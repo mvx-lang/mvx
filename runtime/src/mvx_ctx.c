@@ -252,6 +252,16 @@ void mv_sentence(mvx_ctx *ctx, mv_value *dst) {
     mv_set_str(dst, s, (int64_t)strlen(s));
 }
 
+/* @USER.TYPE — the R83/UniData session-type test, rendered on Unix.  0 when a
+   terminal is attached (an interactive line), else 2 ("other background": a
+   pipe, the networked daemon, an EXECUTE capture — mvx's phantom-equivalents).
+   Portable BASIC can then guard terminal-only work (e.g. a login-time modal)
+   with @USER.TYPE = 0 on mvx exactly as on UniData/UniVerse. */
+void mv_user_type(mvx_ctx *ctx, mv_value *dst) {
+    (void)ctx;
+    mv_set_int(dst, isatty(0) ? 0 : 2);
+}
+
 /* ---------------------------------------------------------------- input */
 
 /* INPUT reads fd 0 one byte at a time, deliberately unbuffered: a

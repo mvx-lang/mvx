@@ -906,7 +906,8 @@ private:
             boxNum(e, t);
             return t;
         }
-        if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0)
+        if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0 &&
+            e.sval != "@USER.TYPE")
             return getScalar(e.sval, e.line);
         if (e.kind == Expr::K::Paren && arrayNames_.count(e.sval))
             return arrayElemPtr(e);
@@ -935,6 +936,11 @@ private:
                     ConstantInt::get(i64Ty_, (int64_t)e.sval.size())});
             return;
         case Expr::K::Var: {
+            if (e.sval == "@USER.TYPE") {          // session type (0 = interactive)
+                callRt("mv_user_type", voidTy_, {ptrTy_, ptrTy_},
+                       {ctxArg_, dest});
+                return;
+            }
             int mc = sysConstChar(e.sval);
             if (mc >= 0) {
                 callRt("mv_set_str", voidTy_, {ptrTy_, ptrTy_, i64Ty_},
