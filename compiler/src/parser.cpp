@@ -47,8 +47,11 @@ public:
                 advance();
                 if (!at(Tok::RParen)) {
                     for (;;) {
+                        bool isMat = false;         // MAT param: a whole array by ref
+                        if (at(Tok::KwMat)) { advance(); isMat = true; }
                         prog.params.push_back(
                             expect(Tok::Ident, "parameter name").text);
+                        prog.paramIsMat.push_back(isMat);
                         if (!at(Tok::Comma)) break;
                         advance();
                     }
@@ -939,7 +942,18 @@ private:
             advance();
             if (!at(Tok::RParen)) {
                 for (;;) {
-                    s->args.push_back(expression());
+                    if (at(Tok::KwMat)) {        // CALL SUB(MAT arr): pass whole array
+                        int ln = cur().line;
+                        advance();
+                        auto a = std::make_unique<Expr>();
+                        a->kind = Expr::K::Var;
+                        a->line = ln;
+                        a->sval = expect(Tok::Ident, "array name after MAT").text;
+                        a->matArg = true;
+                        s->args.push_back(std::move(a));
+                    } else {
+                        s->args.push_back(expression());
+                    }
                     if (!at(Tok::Comma)) break;
                     advance();
                 }

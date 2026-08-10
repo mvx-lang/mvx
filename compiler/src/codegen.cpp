@@ -2257,7 +2257,9 @@ private:
         for (size_t k = 0; k < n; k++) {
             const Expr &a = *s.args[k];
             Value *p;
-            if (a.kind == Expr::K::Var && sysConstChar(a.sval) < 0 &&
+            if (a.matArg)                       // CALL SUB(MAT arr): the array by ref
+                p = b_.CreateLoad(ptrTy_, getArraySlot(a.sval), a.sval + ".mat");
+            else if (a.kind == Expr::K::Var && sysConstChar(a.sval) < 0 &&
                 !arrayNames_.count(a.sval))
                 p = getScalar(a.sval, a.line);
             else if (a.kind == Expr::K::Paren && arrayNames_.count(a.sval))
@@ -2449,13 +2451,25 @@ private:
                 Value *cell = b_.CreateGEP(
                     ptrTy_, argv, ConstantInt::get(i64Ty_, (int)k + off));
                 Value *p = b_.CreateLoad(ptrTy_, cell, prog_.params[k]);
-                if (arrayNames_.count(prog_.params[k]))
-                    err(1, "parameter " + prog_.params[k] +
-                               " conflicts with DIM");
-                scalars_[prog_.params[k]] = p;
-                declareVarDebug(prog_.params[k], p,
-                                prog_.body.empty() ? 1
-                                    : prog_.body.front()->line);
+                bool isMat = k < prog_.paramIsMat.size() && prog_.paramIsMat[k];
+                if (isMat) {
+                    // a whole array passed by reference: hold the caller's
+                    // mv_array* in a slot so element access resolves to it, and
+                    // register the name as an array so A(i) is element access.
+                    Value *slot = eb_.CreateAlloca(ptrTy_, nullptr,
+                                                   prog_.params[k] + ".arr");
+                    b_.CreateStore(p, slot);
+                    arrays_[prog_.params[k]] = slot;
+                    arrayNames_.insert(prog_.params[k]);
+                } else {
+                    if (arrayNames_.count(prog_.params[k]))
+                        err(1, "parameter " + prog_.params[k] +
+                                   " conflicts with DIM");
+                    scalars_[prog_.params[k]] = p;
+                    declareVarDebug(prog_.params[k], p,
+                                    prog_.body.empty() ? 1
+                                        : prog_.body.front()->line);
+                }
             }
         }
 

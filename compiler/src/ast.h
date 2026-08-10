@@ -43,6 +43,7 @@ struct Expr {
     K kind;
     int line = 0;
     bool call = false;          // Paren is a user-function call (DEFFUN)
+    bool matArg = false;        // Var passed as a whole MAT array to a CALL
 
     int64_t ival = 0;
     double fval = 0.0;
@@ -117,6 +118,7 @@ struct Program {
     bool isFunction = false;             // a FUNCTION: returns via RETURN(x)
     std::string name;                    // subroutine name; empty for main
     std::vector<std::string> params;
+    std::vector<bool> paramIsMat;        // params[i] received as a whole MAT array
     std::vector<StmtP> body;
     std::string sourcePath;
 };
