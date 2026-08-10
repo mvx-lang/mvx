@@ -429,3 +429,20 @@ void mvx_sub_<NAME>(mvx_ctx *ctx, int32_t argc, mv_value **argv);
   `deny` policy, which is re-established locally and never shipped in git); and
   the udt-git UniData ⇄ open converter. One descriptor schema, shared by both
   builds via `mv_git_desc_open`.)*
+
+## Portable MV BASIC (udt / D3 / UniVerse ports)
+
+- **`LOCATE` — Format 1 (parenthesized) only.** In every MultiValue BASIC we
+  ship (mvpkg, json, git, …), use only the parenthesized form:
+  - `LOCATE(x, arr; pos)` — attribute-level
+  - `LOCATE(x, arr, amc; pos)` — value-level within attribute `amc`
+  - `LOCATE(x, arr, amc, vmc; pos)` — subvalue-level
+  - optional trailing `; "AL"|"AR"|"DL"|"DR"` for sorted-insert position.
+
+  Do **not** use Format 2, the `LOCATE x IN arr<amc> SETTING pos` statement form.
+  It is flavour-dependent: verified on Rocket UniData 8.x, `LOCATE x IN R<f>
+  SETTING p` searches the **attribute** level of the whole array (it does *not*
+  drill into field `f`'s values the way UniVerse's identical syntax does), and a
+  bare `IN arr` with no subscript is a compile error. Format 1 is level-explicit
+  and behaves identically across UniData/D3/jBASE/UniVerse. Revisit the
+  `IN…SETTING` form later, per-flavour, once flavour support is in scope.
