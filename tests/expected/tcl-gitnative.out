@@ -5,7 +5,12 @@ staged 2 record(s)
 A  CUST/C1
 A  CUST/C2
 [HASH] initial
-HASH initial
+commit HASH
+Author: A
+Date: D
+
+    initial
+
  M CUST/C2
 diff CUST/C2
  Bob

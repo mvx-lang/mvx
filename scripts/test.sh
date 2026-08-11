@@ -945,7 +945,9 @@ RGEOF
     ( cd "$MGR"; "$ROOT/build/bin/mvx-git" init; \
       "$ROOT/build/bin/mvx-git" add CUST; \
       "$ROOT/build/bin/mvx-git" commit -m initial; \
-      "$ROOT/build/bin/mvx-git" log ) 2>&1 | sed -E 's/[0-9a-f]{7,40}/HASH/g'; \
+      "$ROOT/build/bin/mvx-git" log ) 2>&1 \
+        | sed -E -e 's/[0-9a-f]{7,40}/HASH/g' \
+                 -e 's/^Author:.*/Author: A/' -e 's/^Date:.*/Date: D/'; \
     { [ -d "$MGR/.git" ] && echo 'account .git present'; }; \
     echo "plain-git tracked: $(cd "$MGR" && git ls-tree -r --name-only HEAD | tr '\n' ' ')"; \
     ( cd "$MGR"; "$ROOT/build/bin/mvx-git" show CUST C1 ))"
@@ -1075,7 +1077,9 @@ GSEOF
 (cd "$GACCT" && MVXACCOUNT=. "$TESTROOT/gseedbin")
 check tcl-gitnative "$( \
   printf "LINK-PKG $ROOT/packages/git\nGIT INIT\nGIT ADD CUST\nGIT STATUS\nGIT COMMIT -m initial\nGIT LOG\n" | \
-    "$TCL" -a "$GACCT" 2>&1 | sed -E 's/[0-9a-f]{7,40}/HASH/g' | normalise; \
+    "$TCL" -a "$GACCT" 2>&1 \
+      | sed -E -e 's/[0-9a-f]{7,40}/HASH/g' \
+               -e 's/^Author:.*/Author: A/' -e 's/^Date:.*/Date: D/' | normalise; \
   printf 'DELETE CUST C1\nWRITE-C2\n' > /dev/null; \
   (cd "$GACCT" && MVXACCOUNT=. "$MVX" /dev/stdin -o "$TESTROOT/gmod" <<'GMEOF' >/dev/null 2>&1
 OPEN "CUST" TO F ELSE STOP

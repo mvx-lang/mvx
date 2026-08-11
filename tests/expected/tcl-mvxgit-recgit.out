@@ -1,7 +1,12 @@
 initialised empty git repository
 staged 2 record(s)
 [HASH] initial
-HASH initial
+commit HASH
+Author: A
+Date: D
+
+    initial
+
 account .git present
 plain-git tracked: CUST/C1 CUST/C2 
 Ada
