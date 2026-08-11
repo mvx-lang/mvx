@@ -1,0 +1,6 @@
+clone: materialised
+pull-ff: fast-forward
+C2 after ff: 1
+pull-merge: Merge
+C3 local kept: 1
+C4 merged in: 1

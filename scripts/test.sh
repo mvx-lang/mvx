@@ -1058,6 +1058,43 @@ EOF
   check tcl-mvxgit-clone-clean "$( cd "$MGCOC"; \
     st="$( MVX="$TCL" "$ROOT/build/bin/mvx-git" status 2>&1 )"; \
     echo "$st" | grep -E '^ (M|D) ' && echo 'DIRTY' || echo 'clean: no modified/deleted' )"
+
+  # remotes (mv_git#14): push an open account to a bare remote, clone it, then a
+  # fast-forward pull and a divergent-merge pull that RE-MATERIALISE records into
+  # the clone's backend.  Plain `git pull` can't: the clone's native working tree
+  # reads as dirty, so pull is engine-driven (git fetch + tree merge of FETCH_HEAD).
+  RGIT="$ROOT/build/bin/mvx-git"
+  RA="$TESTROOT/remA"; RREM="$TESTROOT/rem.git"; RB="$TESTROOT/remB"
+  rgseed() { printf 'OPEN "CUST" TO F ELSE STOP\n%s\n' "$1" > "$TESTROOT/rg.b"; \
+             "$MVX" "$TESTROOT/rg.b" -o "$TESTROOT/rg.bin" 2>/dev/null; \
+             ( cd "$2" && MVXACCOUNT=. "$TESTROOT/rg.bin" ) >/dev/null; }
+  "$ROOT/scripts/mkaccount.sh" "$RA" >/dev/null
+  "$TCL" -a "$RA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  rgseed 'WRITE "Ada":@AM:"London" ON F, "C1"' "$RA"
+  ( cd "$RA" && "$RGIT" init >/dev/null 2>&1 && git config user.name t && \
+    git config user.email t@t && git config mvx.openaccount true && \
+    "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m base >/dev/null 2>&1 )
+  git init --bare -q "$RREM"
+  ( cd "$RA" && git remote add origin "$RREM" && "$RGIT" push -u origin main >/dev/null 2>&1 )
+  MVX="$TCL" "$RGIT" clone "$RREM" "$RB" </dev/null >/dev/null 2>&1
+  ( cd "$RB" && git config user.name t; git config user.email t@t )
+  rgseed 'WRITE "Bob":@AM:"Paris" ON F, "C2"' "$RA"
+  ( cd "$RA" && "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m c2 >/dev/null 2>&1 && \
+    "$RGIT" push origin main >/dev/null 2>&1 )
+  ff="$( cd "$RB" && "$RGIT" pull origin main 2>/dev/null | grep -o 'fast-forward' )"
+  rgseed 'WRITE "Cy":@AM:"Rome" ON F, "C3"' "$RB"
+  ( cd "$RB" && "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m c3 >/dev/null 2>&1 )
+  rgseed 'WRITE "Dee":@AM:"Oslo" ON F, "C4"' "$RA"
+  ( cd "$RA" && "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m c4 >/dev/null 2>&1 && \
+    "$RGIT" push origin main >/dev/null 2>&1 )
+  mg="$( cd "$RB" && "$RGIT" pull origin main 2>/dev/null | grep -o 'Merge' )"
+  check tcl-mvxgit-remote "$( \
+    echo "clone: $([ -f "$RB/.mvx" ] && echo materialised)"; \
+    echo "pull-ff: $ff"; \
+    echo "C2 after ff: $("$TCL" -a "$RB" -c 'CT CUST C2' 2>/dev/null | grep -c Paris)"; \
+    echo "pull-merge: $mg"; \
+    echo "C3 local kept: $("$TCL" -a "$RB" -c 'CT CUST C3' 2>/dev/null | grep -c Rome)"; \
+    echo "C4 merged in: $("$TCL" -a "$RB" -c 'CT CUST C4' 2>/dev/null | grep -c Oslo)" )"
 else
   echo "  (skipping tcl-mvxgit: git CLI or build/bin/mvx-git unavailable)"
 fi
