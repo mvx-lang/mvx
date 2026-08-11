@@ -19,15 +19,20 @@
  *
  * Tiers (8.2): restricted < developer < unrestricted, default DENY.
  * Spawning cataloged verbs inside the account is the platform working
- * and is allowed at every tier; raw Unix needs unrestricted; compiling
- * needs developer.  The tier comes from $MVXPRIV — the development
- * stand-in for system-level configuration outside the account (8.3);
- * an env var set by the login environment is not writable from inside
- * account data, which is the property that matters.
+ * and is allowed at every tier; compiling needs developer.  Raw Unix (`!`,
+ * SH, OSEXEC) below the unrestricted tier runs ONLY a plain single command
+ * the permit whitelist allows (mvx_perm.c), argv-style; a shell string
+ * (pipes, redirection, substitution, globs, chaining) needs unrestricted.
+ * The tier comes from $MVXPRIV — the development stand-in for system-level
+ * configuration outside the account (8.3); an env var set by the login
+ * environment is not writable from inside account data, which is the
+ * property that matters.
  *
  * All spawns are argv-style (execv), never through a shell, except the
- * explicitly-unrestricted raw Unix passthrough: with argument vectors,
- * metacharacters in user input are inert (8.4).
+ * unrestricted-only raw-string passthrough: with argument vectors,
+ * metacharacters in user input are inert (8.4).  A permit denial returns
+ * a negative status the caller surfaces as an error (the TCL exits 126, so
+ * a BASIC EXECUTE ... RETURNING sees the failure).
  */
 #include "mvx_runtime.h"
 
@@ -120,18 +125,78 @@ static int64_t spawn(char *const argv[], mv_value *capture, int use_path) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* --- raw Unix (the `!` / SH path) — unrestricted only ------------------ */
+/* --- raw Unix (the `!` / SH path) --------------------------------------
+   The unrestricted tier runs the string as a full shell, unchecked.  BELOW it,
+   `!` is no longer all-or-nothing: a PLAIN single command (no shell syntax) is
+   permit-checked exactly like OSEXEC and, if the whitelist allows it, run
+   argv-style — never a shell, so metacharacters in arguments are inert.  A
+   string that genuinely needs a shell (pipes, redirection, substitution, globs,
+   chaining) still requires unrestricted.  A denial returns -1, which the caller
+   (a BASIC EXECUTE, the TCL) surfaces as an error the program can handle. */
+
+/* Split a plain command into argv, stripping '...' / "..." quoting.  Returns
+   argc, or -1 if the string needs a REAL shell: any UNQUOTED shell metacharacter
+   (pipe/redirect/chain/subshell/substitution/glob/brace/tilde/backslash/newline),
+   an unterminated quote, or an overflow. */
+static int shell_tokenize(const char *cmd, char *out, size_t ocap,
+                          char **av, int maxargs) {
+    int argc = 0;
+    size_t o = 0;
+    const char *p = cmd;
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        if (argc >= maxargs - 1) return -1;
+        av[argc++] = out + o;
+        while (*p && *p != ' ' && *p != '\t') {
+            char c = *p;
+            if (c == '\'' || c == '"') {                 /* literal quoted run */
+                char q = c;
+                for (p++; *p && *p != q; p++) {
+                    if (o + 1 >= ocap) return -1;
+                    out[o++] = *p;
+                }
+                if (*p != q) return -1;                  /* unterminated quote */
+                p++;
+                continue;
+            }
+            if (strchr("|&;<>()`$*?[]{}~#\\\n\r", c)) return -1;  /* needs a shell */
+            if (o + 1 >= ocap) return -1;
+            out[o++] = c;
+            p++;
+        }
+        if (o + 1 >= ocap) return -1;
+        out[o++] = '\0';
+    }
+    av[argc] = NULL;
+    return argc;
+}
 
 int64_t mvx_unix_cmd(mvx_ctx *ctx, const char *cmd) {
     (void)ctx;
-    if (priv_tier() < TIER_UNRESTRICTED) {
+    if (priv_tier() >= TIER_UNRESTRICTED) {              /* full shell, unchecked */
+        int st = system(cmd);
+        return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    }
+    char work[8192];
+    char *av[256];
+    int argc = shell_tokenize(cmd, work, sizeof work, av, 256);
+    if (argc < 0) {
         fprintf(stderr,
-                "not allowed: Unix execution requires unrestricted "
-                "privilege\n");
+                "not allowed: '!' needs the unrestricted tier for shell syntax "
+                "(pipes, redirection, substitution, globs, chaining) — a plain "
+                "command runs only if a 'permit' grant allows it\n");
         return -1;
     }
-    int st = system(cmd);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    if (argc == 0) return 0;
+    if (!mvx_perm_allowed(av)) {
+        fprintf(stderr,
+                "not allowed: '%s' is not permitted (no matching 'permit' grant "
+                "in .mvx / .mvx-private for your groups, or a 'deny' rule blocks "
+                "this command or one of its switches)\n", av[0]);
+        return -1;
+    }
+    return spawn(av, NULL, 1);                           /* argv-style, PATH search */
 }
 
 /* --- fine-grained external command (the OSEXEC path) -------------------

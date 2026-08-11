@@ -21,10 +21,11 @@
  *   OFF / QUIT / BYE   end the session
  *   ! <command>        raw passthrough to Unix
  *
- * NOTE: '!' currently spawns unconditionally.  The privilege gate
- * belongs in the runtime exec primitive (ARCHITECTURE.md 8.1) and will
- * move there when EXECUTE lands — a check that lives only here would be
- * decorative.
+ * The privilege gate lives in the runtime exec primitive (mvx_unix_cmd,
+ * ARCHITECTURE.md 8.1), not here — a check in the shell would be
+ * decorative.  Below the unrestricted tier a `!` command runs only if the
+ * permit whitelist allows it (argv-style, no shell); a denial returns < 0,
+ * which we surface as exit 126 so a script or BASIC EXECUTE sees the error.
  *
  * Dispatch order: builtin table, then VOC, then not-found.
  * VOC verb record: attr 1 = "V", attr 2 = executable path relative to
@@ -325,8 +326,8 @@ static int command(char *line) {
     if (len == 0) return 0;
 
     if (line[0] == '!') {               /* raw Unix — runtime-gated */
-        mvx_unix_cmd(g_ctx, line + 1);
-        return 0;
+        int64_t rc = mvx_unix_cmd(g_ctx, line + 1);
+        return rc < 0 ? 126 : (int)rc;  /* propagate: 126 = denied, else the cmd's exit */
     }
 
     char verb[128];
@@ -342,8 +343,8 @@ static int command(char *line) {
 
     if (strcmp(verb, "SH") == 0) {      /* interactive shell — gated */
         const char *sh = getenv("SHELL");
-        mvx_unix_cmd(g_ctx, sh && sh[0] ? sh : "/bin/sh");
-        return 0;
+        int64_t rc = mvx_unix_cmd(g_ctx, sh && sh[0] ? sh : "/bin/sh");
+        return rc < 0 ? 126 : (int)rc;
     }
 
     if (strcmp(verb, "LOGTO") == 0) {   /* switch accounts */

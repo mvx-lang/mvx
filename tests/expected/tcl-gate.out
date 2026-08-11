@@ -1,2 +1,2 @@
-not allowed: Unix execution requires unrestricted privilege
+not allowed: 'echo' is not permitted (no matching 'permit' grant in .mvx / .mvx-private for your groups, or a 'deny' rule blocks this command or one of its switches)
 allowed

@@ -172,9 +172,17 @@
   default deny) come from `$MVXPRIV` — the development stand-in for
   system config outside the account; the property that matters is that
   account data cannot write it. Spawning cataloged verbs is allowed at
-  every tier; raw Unix needs unrestricted; compiling needs developer.
-  All spawns are argv-style (`execv`), never through a shell, except
-  the explicitly-unrestricted raw passthrough.
+  every tier; compiling needs developer. Raw Unix (`!`, SH, OSEXEC)
+  below unrestricted is not all-or-nothing: a plain single command runs
+  iff the permit whitelist (`mvx_perm.c`) grants it, argv-style; a shell
+  string (pipes, redirection, substitution, globs, chaining) still needs
+  unrestricted. So a confined account (e.g. the mvpkg package account)
+  runs exactly its declared command surface — the `.mvx` vendor permit —
+  and nothing else. A denial returns a negative status the caller
+  surfaces as an error: the TCL exits 126, so a BASIC `EXECUTE ...
+  RETURNING code` sees it and can fail in-program. All spawns are
+  argv-style (`execv`), never through a shell, except the
+  unrestricted-only raw passthrough.
 - **EXECUTE spawns `mvx -c`** so there is exactly one dispatcher in
   the system. CAPTURING collects stdout as a dynamic array (line ↔
   attribute); RETURNING receives the exit status (deviation from
