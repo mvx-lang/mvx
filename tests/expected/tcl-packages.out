@@ -24,6 +24,8 @@ commands:
   fetch        fetch a remote ({remote})
   pull         fetch + merge, re-materialising ({remote} {branch})
   push         push to a remote ({remote} {refspec})
+  remote       list or configure remotes ({add|set-url|remove} name {url})
+  config       get or set repo config (key {value})
   help         show this help
 cannot unlink cmd: @ROOT@/packages/git depends on it
 unlinked @ROOT@/packages/git
