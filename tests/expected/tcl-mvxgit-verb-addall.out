@@ -1,0 +1,4 @@
+add -A ran: 1
+lmdb record committed: 1
+open descriptor: 1
+native .mvx absent: 0

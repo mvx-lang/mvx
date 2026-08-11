@@ -1115,6 +1115,30 @@ EOF
     "$RGIT" add -A >/dev/null 2>&1; \
     echo "C1 staged: $(git ls-files --cached | grep -c 'CUST/C1')"; \
     echo "C9 staged: $(git ls-files --cached | grep -c 'CUST/C9')" )"
+
+  # GIT verb owns the whole open-account workflow with NO CLI (mv_git#20 — the D3
+  # constraint): INIT / CONFIG / ADD -A / COMMIT all via verbs.  GIT ADD -A stages
+  # lmdb records (add_all lifted into the engine) and the verb honours
+  # mvx.openaccount (openaccount_sync), so the commit is the portable OPEN form
+  # (.mv-account, DIR/hash %FILE%) — not native .mvx.
+  VBA="$TESTROOT/vbaddall"
+  "$ROOT/scripts/mkaccount.sh" "$VBA" >/dev/null
+  "$TCL" -a "$VBA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  printf 'OPEN "CUST" TO F ELSE STOP\nWRITE "Ada":@AM:"London" ON F, "C1"\n' > "$TESTROOT/vba.b"
+  "$MVX" "$TESTROOT/vba.b" -o "$TESTROOT/vba.bin" 2>/dev/null
+  (cd "$VBA" && MVXACCOUNT=. "$TESTROOT/vba.bin") >/dev/null
+  "$TCL" -a "$VBA" -c "LINK-PKG $ROOT/packages/git" >/dev/null 2>&1
+  "$TCL" -a "$VBA" -c 'GIT INIT' >/dev/null 2>&1
+  "$TCL" -a "$VBA" -c 'GIT CONFIG user.name t' >/dev/null 2>&1
+  "$TCL" -a "$VBA" -c 'GIT CONFIG user.email t@t' >/dev/null 2>&1
+  "$TCL" -a "$VBA" -c 'GIT CONFIG mvx.openaccount true' >/dev/null 2>&1
+  addout="$("$TCL" -a "$VBA" -c 'GIT ADD -A' 2>&1 | tail -1)"
+  "$TCL" -a "$VBA" -c 'GIT COMMIT -m base' >/dev/null 2>&1
+  check tcl-mvxgit-verb-addall "$( cd "$VBA"; \
+    echo "add -A ran: $(echo "$addout" | grep -c staged)"; \
+    echo "lmdb record committed: $(git ls-tree -r HEAD --name-only 2>/dev/null | grep -c '^CUST/C1$')"; \
+    echo "open descriptor: $(git ls-tree -r HEAD --name-only 2>/dev/null | grep -c '^\.mv-account$')"; \
+    echo "native .mvx absent: $(git ls-tree -r HEAD --name-only 2>/dev/null | grep -c '^\.mvx$')" )"
 else
   echo "  (skipping tcl-mvxgit: git CLI or build/bin/mvx-git unavailable)"
 fi
