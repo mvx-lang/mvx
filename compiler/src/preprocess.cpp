@@ -14,6 +14,7 @@
 #include "parser.h"   // CompileError
 
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -92,12 +93,28 @@ std::string readFile(const std::string &path, const std::string &fromItem,
 // or a single "item" -> dir/item.  A ".b" suffix is tried as a fallback.
 std::string resolveInclude(const fs::path &baseDir, const std::string &tok1,
                            const std::string &tok2) {
-    fs::path p = tok2.empty() ? baseDir / tok1 : baseDir / tok1 / tok2;
-    if (fs::exists(p)) return p.string();
-    fs::path withB = p;
-    withB += ".b";
-    if (fs::exists(withB)) return withB.string();
-    return p.string();     // report the primary path in the error
+    auto hit = [](const fs::path &p) -> std::string {
+        if (fs::exists(p)) return p.string();
+        fs::path b = p; b += ".b";
+        if (fs::exists(b)) return b.string();
+        return "";
+    };
+    if (tok2.empty()) {                 // $INCLUDE item -> same dir as the source
+        std::string r = hit(baseDir / tok1);
+        return r.empty() ? (baseDir / tok1).string() : r;
+    }
+    // $INCLUDE file item (R83): `file` is a directory-file.  Try the source's
+    // own directory first (co-located), then account-relative — a BP program
+    // lives in <account>/BP, so a sibling file like BP.INC hangs off <account>.
+    // This mirrors, for the directory-file case, where a real VOC file pointer
+    // would send us.  (A future hash-file include would follow the VOC pointer
+    // through the store engine instead of assuming the directory layout.)
+    if (std::string r = hit(baseDir / tok1 / tok2); !r.empty()) return r;
+    if (const char *a = std::getenv("MVXACCOUNT"); a && a[0])
+        if (std::string r = hit(fs::path(a) / tok1 / tok2); !r.empty()) return r;
+    if (std::string r = hit(baseDir.parent_path() / tok1 / tok2); !r.empty())
+        return r;
+    return (baseDir / tok1 / tok2).string();       // primary path for the error
 }
 
 void run(const std::string &src, const std::string &file, int fixedDwarf,
