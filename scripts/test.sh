@@ -1139,6 +1139,16 @@ EOF
     echo "lmdb record committed: $(git ls-tree -r HEAD --name-only 2>/dev/null | grep -c '^CUST/C1$')"; \
     echo "open descriptor: $(git ls-tree -r HEAD --name-only 2>/dev/null | grep -c '^\.mv-account$')"; \
     echo "native .mvx absent: $(git ls-tree -r HEAD --name-only 2>/dev/null | grep -c '^\.mvx$')" )"
+
+  # GIT TAG (mv_git#20): list / lightweight / annotated / delete — all engine, no
+  # shell git (releases resolve via tags).  Reuses the VBA account (has a commit).
+  "$TCL" -a "$VBA" -c 'GIT TAG v1.0' >/dev/null 2>&1
+  "$TCL" -a "$VBA" -c 'GIT TAG -a v2.0 -m release-two' >/dev/null 2>&1
+  check tcl-mvxgit-tag "$( cd "$VBA"; \
+    echo "list: $("$TCL" -a . -c 'GIT TAG' 2>/dev/null | tr '\n' ',')"; \
+    echo "annotated message: $(git tag -n1 v2.0 2>/dev/null | grep -c release-two)"; \
+    "$TCL" -a . -c 'GIT TAG -d v1.0' >/dev/null 2>&1; \
+    echo "after delete v1.0: $("$TCL" -a . -c 'GIT TAG' 2>/dev/null | tr '\n' ',')" )"
 else
   echo "  (skipping tcl-mvxgit: git CLI or build/bin/mvx-git unavailable)"
 fi

@@ -26,6 +26,7 @@ commands:
   push         push to a remote ({remote} {refspec})
   remote       list or configure remotes ({add|set-url|remove} name {url})
   config       get or set repo config (key {value})
+  tag          list or manage tags (name {commit} | -a name -m msg | -d name)
   help         show this help
 cannot unlink cmd: @ROOT@/packages/git depends on it
 unlinked @ROOT@/packages/git
