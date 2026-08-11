@@ -1095,6 +1095,26 @@ EOF
     echo "pull-merge: $mg"; \
     echo "C3 local kept: $("$TCL" -a "$RB" -c 'CT CUST C3' 2>/dev/null | grep -c Rome)"; \
     echo "C4 merged in: $("$TCL" -a "$RB" -c 'CT CUST C4' 2>/dev/null | grep -c Oslo)" )"
+
+  # per-record .gitignore in open mode (mv_git#17): add AND status must honor
+  # .gitignore at record granularity — a gitignored record (CUST/C9, an ordinary
+  # lmdb record git's plain add never enumerates) is neither staged nor shown as
+  # untracked, so derived artifacts (LIB/, VOC/LIB, …) stay out of the open form.
+  IGA="$TESTROOT/ig17"
+  "$ROOT/scripts/mkaccount.sh" "$IGA" >/dev/null
+  "$TCL" -a "$IGA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  printf 'OPEN "CUST" TO F ELSE STOP\nWRITE "Ada":@AM:"London" ON F, "C1"\nWRITE "derived" ON F, "C9"\n' \
+    > "$TESTROOT/ig17seed.b"
+  "$MVX" "$TESTROOT/ig17seed.b" -o "$TESTROOT/ig17bin" 2>/dev/null
+  (cd "$IGA" && MVXACCOUNT=. "$TESTROOT/ig17bin") >/dev/null
+  printf 'CUST/C9\n' > "$IGA/.gitignore"
+  ( cd "$IGA" && "$RGIT" init >/dev/null 2>&1 && git config user.name t && \
+    git config user.email t@t && git config mvx.openaccount true )
+  check tcl-mvxgit-ignore "$( cd "$IGA"; \
+    echo "status hides C9: $("$RGIT" status 2>/dev/null | grep -c 'CUST/C9')"; \
+    "$RGIT" add -A >/dev/null 2>&1; \
+    echo "C1 staged: $(git ls-files --cached | grep -c 'CUST/C1')"; \
+    echo "C9 staged: $(git ls-files --cached | grep -c 'CUST/C9')" )"
 else
   echo "  (skipping tcl-mvxgit: git CLI or build/bin/mvx-git unavailable)"
 fi
