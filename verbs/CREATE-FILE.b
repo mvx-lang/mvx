@@ -7,7 +7,7 @@
 * the extent permitted by law; see the LICENSE file for details.
 *
 * SPDX-License-Identifier: GPL-2.0-only
-* CREATE-FILE name {DIR | USING <driver> {connection}}
+* CREATE-FILE name {DIR | DIRECTORY | USING <driver> {connection}}
 * The file's backend is decided at creation: a directory file, a
 * local LMDB file (the default), or a file on another driver
 * (lmdbnet, and later postgres/mongo) bound in the account's BINDINGS
@@ -16,11 +16,11 @@ S = TRIM(SENTENCE())
 NAME = FIELD(S, " ", 2)
 TYPE = OCONV(FIELD(S, " ", 3), "MCU")
 IF NAME = "" THEN
-   PRINT "usage: CREATE-FILE name {DIR | USING driver {connection}}"
+   PRINT "usage: CREATE-FILE name {DIR | DIRECTORY | USING driver {connection}}"
    STOP
 END
 BEGIN CASE
-CASE TYPE = "DIR"
+CASE TYPE = "DIR" OR TYPE = "DIRECTORY"
    OK = CREATEFILE(NAME, "DIR")
 CASE TYPE = "USING"
    DRV = FIELD(S, " ", 4)
@@ -35,7 +35,7 @@ CASE TYPE = "USING"
 CASE TYPE = ""
    OK = CREATEFILE(NAME)
 CASE 1
-   PRINT "usage: CREATE-FILE name {DIR | USING driver {connection}}"
+   PRINT "usage: CREATE-FILE name {DIR | DIRECTORY | USING driver {connection}}"
    STOP
 END CASE
 IF OK THEN
