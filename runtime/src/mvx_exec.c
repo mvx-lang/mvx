@@ -37,6 +37,7 @@
 #include "mvx_runtime.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -310,8 +311,68 @@ int64_t mvx_rmtree(mvx_ctx *ctx, const mv_value *path) {
     return (errno == ENOENT) ? 1 : 0;    /* nothing to remove is success */
 }
 
+/* Run argv (argv-style, PATH search) capturing up to cap-1 bytes of stdout into
+   buf (NUL-terminated); stderr is discarded.  Returns exit status, or -1. */
+static int capture_cmd(char *const argv[], char *buf, size_t cap) {
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 1);
+        close(fds[1]);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, 2); close(dn); }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(fds[1]);
+    size_t len = 0;
+    ssize_t n;
+    while (len + 1 < cap && (n = read(fds[0], buf + len, cap - 1 - len)) > 0)
+        len += (size_t)n;
+    char sink[4096];                        /* drain the rest so tar can finish */
+    while (read(fds[0], sink, sizeof sink) > 0) {}
+    close(fds[0]);
+    buf[len] = '\0';
+    int st;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* True iff every entry in a `tar -tzf` listing sits under ONE common top-level
+   directory — the account-shaped-package convention (git/…).  A contents-at-root
+   archive (any file or a second dir at the top) returns 0. */
+static int single_top_dir(const char *listing) {
+    char top[256];
+    size_t tl = 0;
+    int have = 0;
+    for (const char *p = listing; *p; ) {
+        const char *nl = strchr(p, '\n');
+        const char *end = nl ? nl : p + strlen(p);
+        const char *s = p;
+        if (s + 2 <= end && s[0] == '.' && s[1] == '/') s += 2;   /* drop ./ */
+        const char *slash = s;
+        while (slash < end && *slash != '/') slash++;
+        if (slash == end) {
+            if (s < end) return 0;           /* a top-level file -> not wrapped */
+        } else {
+            size_t clen = (size_t)(slash - s) + 1;   /* "<name>/" */
+            if (clen >= sizeof top) return 0;
+            if (!have) { memcpy(top, s, clen); tl = clen; have = 1; }
+            else if (clen != tl || memcmp(s, top, tl) != 0) return 0;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return have;
+}
+
 /* UNTAR(tarball, destdir) -> exit status (0 ok), -1 denied.  Creates destdir,
-   then extracts argv-style (no shell). */
+   then extracts argv-style (no shell).  A tar wrapped in a single top-level
+   directory is unwrapped (--strip-components=1) so a package's files land at
+   destdir either way; a contents-at-root tar is extracted as-is. */
 int64_t mvx_untar(mvx_ctx *ctx, const mv_value *tarball, const mv_value *dest) {
     (void)ctx;
     if (!perm_op("untar")) {
@@ -323,8 +384,15 @@ int64_t mvx_untar(mvx_ctx *ctx, const mv_value *tarball, const mv_value *dest) {
     copy_path(dest, dst, sizeof dst);
     if (!tar[0] || !dst[0]) return -1;
     make_dirs(dst);
-    char *argv[] = {"tar", "-xzf", tar, "-C", dst, NULL};
-    return spawn(argv, NULL, 1);
+
+    char listing[65536];
+    char *lav[] = {"tar", "-tzf", tar, NULL};
+    int strip = (capture_cmd(lav, listing, sizeof listing) == 0) &&
+                single_top_dir(listing);
+
+    char *strip_av[] = {"tar", "-xzf", tar, "--strip-components=1", "-C", dst, NULL};
+    char *flat_av[]  = {"tar", "-xzf", tar, "-C", dst, NULL};
+    return spawn(strip ? strip_av : flat_av, NULL, 1);
 }
 
 /* --- editor spawn (the VI verb) — unrestricted --------------------------

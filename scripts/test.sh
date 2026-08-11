@@ -218,6 +218,8 @@ mkdir -p "$PNAT/.mvx-private"
 echo "permit * = mkdir untar" > "$PNAT/.mvx-private/permissions"
 ( cd "$TESTROOT" && mkdir -p fx && printf 'native-ok' > fx/marker.txt \
   && tar czf "$PNAT/fixture.tgz" -C fx . )
+( cd "$TESTROOT" && mkdir -p wfx/pkg && printf 'wrapped-ok' > wfx/pkg/inner.txt \
+  && tar czf "$PNAT/wrapped.tgz" -C wfx pkg )
 out="$TESTROOT/native"
 if "$MVX" "$ROOT/tests/native.b" -o "$out" 2>"$TESTROOT/cerr"; then
   actual="$(cd "$PNAT" && MVXACCOUNT=. "$out" 2>/dev/null | normalise)"

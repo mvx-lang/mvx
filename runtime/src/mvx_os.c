@@ -98,6 +98,12 @@ void mvx_uname(mvx_ctx *ctx, mv_value *dst, const mv_value *which) {
     int64_t wl = mv_val_chars(which, nb, sizeof nb, &w);
     char c = wl > 0 ? w[0] : 's';
     if (c >= 'A' && c <= 'Z') c += 32;
+    if (c == 'e') {                 /* byte order — the axis for BASIC objects */
+        const unsigned probe = 1;   /* + data files; not a utsname field */
+        mvx_ctx_set_status(ctx, 0);
+        mv_set_str(dst, (*(const char *)&probe) ? "le" : "be", 2);
+        return;
+    }
     const char *v;
     switch (c) {
         case 'n': v = u.nodename; break;

@@ -1,4 +1,9 @@
 mkdir: 1
 untar: 0
 content: native-ok
+untar wrapped: 0
+stripped: wrapped-ok
+endian ok: 1
+os set: 1
+arch set: 1
 rmtree (not permitted): -1
