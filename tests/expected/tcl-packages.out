@@ -20,6 +20,10 @@ commands:
   checkout     switch branch, update records (name)
   merge        merge a branch into this one (name)
   cherry-pick  apply one commit (commit)
+  clone        clone a repo into a dir (url dir {ref})
+  fetch        fetch a remote ({remote})
+  pull         fetch + merge, re-materialising ({remote} {branch})
+  push         push to a remote ({remote} {refspec})
   help         show this help
 cannot unlink cmd: @ROOT@/packages/git depends on it
 unlinked @ROOT@/packages/git
