@@ -1075,6 +1075,10 @@ EOF
     git config user.email t@t && git config mvx.openaccount true && \
     "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m base >/dev/null 2>&1 )
   git init --bare -q "$RREM"
+  # The bare remote's HEAD must name the branch we push (main); otherwise it follows the
+  # runner's init.defaultBranch (unset -> master) while the content is on main, so the clone
+  # lands on an unborn branch and never materialises the account (#98).
+  git -C "$RREM" symbolic-ref HEAD refs/heads/main
   ( cd "$RA" && git remote add origin "$RREM" && "$RGIT" push -u origin main >/dev/null 2>&1 )
   MVX="$TCL" "$RGIT" clone "$RREM" "$RB" </dev/null >/dev/null 2>&1
   ( cd "$RB" && git config user.name t; git config user.email t@t )
