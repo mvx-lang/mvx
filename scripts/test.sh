@@ -682,7 +682,8 @@ printf 'I\nDOCTAG(file)\n\nFile\n10L\n' > "$ACCT/BP.DICT/FILE"
 printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
-# packages: build, link (dependency pulls cmd), GIT help, unlink rules
+# packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules
+"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/getopt" >/dev/null
 "$ROOT/scripts/mkpkg.sh" "$ROOT/packages/cmd" >/dev/null
 "$ROOT/scripts/mkpkg.sh" "$ROOT/packages/git" >/dev/null
 check tcl-packages "$(printf '%s\n' \
@@ -718,6 +719,37 @@ check tcl-getopt "$( \
   printf '%s\n' "LINK-PKG $ROOT/packages/getopt" "LINK-PKG $GOP" \
     'GOTEST -m "hi there" one --open two' \
     "UNLINK-PKG $GOP" "UNLINK-PKG $ROOT/packages/getopt" | tclrun)"
+
+# cmd declarative flags: a subcommand declares flags with CMD.FLAG; CMD.RUN parses
+# the sentence against them via getopt and the handler reads GETOPT.VAL/HAS/ARG.
+# Covers parse (quoted value + flag + positionals), generated per-sub --help, and
+# an unknown-flag error.  Exercises the full cmd -> getopt dependency chain.
+CFP="$TESTROOT/cftest"
+mkdir -p "$CFP/BP" "$CFP/VOC"
+printf 'cftest\n1.0\ncmd-flag test\nmvx\n' > "$CFP/PKG"
+cat > "$CFP/BP/CFTEST" <<'EOF'
+CALL CMD.INIT("CFTEST", "cmd flag demo")
+CALL CMD.ADD("COMMIT", "record staged changes", "CFTEST.COMMIT")
+CALL CMD.FLAG("COMMIT", "m", "message", 1, "", "commit message")
+CALL CMD.FLAG("COMMIT", "a", "all", 0, "", "stage all")
+CALL CMD.RUN
+EOF
+cat > "$CFP/BP/CFTEST.COMMIT" <<'EOF'
+SUBROUTINE CFTEST.COMMIT
+CALL GETOPT.VAL("m", MSG) ; PRINT "m=[" : MSG : "]"
+CALL GETOPT.HAS("all", ALLF) ; PRINT "all=" : ALLF
+CALL GETOPT.ARG(1, A1) ; PRINT "a1=[" : A1 : "]"
+CALL GETOPT.NARGS(NA) ; PRINT "nargs=" : NA
+RETURN
+EOF
+printf 'V\nCATALOG/CFTEST' > "$CFP/VOC/CFTEST"
+check tcl-cmdflags "$( \
+  printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
+  printf '%s\n' "LINK-PKG $ROOT/packages/getopt" "LINK-PKG $ROOT/packages/cmd" "LINK-PKG $CFP" \
+    'CFTEST COMMIT -m "hello world" --all f1 f2' \
+    'CFTEST COMMIT --help' \
+    'CFTEST COMMIT -z' \
+    "UNLINK-PKG $CFP" "UNLINK-PKG $ROOT/packages/cmd" "UNLINK-PKG $ROOT/packages/getopt" | tclrun)"
 
 # native package build: BUILD-PKG compiles a package's BP -> CATALOG/LIB
 # through the runtime (no shell, no mkpkg on PATH), needing only developer

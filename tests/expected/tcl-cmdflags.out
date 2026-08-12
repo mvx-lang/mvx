@@ -1,0 +1,22 @@
+BUILD-PKG: @TESTROOT@/cftest — 2 item(s) built, 0 error(s)
+linked @ROOT@/packages/getopt
+linked @ROOT@/packages/cmd
+linked @TESTROOT@/cftest
+m=[hello world]
+all=1
+a1=[f1]
+nargs=2
+usage: CFTEST commit [options]
+  record staged changes
+options:
+  -m, --message <value> commit message
+  -a, --all             stage all
+CFTEST commit: unknown option 'z'
+usage: CFTEST commit [options]
+  record staged changes
+options:
+  -m, --message <value> commit message
+  -a, --all             stage all
+unlinked @TESTROOT@/cftest
+unlinked @ROOT@/packages/cmd
+unlinked @ROOT@/packages/getopt
