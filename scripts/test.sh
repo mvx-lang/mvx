@@ -1076,18 +1076,25 @@ EOF
     "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m base >/dev/null 2>&1 )
   git init --bare -q "$RREM"
   ( cd "$RA" && git remote add origin "$RREM" && "$RGIT" push -u origin main >/dev/null 2>&1 )
-  MVX="$TCL" "$RGIT" clone "$RREM" "$RB" </dev/null >/dev/null 2>&1
+  cloneraw="$( MVX="$TCL" "$RGIT" clone "$RREM" "$RB" </dev/null 2>&1 )"
+  echo "DIAG98 gitver=[$(git --version)]" >&2
+  echo "DIAG98 cloneraw=[$(printf '%s' "$cloneraw" | tr '\n' '|')]" >&2
+  echo "DIAG98 RBls=[$( ls -a "$RB" 2>/dev/null | tr '\n' ' ' )]" >&2
+  echo "DIAG98 desc: mvx=$([ -f "$RB/.mvx" ]&&echo Y||echo N) mvacct=$([ -e "$RB/.mv-account" ]&&echo Y||echo N) lmdb=$([ -d "$RB/mvxdata.lmdb" ]&&echo Y||echo N)" >&2
+  echo "DIAG98 RB-HEAD=[$( cd "$RB" && git rev-parse --short HEAD 2>&1 )] RB-branch=[$( cd "$RB" && git rev-parse --abbrev-ref HEAD 2>&1 )]" >&2
   ( cd "$RB" && git config user.name t; git config user.email t@t )
   rgseed 'WRITE "Bob":@AM:"Paris" ON F, "C2"' "$RA"
   ( cd "$RA" && "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m c2 >/dev/null 2>&1 && \
     "$RGIT" push origin main >/dev/null 2>&1 )
-  ff="$( cd "$RB" && "$RGIT" pull origin main 2>/dev/null | grep -o 'fast-forward' )"
+  ffraw="$( cd "$RB" && "$RGIT" pull origin main 2>&1 )"; ff="$( printf '%s' "$ffraw" | grep -o 'fast-forward' )"
+  echo "DIAG98 ffraw=[$(printf '%s' "$ffraw" | tr '\n' '|')]" >&2
   rgseed 'WRITE "Cy":@AM:"Rome" ON F, "C3"' "$RB"
   ( cd "$RB" && "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m c3 >/dev/null 2>&1 )
   rgseed 'WRITE "Dee":@AM:"Oslo" ON F, "C4"' "$RA"
   ( cd "$RA" && "$RGIT" add -A >/dev/null 2>&1 && "$RGIT" commit -m c4 >/dev/null 2>&1 && \
     "$RGIT" push origin main >/dev/null 2>&1 )
-  mg="$( cd "$RB" && "$RGIT" pull origin main 2>/dev/null | grep -o 'Merge' )"
+  mgraw="$( cd "$RB" && "$RGIT" pull origin main 2>&1 )"; mg="$( printf '%s' "$mgraw" | grep -o 'Merge' )"
+  echo "DIAG98 mgraw=[$(printf '%s' "$mgraw" | tr '\n' '|')]" >&2
   check tcl-mvxgit-remote "$( \
     echo "clone: $([ -f "$RB/.mvx" ] && echo materialised)"; \
     echo "pull-ff: $ff"; \
