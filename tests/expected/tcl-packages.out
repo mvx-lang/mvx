@@ -1,7 +1,7 @@
 linked @ROOT@/packages/git
 linked @ROOT@/packages/cmd
-git@1.4.2      ok     @ROOT@/packages/git requires cmd [mvx udt]
-cmd@1.0        ok     @ROOT@/packages/cmd [mvx]
+git@1.5.0      ok     @ROOT@/packages/git requires cmd [mvx udt]
+cmd@1.1.0      ok     @ROOT@/packages/cmd [mvx udt]
 2 package(s) linked
 GIT - version-control hash-file records
 usage: GIT <command>
