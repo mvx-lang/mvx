@@ -23,6 +23,7 @@ commands:
   clone        clone a repo into a dir (url dir {ref})
   fetch        fetch a remote ({remote})
   pull         fetch + merge, re-materialising ({remote} {branch})
+  import       re-materialise a file's records from HEAD (file)
   push         push to a remote ({remote} {refspec})
   remote       list or configure remotes ({add|set-url|remove} name {url})
   config       get or set repo config (key {value})
