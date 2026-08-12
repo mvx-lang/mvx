@@ -1,0 +1,9 @@
+BUILD-PKG: @TESTROOT@/gotest — 1 item(s) built, 0 error(s)
+linked @ROOT@/packages/getopt
+linked @TESTROOT@/gotest
+m=[hi there]
+open=1
+a1=[one]
+nargs=2
+unlinked @TESTROOT@/gotest
+unlinked @ROOT@/packages/getopt
