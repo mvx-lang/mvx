@@ -15,3 +15,6 @@
 [submodule "packages/json"]
 	path = packages/json
 	url = git@github.com:mvx-lang/json.git
+[submodule "packages/getopt"]
+	path = packages/getopt
+	url = git@github.com:mvx-lang/getopt.git

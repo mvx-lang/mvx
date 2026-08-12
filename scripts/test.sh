@@ -693,6 +693,32 @@ check tcl-packages "$(printf '%s\n' \
   "UNLINK-PKG $ROOT/packages/git" \
   "UNLINK-PKG $ROOT/packages/cmd" | tclrun)"
 
+# getopt: the declarative option parser exercised through the real LINK-PKG path.
+# A consumer verb declares flags once; GETOPT.PARSE splits the sentence (quoted
+# multi-word value, --flag, positionals) and the accessors read the result out
+# of COMMON /GETOPT/ across the package boundary.
+"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/getopt" >/dev/null
+GOP="$TESTROOT/gotest"
+mkdir -p "$GOP/BP" "$GOP/VOC"
+printf 'gotest\n1.0\ngetopt consumer\nmvx\n' > "$GOP/PKG"
+cat > "$GOP/BP/GOTEST" <<'EOF'
+SPEC = ""
+CALL GETOPT.OPT(SPEC, "m", "message", 1, "", "commit message")
+CALL GETOPT.OPT(SPEC, "o", "open", 0, "", "open format")
+CALL GETOPT.SENTENCE(S)
+CALL GETOPT.PARSE(SPEC, S, 1)
+CALL GETOPT.VAL("m", MSG) ; PRINT "m=[" : MSG : "]"
+CALL GETOPT.HAS("open", ISON) ; PRINT "open=" : ISON
+CALL GETOPT.ARG(1, A1) ; PRINT "a1=[" : A1 : "]"
+CALL GETOPT.NARGS(NA) ; PRINT "nargs=" : NA
+EOF
+printf 'V\nCATALOG/GOTEST' > "$GOP/VOC/GOTEST"
+check tcl-getopt "$( \
+  printf 'BUILD-PKG %s\n' "$GOP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
+  printf '%s\n' "LINK-PKG $ROOT/packages/getopt" "LINK-PKG $GOP" \
+    'GOTEST -m "hi there" one --open two' \
+    "UNLINK-PKG $GOP" "UNLINK-PKG $ROOT/packages/getopt" | tclrun)"
+
 # native package build: BUILD-PKG compiles a package's BP -> CATALOG/LIB
 # through the runtime (no shell, no mkpkg on PATH), needing only developer
 # privilege.  A main verb GREET plus a SUBROUTINE it CALLs proves both the
