@@ -1,5 +1,6 @@
 linked @ROOT@/packages/git
 linked @ROOT@/packages/cmd
+linked @ROOT@/packages/getopt
 initialised empty git repository
 staged 1 record(s)
 [HASH] stock

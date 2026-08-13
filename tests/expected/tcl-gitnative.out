@@ -1,5 +1,6 @@
 linked @ROOT@/packages/git
 linked @ROOT@/packages/cmd
+linked @ROOT@/packages/getopt
 initialised empty git repository
 staged 2 record(s)
 A  CUST/C1
