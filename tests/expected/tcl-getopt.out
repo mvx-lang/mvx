@@ -1,5 +1,5 @@
 BUILD-PKG: @TESTROOT@/gotest — 1 item(s) built, 0 error(s)
-linked @ROOT@/packages/getopt
+@ROOT@/packages/getopt is already linked
 linked @TESTROOT@/gotest
 m=[hi there]
 open=1
