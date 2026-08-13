@@ -47,14 +47,20 @@ PKGNAME="$(head -1 "$PKG/PKG" 2>/dev/null)"
 # 5+) to their directories — a sibling of $PKG, or a $MVXPKGPATH segment,
 # the same search LINK-PKG uses — and list them in a throwaway PACKAGES.
 # The package's own EXPORTS still comes via MVXSYSTEM=$PKG below.
-DEPACCT=""
+#
+# The compiler is always given a per-build search account (MVXACCOUNT): its
+# PACKAGES lists any resolved dependency dirs (their EXPORTS), and the package's
+# own generated include dirs (BP.INC / MVPKG.INC) are linked into it further down
+# so `$INCLUDE <name> PLATFORM.H` resolves via MVXACCOUNT/<name>/PLATFORM.H — a
+# path EVERY mvx searches.  A STANDALONE package (its own BP.INC, e.g. git) then
+# compiles with any toolchain, without depending on the newer parent-dir search.
+DEPACCT="$(mktemp -d "${TMPDIR:-/tmp}/mkpkg.deps.XXXXXX")"
+trap 'rm -rf "$DEPACCT"' EXIT
+: > "$DEPACCT/PACKAGES"
 if [ -f "$PKG/PKG" ]; then
   PKGPARENT="$(cd "$PKG/.." && pwd)"
   DEPS="$(awk 'NR>=5 && NF { print $1 }' "$PKG/PKG")"
   if [ -n "$DEPS" ]; then
-    DEPACCT="$(mktemp -d "${TMPDIR:-/tmp}/mkpkg.deps.XXXXXX")"
-    trap 'rm -rf "$DEPACCT"' EXIT
-    : > "$DEPACCT/PACKAGES"
     for dep in $DEPS; do
       # a '?' prefix marks an optional dependency (LINK-PKG semantics): the
       # package bundles a fallback under the same names, so an unresolved one
@@ -138,6 +144,10 @@ for INC in BP.INC MVPKG.INC; do
 * MVX is a builtin compiler define, so there is nothing to declare here.
 * UniData / UniVerse / D3 builds write their vendor $DEFINE lines in this file.
 PLATH
+    # Link it into the search account so the compiler resolves the include via
+    # MVXACCOUNT/<name>/PLATFORM.H (searched by every mvx), not only the newer
+    # parent-dir fallback — so a standalone package builds with any toolchain.
+    ln -sfn "$PKG/$INC" "$DEPACCT/$INC"
   fi
 done
 SUBS=""
