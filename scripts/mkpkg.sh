@@ -144,9 +144,12 @@ for INC in BP.INC MVPKG.INC; do
 * MVX is a builtin compiler define, so there is nothing to declare here.
 * UniData / UniVerse / D3 builds write their vendor $DEFINE lines in this file.
 PLATH
-    # Link it into the search account so the compiler resolves the include via
-    # MVXACCOUNT/<name>/PLATFORM.H (searched by every mvx), not only the newer
-    # parent-dir fallback — so a standalone package builds with any toolchain.
+    # Resolve `$INCLUDE <name> PLATFORM.H` on ANY mvx.  Every compiler tries
+    # baseDir/<name>/PLATFORM.H FIRST (baseDir = the BP source dir), so place a
+    # copy beside the BP sources — a standalone package (its own BP.INC, e.g. git)
+    # then builds with a released toolchain, not only one that also searches the
+    # parent dir / MVXACCOUNT.  Keep the canonical root copy + the account link too.
+    mkdir -p "$PKG/BP/$INC" && cp "$PKG/$INC/PLATFORM.H" "$PKG/BP/$INC/PLATFORM.H"
     ln -sfn "$PKG/$INC" "$DEPACCT/$INC"
   fi
 done
