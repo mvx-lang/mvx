@@ -27,15 +27,23 @@ FOR LI = 1 TO NP
    GOSUB 9000
    STATE = "broken"
    OPEN CUR:"/VOC" TO PV THEN STATE = "ok"
-   DEPTXT = ""
+   * Runtime dependencies read as "requires a, b"; a '+' build dependency is
+   * not linked (it is needed to COMPILE the package, not to run it), so report
+   * it separately rather than listing it among the runtime requirements.
+   DEPTXT = "" ; BLDTXT = ""
    ND = DCOUNT(PDEPS, @AM)
    FOR DI = 1 TO ND
-      IF DEPTXT = "" THEN
-         DEPTXT = "requires ":PDEPS<DI>
+      D = PDEPS<DI>
+      IF D[1, 1] = "+" THEN
+         D = D[2, LEN(D)]
+         IF BLDTXT = "" THEN BLDTXT = "builds with ":D ELSE BLDTXT = BLDTXT:", ":D
       END ELSE
-         DEPTXT = DEPTXT:", ":PDEPS<DI>
+         IF DEPTXT = "" THEN DEPTXT = "requires ":D ELSE DEPTXT = DEPTXT:", ":D
       END
    NEXT DI
+   IF BLDTXT # "" THEN
+      IF DEPTXT = "" THEN DEPTXT = BLDTXT ELSE DEPTXT = DEPTXT:" (":BLDTXT:")"
+   END
    SYSTXT = ""
    IF PSYS # "" THEN SYSTXT = " [":PSYS:"]"
    PRINT FMT(PNAME:"@":PVER, "L#14"):" ":FMT(STATE, "L#6"):" ":FMT(CUR, "L#46"):" ":DEPTXT:SYSTXT

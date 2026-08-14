@@ -65,7 +65,18 @@ if [ -f "$PKG/PKG" ]; then
       # a '?' prefix marks an optional dependency (LINK-PKG semantics): the
       # package bundles a fallback under the same names, so an unresolved one
       # is expected, not a warning.
-      opt=""; case "$dep" in \?*) opt=1; dep="${dep#\?}" ;; esac
+      # a '+' prefix marks a BUILD dependency — needed to COMPILE this package,
+      # never to run it (mvpkg supplies the shared PLATFORM.H that managed
+      # packages $INCLUDE).  Resolve it here so its EXPORTS and include files
+      # are visible to the compile; LINK-PKG ignores it.  Unresolved is a note,
+      # not a failure: the toolchain may already supply what it provides (mkpkg
+      # generates PLATFORM.H itself below), and `MVPKG install --source`
+      # installs build deps before it builds.
+      opt=""; bld=""
+      case "$dep" in
+        \?*) opt=1; dep="${dep#\?}" ;;
+        +*)  bld=1; dep="${dep#+}" ;;
+      esac
       depdir=""
       # a sibling of $PKG first, then each $MVXPKGPATH segment
       oldifs=$IFS; IFS=:
@@ -79,7 +90,13 @@ if [ -f "$PKG/PKG" ]; then
       IFS=$oldifs
       if [ -n "$depdir" ]; then
         echo "$depdir" >> "$DEPACCT/PACKAGES"
-        echo "  dep $dep -> $depdir (EXPORTS visible)"
+        if [ -n "$bld" ]; then
+          echo "  build dep $dep -> $depdir (EXPORTS + includes visible)"
+        else
+          echo "  dep $dep -> $depdir (EXPORTS visible)"
+        fi
+      elif [ -n "$bld" ]; then
+        echo "  build dep $dep: not installed — the toolchain must supply what it provides"
       elif [ -z "$opt" ]; then
         echo "  dep $dep: unresolved (searched $PKGPARENT/, \$MVXPKGPATH)" >&2
       fi

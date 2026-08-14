@@ -21,6 +21,11 @@
 * — the requiring package ships a fallback under the same names (e.g.
 * git bundles cmd in CMD.BP), so it runs standalone with no package
 * manager present.
+* A name prefixed '+' is a BUILD dependency: needed to compile the package
+* (mvpkg, say, provides the shared PLATFORM.H every managed package
+* includes), never to run it.  Linking skips them entirely — mkpkg resolves
+* them at build time, and `MVPKG install --source` installs them before it
+* builds.
 S = TRIM(SENTENCE())
 P = FIELD(S, " ", 2)
 IF P = "" THEN
@@ -87,6 +92,10 @@ UNTIL QUEUE = "" DO
       ND = DCOUNT(DEPLIST, @AM)
       FOR DI = 1 TO ND
          D = DEPLIST<DI>
+         * a '+' prefix marks a BUILD dependency — needed to compile the
+         * package, never to run it (mvpkg supplies the shared PLATFORM.H).
+         * Linking is a runtime concern, so skip it entirely.
+         IF D[1, 1] = "+" THEN GOTO 9100
          * a '?' prefix marks an optional dependency: linked if resolvable
          * (the full package overrides), else assumed satisfied by a copy the
          * requiring package bundles (e.g. git's CMD.BP) — so do not fail.
@@ -106,6 +115,8 @@ UNTIL QUEUE = "" DO
                END
             END
          END
+* next dependency — a build dep jumps here, skipping the link
+9100
       NEXT DI
    END
 REPEAT
