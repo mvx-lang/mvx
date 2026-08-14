@@ -2,7 +2,7 @@ linked @ROOT@/packages/git
 linked @ROOT@/packages/cmd
 linked @ROOT@/packages/getopt
 git@1.5.1      ok     @ROOT@/packages/git requires cmd [mvx udt]
-cmd@1.2.1      ok     @ROOT@/packages/cmd requires getopt, mvpkg [mvx udt]
+cmd@1.3.0      ok     @ROOT@/packages/cmd requires getopt (builds with mvpkg) [mvx udt]
 getopt@1.0     ok     @ROOT@/packages/getopt [mvx udt]
 3 package(s) linked
 GIT - version-control hash-file records
