@@ -59,6 +59,16 @@ void     mvx_ctx_destroy(mvx_ctx *ctx);
    (drivers beside it, ../bin, ../share/mvx/system).  "" if unknown. */
 const char *mvx_runtime_dir(void);
 
+/* Is this storage driver usable on this host?  An account may name a backend
+   this machine was not built with — migration is per FILE, so a repository's
+   files need not all live on the same one — and that is a question to ask the
+   user about rather than a reason to abort.  Asking is why this exists. */
+int mvx_driver_available(const char *name);
+
+/* The drivers this host actually has, comma-separated, so a prompt can offer
+   real options instead of asking for a name the user has to guess. */
+void mvx_driver_names(char *out, size_t cap);
+
 /* --- value lifecycle --------------------------------------------------- */
 void mv_init(mv_value *v);
 void mv_clear(mv_value *v);                         /* release + unassigned */

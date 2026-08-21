@@ -67,10 +67,17 @@ static const mvx_driver *driver_try(const char *dir, const char *name) {
     return d;                           /* handle stays open for process life */
 }
 
-/* Resolve a driver by name: $MVXDRIVERS (colon-separated), then the
-   built-in driver directory.  A missing driver is a configuration
-   error, not a missing file — fail loudly rather than taking ELSE. */
-static const mvx_driver *driver_load(const char *name) {
+/* Find a driver by name — $MVXDRIVERS (colon-separated), then libmvxrt's own
+   directory, then the compile-time one — and CACHE it.  NULL when there is no
+   such driver here.
+
+   Split out of driver_load so a caller can ASK about a driver instead of dying
+   for want of it.  An account can perfectly well name a backend this host was
+   not built with: migration is per FILE (ARCHITECTURE 4.4), so a repository's
+   files need not all live on the same one, and a clone onto a machine without
+   postgres is an ordinary thing to want to do rather than a misconfiguration.
+   Deciding that is the caller's business, not the loader's. */
+static const mvx_driver *driver_find(const char *name) {
     for (loaded_drv *l = g_drivers; l; l = l->next)
         if (strcmp(l->name, name) == 0) return l->drv;
 
@@ -88,10 +95,7 @@ static const mvx_driver *driver_load(const char *name) {
     const char *rtd = mvx_runtime_dir();
     if (!d && rtd[0]) d = driver_try(rtd, name);
     if (!d) d = driver_try(MVX_DRIVER_DIR, name);
-    if (!d)
-        mvx_fatal("cannot load storage driver \"%s\" "
-                  "(searched $MVXDRIVERS, %s and %s)",
-                  name, rtd[0] ? rtd : "(runtime dir)", MVX_DRIVER_DIR);
+    if (!d) return NULL;
 
     loaded_drv *l = malloc(sizeof(loaded_drv));
     if (!l) mvx_fatal("out of memory loading driver");
@@ -99,6 +103,71 @@ static const mvx_driver *driver_load(const char *name) {
     l->drv = d;
     l->next = g_drivers;
     g_drivers = l;
+    return d;
+}
+
+/* Is this driver usable here?  The question a caller asks before offering the
+   user a choice, and the reason driver_find exists. */
+int mvx_driver_available(const char *name) {
+    return name && name[0] && driver_find(name) != NULL;
+}
+
+/* The drivers this host actually has, as a comma-separated list — so a prompt
+   can offer real options rather than ask the user to guess a name.  Read off
+   the same directories the loader searches, by their file names, since that is
+   the only enumeration there is: a driver is a libmvxdrv_<name> shared object.
+   Names only; loading each one to confirm would be a lot of dlopen for a list
+   that is about to be printed. */
+static void driver_list_dir(const char *dir, char *out, size_t cap) {
+    DIR *dh = opendir(dir);
+    if (!dh) return;
+    struct dirent *e;
+    while ((e = readdir(dh))) {
+        const char *n = e->d_name;
+        if (strncmp(n, "libmvxdrv_", 10) != 0) continue;
+        const char *suf = strstr(n + 10, DRV_SUFFIX);
+        if (!suf || suf[strlen(DRV_SUFFIX)]) continue;
+        char nm[64];
+        size_t nl = (size_t)(suf - (n + 10));
+        if (nl == 0 || nl >= sizeof nm) continue;
+        snprintf(nm, sizeof nm, "%.*s", (int)nl, n + 10);
+        /* one entry each, however many directories carry it */
+        size_t have = strlen(out);
+        char probe[70];
+        snprintf(probe, sizeof probe, "%s,", nm);
+        if (strstr(out, probe)) continue;
+        snprintf(out + have, cap - have, "%s,", nm);
+    }
+    closedir(dh);
+}
+
+void mvx_driver_names(char *out, size_t cap) {
+    if (!cap) return;
+    out[0] = '\0';
+    const char *sp = getenv("MVXDRIVERS");
+    if (sp && sp[0]) {
+        char *dup = strdup(sp);
+        for (char *tok = strtok(dup, ":"); tok; tok = strtok(NULL, ":"))
+            driver_list_dir(tok, out, cap);
+        free(dup);
+    }
+    const char *rtd = mvx_runtime_dir();
+    if (rtd[0]) driver_list_dir(rtd, out, cap);
+    driver_list_dir(MVX_DRIVER_DIR, out, cap);
+    size_t n = strlen(out);
+    if (n && out[n - 1] == ',') out[n - 1] = '\0';   /* drop the trailer */
+}
+
+/* Resolve a driver by name, or die.  For callers with nothing to fall back on;
+   anything that can offer the user a choice asks mvx_driver_available first. */
+static const mvx_driver *driver_load(const char *name) {
+    const mvx_driver *d = driver_find(name);
+    if (!d) {
+        const char *rtd = mvx_runtime_dir();
+        mvx_fatal("cannot load storage driver \"%s\" "
+                  "(searched $MVXDRIVERS, %s and %s)",
+                  name, rtd[0] ? rtd : "(runtime dir)", MVX_DRIVER_DIR);
+    }
     return d;
 }
 
