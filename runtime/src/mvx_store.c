@@ -3127,6 +3127,102 @@ void mvx_account_hash(char *buf, size_t cap) {
     }
 }
 
+/* --- when the backend a file names is not on this host (mvx#113) -----------
+ *
+ * Migration is per FILE, so a repository's files need not all live on the same
+ * backend — and a clone onto a machine without postgres is an ordinary thing to
+ * want.  Until now that was fatal, part-way through, leaving a half-made
+ * account behind.  Ask instead.
+ *
+ * THE QUESTION IS ASKED WHERE THE FILE IS CREATED, and nowhere else.  Rebinding
+ * a file on an ordinary OPEN would point a live file at empty local storage
+ * while its data sat in a backend that was merely unreachable — a far worse
+ * answer than refusing.  At create time there is no data to lose yet: a clone's
+ * records arrive from git afterwards.
+ *
+ * Per file, with an "always", because both halves matter: an account that
+ * deliberately spread files across backends should not have that flattened by
+ * one answer, and forty files must not mean forty questions.
+ */
+static char g_sub_all[64];        /* the "always" answer, for the rest of the run */
+static int  g_sub_skip_all;       /* likewise, for "no" */
+
+/* 1 -> use `chosen`; 0 -> skip this file; -1 -> abort the operation. */
+static int driver_substitute(const char *file, const char *want,
+                             char *chosen, size_t cap) {
+    /* SUPPLIED UP FRONT BEATS ASKING.  It is how a script says what it wants,
+       and it is the only reason this path is testable — a prompt no automated
+       test can reach is a prompt that rots. */
+    const char *env = getenv("MVXDRIVER");
+    if (env && env[0]) {
+        if (!mvx_driver_available(env)) {
+            fprintf(stderr, "MVXDRIVER=\"%s\" is not a driver on this host\n",
+                    env);
+            return -1;
+        }
+        snprintf(chosen, cap, "%s", env);
+        return 1;
+    }
+    if (g_sub_skip_all) return 0;
+    if (g_sub_all[0]) { snprintf(chosen, cap, "%s", g_sub_all); return 1; }
+
+    char avail[512];
+    mvx_driver_names(avail, sizeof avail);
+    for (char *c = avail; *c; c++) if (*c == ',') *c = ' ';
+
+    char dflt[600];
+    mvx_account_hash(dflt, sizeof dflt);
+    if (!dflt[0] || !mvx_driver_available(dflt))
+        snprintf(dflt, sizeof dflt, "lmdb");
+
+    fprintf(stderr, "\n%s: backend \"%s\" is not available on this host\n",
+            file, want);
+    fprintf(stderr, "  available: %s\n", avail[0] ? avail : "(none)");
+
+    /* NO TERMINAL MEANS NO GUESSING.  Not a prompt into a closed pipe, and not
+       a silent default that quietly puts the file somewhere nobody chose. */
+    if (!isatty(0)) {
+        fprintf(stderr, "  not a terminal - set MVXDRIVER=<name> to choose "
+                        "one, or run this where it can ask\n");
+        return -1;
+    }
+
+    for (;;) {
+        fprintf(stderr, "  create it on \"%s\" instead?"
+                        "  [y]es  [n]o, skip  [a]lways  [q]uit"
+                        "  (or type a driver name): ", dflt);
+        fflush(stderr);
+        char line[128];
+        if (!fgets(line, sizeof line, stdin)) {
+            fprintf(stderr, "\n");
+            return -1;                       /* input ended: abort, not guess */
+        }
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (!*p || strcasecmp(p, "y") == 0 || strcasecmp(p, "yes") == 0) {
+            snprintf(chosen, cap, "%s", dflt);
+            return 1;
+        }
+        if (strcasecmp(p, "n") == 0 || strcasecmp(p, "no") == 0) return 0;
+        if (strcasecmp(p, "q") == 0 || strcasecmp(p, "quit") == 0) return -1;
+        if (strcasecmp(p, "a") == 0 || strcasecmp(p, "all") == 0 ||
+            strcasecmp(p, "always") == 0) {
+            snprintf(g_sub_all, sizeof g_sub_all, "%s", dflt);
+            snprintf(chosen, cap, "%s", dflt);
+            return 1;
+        }
+        /* A name, so the user is not stuck with the one on offer. */
+        if (mvx_driver_available(p)) {
+            snprintf(chosen, cap, "%s", p);
+            return 1;
+        }
+        fprintf(stderr, "  \"%s\" is not a driver here\n", p);
+    }
+}
+
 int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                        const mv_value *type) {
     (void)ctx;
@@ -3169,6 +3265,21 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                             "address (give one, or set $MVXDAEMON)\n");
             return 0;
         }
+        /* The named backend may not be on this host — a clone of an account
+           whose files were migrated elsewhere is the ordinary way to get here.
+           Ask rather than abort, and bind to whatever is chosen so every later
+           OPEN resolves there (mvx#113).  The connection params belong to the
+           backend that is gone, so they do not travel with the substitution. */
+        /* NOT for `@name`: that is a connection PROFILE, not a driver — the
+           driver comes from the profile when the binding is resolved, so there
+           is nothing here to check and "@conn1" is not a file on disk. */
+        if (drvname[0] != '@' && !mvx_driver_available(drvname)) {
+            char sub[64];
+            int r = driver_substitute(cspec, drvname, sub, sizeof sub);
+            if (r <= 0) return 0;
+            snprintf(drvname, sizeof drvname, "%s", sub);
+            ap = "";
+        }
         binding_add(cspec, drvname, ap);
         char dataspec[1720], dictspec[1720];
         const mvx_driver *drv =
@@ -3209,6 +3320,20 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
 
     /* LMDB-backed: honour the file's local/remote binding.  DICT and
        DATA are created together, classic style. */
+    /* A binding inherited from somewhere else may name a backend this host does
+       not have — the same question as the USING path above, and asked here
+       because resolve() goes straight to the loader, which has nothing to fall
+       back on (mvx#113). */
+    {
+        char bdrv[64], bpar[512];
+        if (binding_for(cspec, bdrv, sizeof bdrv, bpar, sizeof bpar) &&
+            !mvx_driver_available(bdrv)) {
+            char sub[64];
+            int r = driver_substitute(cspec, bdrv, sub, sizeof sub);
+            if (r <= 0) return 0;
+            binding_add(cspec, sub, "");
+        }
+    }
     char dataspec[1720], dictspec[1720];
     const mvx_driver *drv = resolve(cspec, 0, dataspec, sizeof dataspec);
     if (!drv->create(dataspec, err, sizeof err)) return 0;
