@@ -72,6 +72,14 @@ runs:
         tag_name: ${{ github.ref_name }}
         name: ${{ inputs.title }} ${{ github.ref_name }}
         body: ${{ inputs.body }}
+        # THIS JOB CREATES THE RELEASE, so it is the one that decides whether it
+        # is a pre-release — the later jobs only attach assets to what it made.
+        # A tag carrying a suffix (2.0.0-beta1, 2.0.0-rc1) is a pre-release by
+        # definition, and GitHub has to be told: otherwise it publishes as a full
+        # release, "latest" points at it, and anyone installing by name gets a
+        # beta without having asked for one.  Every package using this action
+        # inherits the rule, which is the point of it living here.
+        prerelease: ${{ contains(github.ref_name, '-') }}
         files: |
           ${{ steps.pkg.outputs.tarball }}
           ${{ steps.pkg.outputs.checksum }}
