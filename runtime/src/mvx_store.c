@@ -3223,6 +3223,40 @@ static int driver_substitute(const char *file, const char *want,
     }
 }
 
+/* Bind `file` to the backend `want`, asking if this host does not have it.
+ *
+ * What a CLONE needs is the BINDING, not a create: on MVX a hash file comes
+ * into existence on first write, so materialising never calls CREATE-FILE for
+ * one — and routing this through CREATE-FILE instead fails outright, because by
+ * then the file's VOC pointer has been restored and creating over it is refused.
+ * Meanwhile the binding is the whole point: without it the file is silently made
+ * on the local default, which is exactly the substitution the user wanted to be
+ * asked about (mvx#113).
+ *
+ * Returns 1 when the file is bound (to `want`, or to whatever was chosen in its
+ * place), 0 when the user declined or there was nobody to ask. */
+int mvx_bind_driver(const char *file, const char *want) {
+    if (!file || !file[0] || !want || !want[0]) return 0;
+    /* A connection profile resolves its own driver later; nothing to check. */
+    if (want[0] == '@') { binding_add(file, want, ""); return 1; }
+
+    /* Already what this account would use: no binding, nothing to say.  An
+       entry here would only record what was true anyway, on every file. */
+    char dflt[600];
+    mvx_account_hash(dflt, sizeof dflt);
+    const char *eff = dflt[0] ? dflt : "lmdb";
+    if (strcasecmp(eff, want) == 0) return 1;
+
+    if (mvx_driver_available(want)) { binding_add(file, want, ""); return 1; }
+
+    char sub[64];
+    if (driver_substitute(file, want, sub, sizeof sub) != 1) return 0;
+    /* The substitute may BE the default, in which case say nothing rather than
+       record a binding that means "as usual". */
+    if (strcasecmp(eff, sub) != 0) binding_add(file, sub, "");
+    return 1;
+}
+
 int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                        const mv_value *type) {
     (void)ctx;

@@ -69,6 +69,13 @@ int mvx_driver_available(const char *name);
    real options instead of asking for a name the user has to guess. */
 void mvx_driver_names(char *out, size_t cap);
 
+/* Bind `file` to backend `want`, asking when this host does not have it.  What
+   a clone needs is the binding rather than a create — a hash file here comes
+   into existence on first write — and without it the file is silently made on
+   the local default, which is the substitution worth being asked about.
+   1 when bound (to `want` or a chosen substitute), 0 when declined. */
+int mvx_bind_driver(const char *file, const char *want);
+
 /* --- value lifecycle --------------------------------------------------- */
 void mv_init(mv_value *v);
 void mv_clear(mv_value *v);                         /* release + unassigned */
