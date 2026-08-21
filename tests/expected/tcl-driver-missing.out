@@ -1,0 +1,3 @@
+no override: not a terminal
+override:    file ZB created
+bad override: is not a driver on this host

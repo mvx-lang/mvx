@@ -1532,6 +1532,27 @@ check tcl-conn "$( \
 kill $APID 2>/dev/null
 rm -f "$ASOCK"
 
+# A BACKEND THIS HOST DOES NOT HAVE is a question, not a fatal error (mvx#113).
+# Migration is per file, so a repository's files need not all live on the same
+# backend, and cloning onto a machine without postgres is an ordinary thing to
+# want — it used to abort part-way through and leave a half-made account.
+#
+# The PROMPT cannot be driven from here, which is exactly why the override
+# exists: a path only reachable by hand is a path that rots.  So the three
+# non-interactive outcomes are what get asserted, and each is a different
+# answer to "what happens when nobody can be asked".
+DACCT="$TESTROOT/dacct"; mkdir -p "$DACCT"
+check tcl-driver-missing "$( \
+  printf 'no override: '; \
+  "$TCL" -a "$DACCT" -c "CREATE-FILE ZA USING nosuchdrv" </dev/null 2>&1 \
+    | sed -n 's/.*\(not a terminal\).*/\1/p'; \
+  printf 'override:    '; \
+  MVXDRIVER=lmdb "$TCL" -a "$DACCT" -c "CREATE-FILE ZB USING nosuchdrv" \
+    </dev/null 2>&1 | sed -n 's/.*\(file ZB created\).*/\1/p'; \
+  printf 'bad override: '; \
+  MVXDRIVER=alsonot "$TCL" -a "$DACCT" -c "CREATE-FILE ZC USING nosuchdrv" \
+    </dev/null 2>&1 | sed -n 's/.*\(is not a driver on this host\).*/\1/p')"
+
 # postgres backend — only when MVX_PG names a reachable database, e.g.
 #   MVX_PG='address=localhost:5432 dbname=mvx user=mvx password=mvx'
 # Records round-trip byte-exact through a table (id/rec BYTEA), bound

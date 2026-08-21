@@ -67,10 +67,17 @@ static const mvx_driver *driver_try(const char *dir, const char *name) {
     return d;                           /* handle stays open for process life */
 }
 
-/* Resolve a driver by name: $MVXDRIVERS (colon-separated), then the
-   built-in driver directory.  A missing driver is a configuration
-   error, not a missing file — fail loudly rather than taking ELSE. */
-static const mvx_driver *driver_load(const char *name) {
+/* Find a driver by name — $MVXDRIVERS (colon-separated), then libmvxrt's own
+   directory, then the compile-time one — and CACHE it.  NULL when there is no
+   such driver here.
+
+   Split out of driver_load so a caller can ASK about a driver instead of dying
+   for want of it.  An account can perfectly well name a backend this host was
+   not built with: migration is per FILE (ARCHITECTURE 4.4), so a repository's
+   files need not all live on the same one, and a clone onto a machine without
+   postgres is an ordinary thing to want to do rather than a misconfiguration.
+   Deciding that is the caller's business, not the loader's. */
+static const mvx_driver *driver_find(const char *name) {
     for (loaded_drv *l = g_drivers; l; l = l->next)
         if (strcmp(l->name, name) == 0) return l->drv;
 
@@ -88,10 +95,7 @@ static const mvx_driver *driver_load(const char *name) {
     const char *rtd = mvx_runtime_dir();
     if (!d && rtd[0]) d = driver_try(rtd, name);
     if (!d) d = driver_try(MVX_DRIVER_DIR, name);
-    if (!d)
-        mvx_fatal("cannot load storage driver \"%s\" "
-                  "(searched $MVXDRIVERS, %s and %s)",
-                  name, rtd[0] ? rtd : "(runtime dir)", MVX_DRIVER_DIR);
+    if (!d) return NULL;
 
     loaded_drv *l = malloc(sizeof(loaded_drv));
     if (!l) mvx_fatal("out of memory loading driver");
@@ -99,6 +103,71 @@ static const mvx_driver *driver_load(const char *name) {
     l->drv = d;
     l->next = g_drivers;
     g_drivers = l;
+    return d;
+}
+
+/* Is this driver usable here?  The question a caller asks before offering the
+   user a choice, and the reason driver_find exists. */
+int mvx_driver_available(const char *name) {
+    return name && name[0] && driver_find(name) != NULL;
+}
+
+/* The drivers this host actually has, as a comma-separated list — so a prompt
+   can offer real options rather than ask the user to guess a name.  Read off
+   the same directories the loader searches, by their file names, since that is
+   the only enumeration there is: a driver is a libmvxdrv_<name> shared object.
+   Names only; loading each one to confirm would be a lot of dlopen for a list
+   that is about to be printed. */
+static void driver_list_dir(const char *dir, char *out, size_t cap) {
+    DIR *dh = opendir(dir);
+    if (!dh) return;
+    struct dirent *e;
+    while ((e = readdir(dh))) {
+        const char *n = e->d_name;
+        if (strncmp(n, "libmvxdrv_", 10) != 0) continue;
+        const char *suf = strstr(n + 10, DRV_SUFFIX);
+        if (!suf || suf[strlen(DRV_SUFFIX)]) continue;
+        char nm[64];
+        size_t nl = (size_t)(suf - (n + 10));
+        if (nl == 0 || nl >= sizeof nm) continue;
+        snprintf(nm, sizeof nm, "%.*s", (int)nl, n + 10);
+        /* one entry each, however many directories carry it */
+        size_t have = strlen(out);
+        char probe[70];
+        snprintf(probe, sizeof probe, "%s,", nm);
+        if (strstr(out, probe)) continue;
+        snprintf(out + have, cap - have, "%s,", nm);
+    }
+    closedir(dh);
+}
+
+void mvx_driver_names(char *out, size_t cap) {
+    if (!cap) return;
+    out[0] = '\0';
+    const char *sp = getenv("MVXDRIVERS");
+    if (sp && sp[0]) {
+        char *dup = strdup(sp);
+        for (char *tok = strtok(dup, ":"); tok; tok = strtok(NULL, ":"))
+            driver_list_dir(tok, out, cap);
+        free(dup);
+    }
+    const char *rtd = mvx_runtime_dir();
+    if (rtd[0]) driver_list_dir(rtd, out, cap);
+    driver_list_dir(MVX_DRIVER_DIR, out, cap);
+    size_t n = strlen(out);
+    if (n && out[n - 1] == ',') out[n - 1] = '\0';   /* drop the trailer */
+}
+
+/* Resolve a driver by name, or die.  For callers with nothing to fall back on;
+   anything that can offer the user a choice asks mvx_driver_available first. */
+static const mvx_driver *driver_load(const char *name) {
+    const mvx_driver *d = driver_find(name);
+    if (!d) {
+        const char *rtd = mvx_runtime_dir();
+        mvx_fatal("cannot load storage driver \"%s\" "
+                  "(searched $MVXDRIVERS, %s and %s)",
+                  name, rtd[0] ? rtd : "(runtime dir)", MVX_DRIVER_DIR);
+    }
     return d;
 }
 
@@ -3058,6 +3127,136 @@ void mvx_account_hash(char *buf, size_t cap) {
     }
 }
 
+/* --- when the backend a file names is not on this host (mvx#113) -----------
+ *
+ * Migration is per FILE, so a repository's files need not all live on the same
+ * backend — and a clone onto a machine without postgres is an ordinary thing to
+ * want.  Until now that was fatal, part-way through, leaving a half-made
+ * account behind.  Ask instead.
+ *
+ * THE QUESTION IS ASKED WHERE THE FILE IS CREATED, and nowhere else.  Rebinding
+ * a file on an ordinary OPEN would point a live file at empty local storage
+ * while its data sat in a backend that was merely unreachable — a far worse
+ * answer than refusing.  At create time there is no data to lose yet: a clone's
+ * records arrive from git afterwards.
+ *
+ * Per file, with an "always", because both halves matter: an account that
+ * deliberately spread files across backends should not have that flattened by
+ * one answer, and forty files must not mean forty questions.
+ */
+static char g_sub_all[64];        /* the "always" answer, for the rest of the run */
+static int  g_sub_skip_all;       /* likewise, for "no" */
+
+/* 1 -> use `chosen`; 0 -> skip this file; -1 -> abort the operation. */
+static int driver_substitute(const char *file, const char *want,
+                             char *chosen, size_t cap) {
+    /* SUPPLIED UP FRONT BEATS ASKING.  It is how a script says what it wants,
+       and it is the only reason this path is testable — a prompt no automated
+       test can reach is a prompt that rots. */
+    const char *env = getenv("MVXDRIVER");
+    if (env && env[0]) {
+        if (!mvx_driver_available(env)) {
+            fprintf(stderr, "MVXDRIVER=\"%s\" is not a driver on this host\n",
+                    env);
+            return -1;
+        }
+        snprintf(chosen, cap, "%s", env);
+        return 1;
+    }
+    if (g_sub_skip_all) return 0;
+    if (g_sub_all[0]) { snprintf(chosen, cap, "%s", g_sub_all); return 1; }
+
+    char avail[512];
+    mvx_driver_names(avail, sizeof avail);
+    for (char *c = avail; *c; c++) if (*c == ',') *c = ' ';
+
+    char dflt[600];
+    mvx_account_hash(dflt, sizeof dflt);
+    if (!dflt[0] || !mvx_driver_available(dflt))
+        snprintf(dflt, sizeof dflt, "lmdb");
+
+    fprintf(stderr, "\n%s: backend \"%s\" is not available on this host\n",
+            file, want);
+    fprintf(stderr, "  available: %s\n", avail[0] ? avail : "(none)");
+
+    /* NO TERMINAL MEANS NO GUESSING.  Not a prompt into a closed pipe, and not
+       a silent default that quietly puts the file somewhere nobody chose. */
+    if (!isatty(0)) {
+        fprintf(stderr, "  not a terminal - set MVXDRIVER=<name> to choose "
+                        "one, or run this where it can ask\n");
+        return -1;
+    }
+
+    for (;;) {
+        fprintf(stderr, "  create it on \"%s\" instead?"
+                        "  [y]es  [n]o, skip  [a]lways  [q]uit"
+                        "  (or type a driver name): ", dflt);
+        fflush(stderr);
+        char line[128];
+        if (!fgets(line, sizeof line, stdin)) {
+            fprintf(stderr, "\n");
+            return -1;                       /* input ended: abort, not guess */
+        }
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (!*p || strcasecmp(p, "y") == 0 || strcasecmp(p, "yes") == 0) {
+            snprintf(chosen, cap, "%s", dflt);
+            return 1;
+        }
+        if (strcasecmp(p, "n") == 0 || strcasecmp(p, "no") == 0) return 0;
+        if (strcasecmp(p, "q") == 0 || strcasecmp(p, "quit") == 0) return -1;
+        if (strcasecmp(p, "a") == 0 || strcasecmp(p, "all") == 0 ||
+            strcasecmp(p, "always") == 0) {
+            snprintf(g_sub_all, sizeof g_sub_all, "%s", dflt);
+            snprintf(chosen, cap, "%s", dflt);
+            return 1;
+        }
+        /* A name, so the user is not stuck with the one on offer. */
+        if (mvx_driver_available(p)) {
+            snprintf(chosen, cap, "%s", p);
+            return 1;
+        }
+        fprintf(stderr, "  \"%s\" is not a driver here\n", p);
+    }
+}
+
+/* Bind `file` to the backend `want`, asking if this host does not have it.
+ *
+ * What a CLONE needs is the BINDING, not a create: on MVX a hash file comes
+ * into existence on first write, so materialising never calls CREATE-FILE for
+ * one — and routing this through CREATE-FILE instead fails outright, because by
+ * then the file's VOC pointer has been restored and creating over it is refused.
+ * Meanwhile the binding is the whole point: without it the file is silently made
+ * on the local default, which is exactly the substitution the user wanted to be
+ * asked about (mvx#113).
+ *
+ * Returns 1 when the file is bound (to `want`, or to whatever was chosen in its
+ * place), 0 when the user declined or there was nobody to ask. */
+int mvx_bind_driver(const char *file, const char *want) {
+    if (!file || !file[0] || !want || !want[0]) return 0;
+    /* A connection profile resolves its own driver later; nothing to check. */
+    if (want[0] == '@') { binding_add(file, want, ""); return 1; }
+
+    /* Already what this account would use: no binding, nothing to say.  An
+       entry here would only record what was true anyway, on every file. */
+    char dflt[600];
+    mvx_account_hash(dflt, sizeof dflt);
+    const char *eff = dflt[0] ? dflt : "lmdb";
+    if (strcasecmp(eff, want) == 0) return 1;
+
+    if (mvx_driver_available(want)) { binding_add(file, want, ""); return 1; }
+
+    char sub[64];
+    if (driver_substitute(file, want, sub, sizeof sub) != 1) return 0;
+    /* The substitute may BE the default, in which case say nothing rather than
+       record a binding that means "as usual". */
+    if (strcasecmp(eff, sub) != 0) binding_add(file, sub, "");
+    return 1;
+}
+
 int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                        const mv_value *type) {
     (void)ctx;
@@ -3100,6 +3299,21 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                             "address (give one, or set $MVXDAEMON)\n");
             return 0;
         }
+        /* The named backend may not be on this host — a clone of an account
+           whose files were migrated elsewhere is the ordinary way to get here.
+           Ask rather than abort, and bind to whatever is chosen so every later
+           OPEN resolves there (mvx#113).  The connection params belong to the
+           backend that is gone, so they do not travel with the substitution. */
+        /* NOT for `@name`: that is a connection PROFILE, not a driver — the
+           driver comes from the profile when the binding is resolved, so there
+           is nothing here to check and "@conn1" is not a file on disk. */
+        if (drvname[0] != '@' && !mvx_driver_available(drvname)) {
+            char sub[64];
+            int r = driver_substitute(cspec, drvname, sub, sizeof sub);
+            if (r <= 0) return 0;
+            snprintf(drvname, sizeof drvname, "%s", sub);
+            ap = "";
+        }
         binding_add(cspec, drvname, ap);
         char dataspec[1720], dictspec[1720];
         const mvx_driver *drv =
@@ -3140,6 +3354,20 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
 
     /* LMDB-backed: honour the file's local/remote binding.  DICT and
        DATA are created together, classic style. */
+    /* A binding inherited from somewhere else may name a backend this host does
+       not have — the same question as the USING path above, and asked here
+       because resolve() goes straight to the loader, which has nothing to fall
+       back on (mvx#113). */
+    {
+        char bdrv[64], bpar[512];
+        if (binding_for(cspec, bdrv, sizeof bdrv, bpar, sizeof bpar) &&
+            !mvx_driver_available(bdrv)) {
+            char sub[64];
+            int r = driver_substitute(cspec, bdrv, sub, sizeof sub);
+            if (r <= 0) return 0;
+            binding_add(cspec, sub, "");
+        }
+    }
     char dataspec[1720], dictspec[1720];
     const mvx_driver *drv = resolve(cspec, 0, dataspec, sizeof dataspec);
     if (!drv->create(dataspec, err, sizeof err)) return 0;
