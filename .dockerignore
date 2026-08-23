@@ -4,6 +4,7 @@ build
 *.dylib
 *.so
 mvxdata.lmdb
+demo-mvx/mvxdata.lmdb
 demo/mvxdata.lmdb
 docs/book
 node_modules
