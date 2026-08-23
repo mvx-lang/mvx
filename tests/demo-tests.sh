@@ -61,7 +61,12 @@ fi
 say "== demo account suite — platform=$PLATFORM"
 say "-- clone: the account arrives from git --"
 rm -rf "$A"
-clone_out=$( cd "$WORK" && "$MVXGIT" clone "$DEMO" demo 2>&1 )
+# UniVerse fixes an account's VOC flavour when it is created and cannot be
+# asked afterwards, so uv-git refuses to guess (mv_git#15).  PICK is what the
+# packages target.  Harmless on the platforms that do not need it.
+CLONE_FLAGS=""
+[ "$PLATFORM" = uv ] && CLONE_FLAGS="--flavour=PICK"
+clone_out=$( cd "$WORK" && "$MVXGIT" clone "$DEMO" demo $CLONE_FLAGS 2>&1 )
 if [ ! -d "$A" ]; then
   say "  FAIL clone — no account at $A"
   say "$clone_out" | sed 's/^/     /'
