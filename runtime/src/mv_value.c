@@ -11,6 +11,7 @@
  */
 
 #include "mvx_runtime.h"
+#include "mv_intern.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -48,18 +49,27 @@ void mvx_arity_check(const char *name, int32_t expected, int32_t got) {
 
 /* -------------------------------------------------------------- strings */
 
-static mv_string *str_alloc(int64_t len) {
-    mv_string *s = malloc(sizeof(mv_string) + (size_t)len + 1);
+static mv_string *str_alloc_cap(int64_t len, int64_t cap) {
+    if (cap < len) cap = len;
+    mv_string *s = malloc(sizeof(mv_string) + (size_t)cap + 1);
     if (!s) mvx_fatal("out of memory allocating string of length %lld",
                       (long long)len);
     s->refs = 1;
     s->len  = len;
+    s->cap  = cap;
+    s->ix   = NULL;
     s->data[len] = '\0';
     return s;
 }
 
+static mv_string *str_alloc(int64_t len) { return str_alloc_cap(len, len); }
+
+mv_string *mvx_str_alloc_cap(int64_t len, int64_t cap) {
+    return str_alloc_cap(len, cap);
+}
+
 static void str_release(mv_string *s) {
-    if (s && --s->refs == 0) free(s);
+    if (s && --s->refs == 0) { mvx_ix_drop(s); free(s); }
 }
 
 /* ------------------------------------------------------- value lifecycle */
@@ -90,7 +100,20 @@ void mv_set_dbl(mv_value *v, double d) {
     v->s = NULL;
 }
 
+/* Reuse the value's own buffer whenever it owns it outright and the bytes
+   fit.  Dynamic-array work rewrites the same variable over and over, so this
+   is the difference between an allocation per operation and none at all.
+   memmove rather than memcpy: p may point into the buffer being written,
+   as in X = X<1,2>. */
 void mv_set_str(mv_value *v, const char *p, int64_t len) {
+    if (v->tag == MV_STR && v->s->refs == 1 && v->s->cap >= len) {
+        mv_string *s = v->s;
+        memmove(s->data, p, (size_t)len);
+        s->len = len;
+        s->data[len] = '\0';
+        mvx_ix_drop(s);
+        return;
+    }
     mv_string *s = str_alloc(len);
     memcpy(s->data, p, (size_t)len);
     if (v->tag == MV_STR) str_release(v->s);
@@ -255,7 +278,20 @@ void mv_cat(mv_value *dst, const mv_value *a, const mv_value *b) {
     int64_t la, lb;
     const char *pa = val_chars(a, ba, sizeof ba, &la);
     const char *pb = val_chars(b, bb, sizeof bb, &lb);
-    mv_string *s = str_alloc(la + lb);
+    /* S = S : X against a buffer this value owns and that already has the
+       room: append in place.  With the headroom below, building a record up
+       one field at a time stops being quadratic. */
+    if (dst == a && dst->tag == MV_STR && dst->s->refs == 1 &&
+        pa == dst->s->data && dst->s->cap >= la + lb) {
+        mv_string *s = dst->s;
+        memmove(s->data + la, pb, (size_t)lb);
+        s->len = la + lb;
+        s->data[s->len] = '\0';
+        mvx_ix_drop(s);
+        return;
+    }
+    int64_t need = la + lb;
+    mv_string *s = str_alloc_cap(need, need + need / 2 + 16);
     memcpy(s->data, pa, (size_t)la);
     memcpy(s->data + la, pb, (size_t)lb);
     if (dst->tag == MV_STR) str_release(dst->s);
