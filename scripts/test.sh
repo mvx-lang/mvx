@@ -77,7 +77,8 @@ normalise() {
   # differs by platform; @ROOT@ hides the path but not the trailing
   # spaces, so squeeze 2+ spaces after a normalised path token to one.
   sed -E -e "s#$TESTROOT#@TESTROOT@#g" -e "s#$ROOT#@ROOT@#g" \
-         -e "s#(@(TEST)?ROOT@[^ ]*)  +#\1 #g"
+         -e "s#(@(TEST)?ROOT@[^ ]*)  +#\1 #g" \
+         -e 's/^([a-z][a-z0-9_-]*)@[0-9][^ ]* +/\1@VER /'
 }
 
 # ---------------------------------------------------------------- phase 1
