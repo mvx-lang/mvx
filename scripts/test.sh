@@ -103,6 +103,7 @@ lang smoke
 lang goto
 lang case
 lang dynarr
+lang dynalias
 lang conv
 lang strfns world
 lang strmath

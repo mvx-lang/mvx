@@ -15,6 +15,7 @@
  * marks, plus LEN / COUNT / DCOUNT.
  */
 #include "mvx_runtime.h"
+#include "mv_intern.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -61,28 +62,156 @@ static int64_t span_count(span s, char mark) {
 }
 
 /* Span of the idx-th (1-based) mark-separated element; empty span at the
-   end when idx is past the last element. */
+   end when idx is past the last element.
+
+   A plain byte loop, not memchr per element: dynamic-array elements are
+   routinely one or two bytes, and at that size a call into memchr costs more
+   than the comparison it saves. */
 static span nth_span(span s, char mark, int64_t idx) {
-    const char *end = s.p + s.len;
-    const char *q = s.p;
+    const char *p = s.p, *end = s.p + s.len;
     int64_t n = 1;
     while (n < idx) {
-        const char *m = memchr(q, mark, (size_t)(end - q));
-        if (!m) return (span){end, 0};
-        q = m + 1;
+        while (p < end && *p != mark) p++;
+        if (p == end) return (span){end, 0};
+        p++;
         n++;
     }
-    const char *m = memchr(q, mark, (size_t)(end - q));
-    return (span){q, (m ? m : end) - q};
+    const char *q = p;
+    while (q < end && *q != mark) q++;
+    return (span){p, q - p};
+}
+
+/* ------------------------------------------------------- element index */
+
+/* Walking to element N is linear, so a loop over a long dynamic array is
+   quadratic.  Where a range is big enough to pay for it, record the offset of
+   every IX_STRIDE-th element so a lookup walks at most IX_STRIDE-1 marks, and
+   record the element count so a bounds check costs nothing.
+
+   The threshold is in bytes, not elements: what an index saves is scanning,
+   and a long attribute holding two values is just as expensive to walk past
+   as a short one holding fifty.  An index covers one byte range at one mark
+   level, and a subscript touches several levels in turn, so a string keeps a
+   short chain of them -- one per level -- rather than a single slot the
+   levels would evict each other from.  All of it is dropped the moment the
+   bytes move. */
+#define IX_MIN_BYTES 128
+#define IX_STRIDE    16
+#define IX_MAX_CHAIN 3
+
+struct mv_ix {
+    struct mv_ix *next;
+    char    mark;
+    int64_t base, blen;     /* the indexed range, as an offset into data */
+    int64_t n;              /* elements in it */
+    int64_t noff;
+    int64_t off[];          /* off[k]: start of element k*IX_STRIDE + 1 */
+};
+
+void mvx_ix_drop(mv_string *s) {
+    if (!s) return;
+    struct mv_ix *ix = s->ix;
+    while (ix) { struct mv_ix *nx = ix->next; free(ix); ix = nx; }
+    s->ix = NULL;
+}
+
+static struct mv_ix *ix_build(mv_string *st, span sp, char mark) {
+    int64_t n = span_count(sp, mark);
+    int64_t noff = (n + IX_STRIDE - 1) / IX_STRIDE;
+    if (noff < 1) noff = 1;
+    struct mv_ix *ix = malloc(sizeof *ix + (size_t)noff * sizeof(int64_t));
+    if (!ix) return NULL;
+    ix->mark = mark;
+    ix->base = sp.p - st->data;
+    ix->blen = sp.len;
+    ix->n    = n;
+    ix->noff = noff;
+    const char *p = sp.p, *end = sp.p + sp.len;
+    int64_t elem = 0, k = 0;
+    ix->off[k++] = 0;
+    while (p < end && k < noff) {
+        if (*p == mark) {
+            elem++;
+            if (elem % IX_STRIDE == 0) ix->off[k++] = (p + 1) - sp.p;
+        }
+        p++;
+    }
+    while (k < noff) ix->off[k++] = sp.len;
+
+    ix->next = st->ix;
+    st->ix = ix;
+    /* Keep the chain short; three levels is all a subscript can name. */
+    struct mv_ix *q = ix;
+    for (int i = 0; i < IX_MAX_CHAIN - 1 && q; i++) q = q->next;
+    if (q && q->next) {
+        struct mv_ix *drop = q->next;
+        q->next = NULL;
+        while (drop) { struct mv_ix *nx = drop->next; free(drop); drop = nx; }
+    }
+    return ix;
+}
+
+/* The index for this range and level, building one if it is worth it. */
+static struct mv_ix *ix_for(mv_string *st, span sp, char mark) {
+    if (!st) return NULL;
+    int64_t base = sp.p - st->data;
+    for (struct mv_ix *ix = st->ix; ix; ix = ix->next)
+        if (ix->mark == mark && ix->base == base && ix->blen == sp.len)
+            return ix;
+    if (sp.len < IX_MIN_BYTES) return NULL;
+    return ix_build(st, sp, mark);
+}
+
+/* nth_span, using the index when there is one.  The last element needs no
+   forward scan at all: it runs to the end of the range by definition. */
+static span nth_span_ix(mv_string *st, span sp, char mark, int64_t idx) {
+    struct mv_ix *ix = ix_for(st, sp, mark);
+    if (!ix || idx > ix->n) return nth_span(sp, mark, idx);
+    int64_t b = (idx - 1) / IX_STRIDE;
+    int64_t rem = (idx - 1) % IX_STRIDE;
+    const char *p = sp.p + ix->off[b], *end = sp.p + sp.len;
+    while (rem-- > 0) {
+        while (p < end && *p != mark) p++;
+        if (p < end) p++;
+    }
+    if (idx == ix->n) return (span){p, end - p};
+    const char *q = p;
+    while (q < end && *q != mark) q++;
+    return (span){p, q - p};
+}
+
+/* nth_span_ix, reporting whether idx was within the element count, so a
+   caller needing bounds does not have to count them in a separate pass. */
+static span nth_span_chk(mv_string *st, span sp, char mark, int64_t idx,
+                         int *ok) {
+    struct mv_ix *ix = ix_for(st, sp, mark);
+    if (ix) {
+        *ok = idx <= ix->n;
+        return *ok ? nth_span_ix(st, sp, mark, idx) : (span){sp.p + sp.len, 0};
+    }
+    /* no index: walk, and notice running off the end on the way */
+    const char *p = sp.p, *end = sp.p + sp.len;
+    int64_t n = 1;
+    while (n < idx) {
+        while (p < end && *p != mark) p++;
+        if (p == end) { *ok = 0; return (span){end, 0}; }
+        p++;
+        n++;
+    }
+    *ok = 1;
+    const char *q = p;
+    while (q < end && *q != mark) q++;
+    return (span){p, q - p};
 }
 
 void mv_extract_fn(mv_value *dst, const mv_value *src, int64_t a,
                    int64_t v, int64_t s) {
     char nb[40];
     span sp = val_span(src, nb, sizeof nb);
-    if (a > 0) sp = nth_span(sp, AM, a);
-    if (v > 0) sp = nth_span(sp, VM, v);
-    if (s > 0) sp = nth_span(sp, SM, s);
+    mv_string *st = src->tag == MV_STR ? src->s : NULL;
+    if (a > 0) sp = nth_span_ix(st, sp, AM, a);
+    if (v > 0) sp = nth_span_ix(st, sp, VM, v);
+    if (s > 0) sp = nth_span_ix(st, sp, SM, s);
     mv_set_str(dst, sp.p, sp.len);
 }
 
@@ -185,6 +314,62 @@ static void modify(dbuf *out, span s, const char *marks,
     bput(out, e.p + e.len, s.p + s.len - (e.p + e.len));
 }
 
+/* Locate the element X<a,v,s> names, failing if any level would have to be
+   created.  Only the in-place path uses this; the general path pads. */
+static int locate(mv_string *st, int64_t a, int64_t v, int64_t s_, span *out) {
+    static const char marks[3] = {AM, VM, SM};
+    span sp = {st->data, st->len};
+    int64_t idx[3];
+    int n = 0;
+    idx[n++] = a;
+    if (v != 0 || s_ != 0) idx[n++] = v;
+    if (s_ != 0) idx[n++] = s_;
+    for (int i = 0; i < n; i++) {
+        int64_t k = idx[i];
+        if (k < 0) return 0;                    /* append: needs the rebuild */
+        if (k == 0) k = 1;
+        int ok;
+        sp = nth_span_chk(st, sp, marks[i], k, &ok);
+        if (!ok) return 0;
+    }
+    *out = sp;
+    return 1;
+}
+
+/* Replace an existing element without rebuilding the string.
+
+   X<a,v,s> = y compiles to dst == src (see codegen.cpp), so a value that owns
+   its buffer outright can be patched where it stands.  Same-length is the
+   cheapest case -- a byte copy, and the index stays exact -- and a length
+   change is still only a memmove of the tail while the capacity holds.
+   Returns 0 when the general path has to run instead. */
+static int inplace_repl(mv_value *dst, const mv_value *src, int64_t a,
+                        int64_t v, int64_t s_, const mv_value *val) {
+    if (dst != src || dst->tag != MV_STR || dst->s->refs != 1) return 0;
+    mv_string *st = dst->s;
+    char vb[40];
+    span vs = val_span(val, vb, sizeof vb);
+    span e;
+    if (!locate(st, a, v, s_, &e)) return 0;
+
+    int64_t at = e.p - st->data;
+    int64_t delta = vs.len - e.len;
+    if (delta == 0) {
+        memmove(st->data + at, vs.p, (size_t)vs.len);   /* may overlap */
+        return 1;                                       /* index still exact */
+    }
+    /* The value must not live in the bytes about to shift. */
+    if (vs.p >= st->data && vs.p < st->data + st->len) return 0;
+    if (st->len + delta > st->cap) return 0;
+    char *tail = st->data + at + e.len;
+    memmove(tail + delta, tail, (size_t)(st->len - at - e.len));
+    memcpy(st->data + at, vs.p, (size_t)vs.len);
+    st->len += delta;
+    st->data[st->len] = '\0';
+    mvx_ix_drop(st);            /* every offset past the edit has moved */
+    return 1;
+}
+
 static void run_op(mv_value *dst, const mv_value *src, int64_t a,
                    int64_t v, int64_t s, const mv_value *val, int op) {
     char nb[40], vb[40];
@@ -198,12 +383,27 @@ static void run_op(mv_value *dst, const mv_value *src, int64_t a,
     if (s != 0) idx[n++] = s;
     dbuf out = {0, 0, 0};
     modify(&out, sp, marks, idx, n, vs, op);
-    mv_set_str(dst, out.d ? out.d : "", out.len);
+    /* Land the result in a buffer with room to spare, so the next edit of
+       this variable can be an in-place patch rather than another rebuild. */
+    if (dst->tag == MV_STR && dst->s->refs == 1 && dst->s->cap >= out.len) {
+        mv_string *st = dst->s;
+        memcpy(st->data, out.d ? out.d : "", (size_t)out.len);
+        st->len = out.len;
+        st->data[out.len] = '\0';
+        mvx_ix_drop(st);
+    } else {
+        mv_string *st = mvx_str_alloc_cap(out.len, out.len + out.len / 2 + 16);
+        memcpy(st->data, out.d ? out.d : "", (size_t)out.len);
+        mv_clear(dst);
+        dst->tag = MV_STR;
+        dst->s = st;
+    }
     free(out.d);
 }
 
 void mv_replace_fn(mv_value *dst, const mv_value *src, int64_t a,
                    int64_t v, int64_t s, const mv_value *val) {
+    if (inplace_repl(dst, src, a, v, s, val)) return;
     run_op(dst, src, a, v, s, val, OP_REPL);
 }
 

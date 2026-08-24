@@ -35,9 +35,15 @@ enum {
     MV_FILE       = 4,      /* file variable; i holds the mvx_file* */
 };
 
+/* Lazily built offset index over one mark level; see mv_dyn.c.  Private to
+   the runtime -- generated code never dereferences an mv_string. */
+typedef struct mv_ix mv_ix;
+
 typedef struct mv_string {
     int64_t refs;
     int64_t len;
+    int64_t cap;                /* usable bytes in data[]; cap >= len */
+    mv_ix  *ix;                 /* NULL until a subscript asks for one */
     char    data[];             /* NUL-terminated */
 } mv_string;
 
