@@ -141,8 +141,18 @@ int main(int argc, char **argv) {
     std::vector<std::string> sources, objects;
     // Preprocessor symbols: MVX identifies this compiler to portable
     // source ($IFDEF MVX ... $ELSE ... $ENDIF).
+    //
+    // ENGINE says something different and more useful to portable source: the
+    // record-git engine is callable in-process here, as an ordinary
+    // subroutine.  That is true of MVX and of jBASE (which reaches C with
+    // DEFC and can hand it the session), and false of UniData and UniVerse,
+    // where a handler has to do the work in BASIC instead.  A handler that
+    // only wants to know "can I just call the engine?" should ask that rather
+    // than name a platform -- naming platforms is how jBASE ended up excluded
+    // from things it can do (mv_git#114).
     std::map<std::string, std::string> defines;
     defines["MVX"] = "";
+    defines["ENGINE"] = "";
 
     // Package extension functions available to this compile (config, not a flag).
     std::set<std::string> extFuncs = loadExtFuncs();
