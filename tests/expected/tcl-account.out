@@ -3,6 +3,7 @@
 G200         Gadget      
 W100         Widget      
 2 record(s) listed
-FOO
-001 V
-002 CATALOG/FOO
+MYPARA
+001 PA
+002 HELLO
+FOO not on file
