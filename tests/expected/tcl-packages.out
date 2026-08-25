@@ -1,7 +1,7 @@
 linked @ROOT@/packages/git
 linked @ROOT@/packages/cmd
 linked @ROOT@/packages/getopt
-git@VER ok     @ROOT@/packages/git requires cmd [mvx udt]
+git@VER ok     @ROOT@/packages/git requires cmd [mvx udt uv]
 cmd@VER ok     @ROOT@/packages/cmd requires getopt (builds with mvpkg) [mvx udt]
 getopt@VER ok     @ROOT@/packages/getopt builds with mvpkg [mvx udt]
 3 package(s) linked
