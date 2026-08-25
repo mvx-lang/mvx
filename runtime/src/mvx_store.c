@@ -2978,6 +2978,21 @@ int mvx_openaccount(void) {
    classifier drops V/K.) */
 int mvx_voc_class(const char *type, int64_t len) {
     static const struct { const char *t; int c; } tbl[] = {
+        /* A CATALOGUED VERB IS REBUILT, NOT CARRIED.  `CATALOG BP MYPROG`
+           writes `V` / CATALOG/MYPROG, and CATALOG/ is furniture that never
+           travels (mv_git#130) -- so the committed record named a directory the
+           clone does not have.  BP travels, and BUILD re-catalogues from it when
+           it provisions an account, which is the same assumption the CATALOG
+           provisioning-pointer skip already rests on (mvx#77).  So it is
+           derived, like a file's own pointer, and a wholesale add leaves it out
+           (mvx#133); naming it explicitly still stages it.
+
+           This REPLACES the earlier reading, which was that an MVX account's
+           VOC holds only the user's own verbs and those are kept.  True as far
+           as it went -- they are the user's, not the system's -- but being the
+           user's and being DERIVED are different questions, and the second one
+           decides this. */
+        {"V", 1},                           /* catalogued verb */
         {"F", 2}, {"DIR", 2}, {"Q", 2},     /* file / directory / q-pointer */
         {NULL, 0}
     };

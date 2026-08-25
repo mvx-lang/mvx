@@ -795,6 +795,7 @@ OPEN "DICT", "PARTS" TO D ELSE STOP
 WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
 OPEN "VOC" TO V ELSE STOP
 WRITE "V":@AM:"CATALOG/FOO" ON V, "FOO"
+WRITE "PA":@AM:"HELLO" ON V, "MYPARA"
 PRINT "seeded"
 EOF
   "$MVX" "$rtseed" -o "$TESTROOT/rtseedbin" 2>/dev/null
@@ -806,9 +807,16 @@ EOF
   RTC="$TESTROOT/rtclone"
   git clone -q "$RTS" "$RTC" >/dev/null 2>&1
   MVX="$TCL" "$CONV" "$RTC" >/dev/null 2>&1
+  # WHICH VOC RECORDS SURVIVE THE ROUND TRIP, asserted both ways (mvx#133).
+  # MYPARA is the account's own and must come back.  FOO is a catalogued verb --
+  # `CATALOG` writes it and BUILD writes it again when it provisions the clone,
+  # so it is derived plumbing and a wholesale add leaves it out, exactly like a
+  # file's own pointer.  Asserting only the survivor would not notice the rule
+  # being applied to the wrong half.
   check tcl-account "$(printf '%s\n' \
     'COUNT PARTS' \
     'LIST PARTS NAME BY NAME' \
+    'CT VOC MYPARA' \
     'CT VOC FOO' | "$TCL" -a "$RTC" 2>&1 | normalise)"
 else
   echo "  (skipping tcl-account: git or mvx-git unavailable)"
