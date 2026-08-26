@@ -317,6 +317,7 @@ message(STATUS "  lmdbd daemon    : ${MVX_WITH_DAEMON}")
 message(STATUS "")
 
 set(MVX_SOURCE_DIR ${CMAKE_SOURCE_DIR})
+set(MVX_BINARY_DIR ${CMAKE_BINARY_DIR})
 configure_file(${CMAKE_SOURCE_DIR}/scripts/install-system.cmake.in
                ${CMAKE_BINARY_DIR}/install-system.cmake @ONLY)
 install(SCRIPT ${CMAKE_BINARY_DIR}/install-system.cmake)

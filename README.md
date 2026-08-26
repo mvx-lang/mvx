@@ -238,6 +238,13 @@ package, libgit2 (`brew install libgit2`). See the
 - `packages/` — shipped packages (`cmd`, `git`, `sample`)
 - `docs/` — the documentation, a submodule of the GitHub wiki
 - `examples/` — larger sample programs (full-screen demo, Snake)
+- `demo/` — the demo account (a submodule of `mvx-lang/demo`): clients,
+  inventory, orders with line items, staff. Committed in the open account
+  format, so the same repository builds an account on UniData and UniVerse
+  as well as here — dictionaries, conversions, associations and I-types
+  included
+- `demo-mvx/` — an MVX-only demo account, for what does not travel: the
+  mouse demo needs terminal support UniVerse has not got
 - `bench/sieve.b` — the prime-sieve benchmark
 - `tests/`, `scripts/test.sh` — the test harness
 
