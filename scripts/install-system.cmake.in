@@ -13,6 +13,7 @@
 # rpath points at the install's own lib directory rather than the build
 # tree.  The master VOC and its dictionary are copied alongside.
 set(SRC "@MVX_SOURCE_DIR@")
+set(BIN "@MVX_BINARY_DIR@")
 set(SYS "${CMAKE_INSTALL_PREFIX}/share/mvx/system")
 set(MVXBASIC "${CMAKE_INSTALL_PREFIX}/bin/mvx-basic")
 
@@ -20,6 +21,25 @@ file(MAKE_DIRECTORY "${SYS}/CATALOG")
 file(REMOVE_RECURSE "${SYS}/VOC" "${SYS}/VOC.DICT")
 file(COPY "${SRC}/system/VOC"      DESTINATION "${SYS}")
 file(COPY "${SRC}/system/VOC.DICT" DESTINATION "${SYS}")
+
+# THE DESCRIPTOR SHIPS TOO.  The build target copies system/.mvx into the build
+# tree and this script did not copy it into the install, so a published
+# toolchain's system account was VOC + VOC.DICT + CATALOG and nothing else.
+# mkaccount.sh seeds every new account's permit/deny baseline from it, so
+# without it an account made from an installed toolchain has no OS-command
+# policy at all (mvx#137).  A dotfile is easy to miss in a copy list; naming it
+# explicitly is the point.
+file(COPY "${SRC}/system/.mvx" DESTINATION "${SYS}")
+
+# The packages built into the system account (MVX_PACKAGES: json, http) live in
+# the BUILD tree, not the source -- EXPORTS names their functions and LIB holds
+# them.  Without these an installed toolchain resolves none of the system
+# package functions a program may call.
+foreach(part EXPORTS LIB)
+  if(EXISTS "${BIN}/system/${part}")
+    file(COPY "${BIN}/system/${part}" DESTINATION "${SYS}")
+  endif()
+endforeach()
 
 file(GLOB verbs "${SRC}/verbs/*.b")
 foreach(v ${verbs})
