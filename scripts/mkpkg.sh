@@ -212,6 +212,47 @@ if [ -n "$SUBS" ]; then
   echo "  built LIB/lib$PKGNAME.$EXT"
 fi
 
+# --- VOC verb records: DERIVED, from a declaration ------------------------
+# A catalogued verb's VOC record is `V` + `CATALOG/<name>`, and every other MV
+# system recreates it when the program is catalogued -- UniData's and
+# UniVerse's CATALOG verb writes it, and BUILD re-catalogues from BP when it
+# provisions an account.  mvx#133 made MVX agree (`V` is class 1 in
+# mvx_voc_class), so mv_git and friends should not be committing those records
+# at all.  Nothing regenerated them here, which is why they still were.
+#
+# WHICH programs are verbs is the part that cannot be inferred.  Everything
+# above that is not a SUBROUTINE compiles to CATALOG/, but "not a subroutine"
+# is not "is a verb": writing a record per catalogued program registers
+# mv_git's GIT.AGENT, GIT.REGACCT and GIT.SETUP alongside GIT, three commands
+# the package does not expose.  That selection exists nowhere else in the
+# package, so the package states it -- one name per line in VERBS, beside
+# EXPORTS, and the record becomes derived like everything else (mvx#136).
+#
+# No VERBS file means no records, which is what every package did before this.
+if [ -f "$PKG/VERBS" ]; then
+  NVERB=0
+  while IFS= read -r vline || [ -n "$vline" ]; do
+    case "$vline" in ''|\#*) continue ;; esac
+    vname="${vline%%[ 	]*}"
+    [ -n "$vname" ] || continue
+    # A name that is not catalogued is a typo, not a verb.  Failing here beats
+    # publishing a VOC record pointing at nothing -- which is the check the
+    # release job already makes, too late, on the built artifact.
+    if [ ! -e "$PKG/CATALOG/$vname" ]; then
+      echo "mkpkg: VERBS names '$vname' but there is no CATALOG/$vname" >&2
+      exit 1
+    fi
+    # Only ever replaces a V record.  A VOC entry of any other class is the
+    # account's own data -- mv_eb keeps its coding standard in VOC/%CS% -- and
+    # is not this script's to overwrite.
+    if [ ! -f "$PKG/VOC/$vname" ] || [ "$(head -n1 "$PKG/VOC/$vname")" = V ]; then
+      printf 'V\nCATALOG/%s' "$vname" > "$PKG/VOC/$vname"
+    fi
+    NVERB=$((NVERB+1))
+  done < "$PKG/VERBS"
+  echo "  registered $NVERB verb(s) from VERBS"
+fi
+
 # bin/: standalone OS commands a package ships (built by build-native.sh
 # or checked in).  Symlink them beside mvx so they land on the dev PATH;
 # an install would copy them into a real bin directory instead.
