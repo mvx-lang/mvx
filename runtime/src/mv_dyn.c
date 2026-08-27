@@ -16,6 +16,7 @@
  */
 #include "mvx_runtime.h"
 #include "mv_intern.h"
+#include "mv_bytes.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -58,7 +59,7 @@ static inline int64_t mv_itoa64(char *buf, int64_t v) {
 static span val_span(const mv_value *v, char *buf, size_t cap) {
     switch (v->tag) {
     case MV_STR:
-        return (span){v->s->data, v->s->len};
+        return (span){mv_str_bytes(v->s), v->s->len};
     case MV_INT:
         return (span){buf, mv_itoa64(buf, v->i)};
     case MV_DBL: {
@@ -147,7 +148,7 @@ static struct mv_ix *ix_build(mv_string *st, span sp, char mark) {
     struct mv_ix *ix = malloc(sizeof *ix + (size_t)noff * sizeof(int64_t));
     if (!ix) return NULL;
     ix->mark = mark;
-    ix->base = sp.p - st->data;
+    ix->base = sp.p - mv_str_wbytes(st);
     ix->blen = sp.len;
     ix->n    = n;
     ix->noff = noff;
@@ -179,7 +180,7 @@ static struct mv_ix *ix_build(mv_string *st, span sp, char mark) {
 /* The index for this range and level, building one if it is worth it. */
 static struct mv_ix *ix_for(mv_string *st, span sp, char mark) {
     if (!st) return NULL;
-    int64_t base = sp.p - st->data;
+    int64_t base = sp.p - mv_str_wbytes(st);
     for (struct mv_ix *ix = st->ix; ix; ix = ix->next)
         if (ix->mark == mark && ix->base == base && ix->blen == sp.len)
             return ix;
@@ -348,7 +349,7 @@ static void modify(dbuf *out, span s, const char *marks,
    created.  Only the in-place path uses this; the general path pads. */
 static int locate(mv_string *st, int64_t a, int64_t v, int64_t s_, span *out) {
     static const char marks[3] = {AM, VM, SM};
-    span sp = {st->data, st->len};
+    span sp = {mv_str_bytes(st), st->len};
     int64_t idx[3];
     int n = 0;
     idx[n++] = a;
@@ -382,20 +383,20 @@ static int inplace_repl(mv_value *dst, const mv_value *src, int64_t a,
     span e;
     if (!locate(st, a, v, s_, &e)) return 0;
 
-    int64_t at = e.p - st->data;
+    int64_t at = e.p - mv_str_wbytes(st);
     int64_t delta = vs.len - e.len;
     if (delta == 0) {
-        memmove(st->data + at, vs.p, (size_t)vs.len);   /* may overlap */
+        memmove(mv_str_wbytes(st) + at, vs.p, (size_t)vs.len);   /* may overlap */
         return 1;                                       /* index still exact */
     }
     /* The value must not live in the bytes about to shift. */
-    if (vs.p >= st->data && vs.p < st->data + st->len) return 0;
+    if (vs.p >= mv_str_wbytes(st) && vs.p < mv_str_wbytes(st) + st->len) return 0;
     if (st->len + delta > st->cap) return 0;
-    char *tail = st->data + at + e.len;
+    char *tail = mv_str_wbytes(st) + at + e.len;
     memmove(tail + delta, tail, (size_t)(st->len - at - e.len));
-    memcpy(st->data + at, vs.p, (size_t)vs.len);
+    memcpy(mv_str_wbytes(st) + at, vs.p, (size_t)vs.len);
     st->len += delta;
-    st->data[st->len] = '\0';
+    mv_str_wbytes(st)[st->len] = '\0';
     mvx_ix_drop(st);            /* every offset past the edit has moved */
     return 1;
 }
@@ -417,13 +418,13 @@ static void run_op(mv_value *dst, const mv_value *src, int64_t a,
        this variable can be an in-place patch rather than another rebuild. */
     if (dst->tag == MV_STR && dst->s->refs == 1 && dst->s->cap >= out.len) {
         mv_string *st = dst->s;
-        memcpy(st->data, out.d ? out.d : "", (size_t)out.len);
+        memcpy(mv_str_wbytes(st), out.d ? out.d : "", (size_t)out.len);
         st->len = out.len;
-        st->data[out.len] = '\0';
+        mv_str_wbytes(st)[out.len] = '\0';
         mvx_ix_drop(st);
     } else {
         mv_string *st = mvx_str_alloc_cap(out.len, out.len + out.len / 2 + 16);
-        memcpy(st->data, out.d ? out.d : "", (size_t)out.len);
+        memcpy(mv_str_wbytes(st), out.d ? out.d : "", (size_t)out.len);
         mv_clear(dst);
         dst->tag = MV_STR;
         dst->s = st;

@@ -15,6 +15,7 @@
 #endif
 
 #include "mvx_runtime.h"
+#include "mv_bytes.h"
 
 #include <dlfcn.h>
 #include <libgen.h>
@@ -187,9 +188,9 @@ void mv_print(mvx_ctx *ctx, const mv_value *v) {
     char buf[40];
     switch (v->tag) {
     case MV_STR:
-        fwrite(v->s->data, 1, (size_t)v->s->len, stdout);
+        fwrite(mv_str_bytes(v->s), 1, (size_t)v->s->len, stdout);
         for (int64_t k = 0; k < v->s->len; k++)
-            ctx->print_col = (v->s->data[k] == '\n') ? 0 : ctx->print_col + 1;
+            ctx->print_col = (mv_str_bytes(v->s)[k] == '\n') ? 0 : ctx->print_col + 1;
         return;
     case MV_INT:
         snprintf(buf, sizeof buf, "%lld", (long long)v->i);

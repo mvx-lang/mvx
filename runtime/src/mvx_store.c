@@ -20,6 +20,7 @@
  */
 #include "mvx_driver.h"
 #include "mvx_map.h"
+#include "mv_bytes.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -2740,7 +2741,7 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
         char err[256] = "";
         if (lmdb->names(NULL, &names, err, sizeof err) &&
             names.tag == MV_STR && names.s->len > 0) {
-            const char *p = names.s->data, *end = p + names.s->len;
+            const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
             while (p < end) {
                 const char *am = memchr(p, '\xFE', (size_t)(end - p));
                 size_t n = (am ? am : end) - p;
@@ -2820,7 +2821,7 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                 char err[256] = "";
                 if (pg->names(bparm, &names, err, sizeof err) &&
                     names.tag == MV_STR && names.s->len > 0) {
-                    const char *p = names.s->data, *end = p + names.s->len;
+                    const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
                     while (p < end) {
                         const char *am = memchr(p, '\xFE', (size_t)(end - p));
                         size_t n = (am ? am : end) - p;
@@ -2842,7 +2843,7 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             char err[256] = "";
             if (net->names(NULL, &names, err, sizeof err) &&
                 names.tag == MV_STR && names.s->len > 0) {
-                const char *p = names.s->data;
+                const char *p = mv_str_bytes(names.s);
                 const char *end = p + names.s->len;
                 while (p < end) {
                     const char *am = memchr(p, '\xFE',

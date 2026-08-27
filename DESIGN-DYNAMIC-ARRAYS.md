@@ -145,12 +145,26 @@ one string until each is first written.
 
 ### 3.4 Memory
 
-An element vector costs ~16 bytes per element against ~2 bytes of flat text
-for the sieve's banks — **8x**, and the user's framing ("using more memory")
-is correct and accepted. But an unbounded multiplier on a 10MB record is not
-a trade anyone chose. Bound it: only build `dyn` when the value is *subscript
-written* (a read-only array keeps its bytes), and cap the element count above
-which we stay flat.
+An element vector costs ~16 bytes per element against ~2 bytes of flat text for
+the sieve's banks — **8x**.
+
+**This matters less than it first looks, and the reason is historical.** Pick's
+representation was designed when memory was counted in kilobytes, and packing a
+record into the fewest possible bytes was the whole game. A machine now has
+gigabytes. An 8x multiplier on a working set that is measured in megabytes is
+not the squeeze it would have been in 1975, and designing around it as though it
+still is means keeping a 1975 trade-off long after the thing it traded against
+stopped being scarce.
+
+So: **take the memory.** Build `dyn` on first subscripted write and keep it.
+
+Two bounds stay, and neither is about saving bytes for their own sake:
+
+- A value that is never subscript-written never builds one, so reading a large
+  record costs exactly what it costs today.
+- A cap on element count, high enough never to be met by working data, so a
+  pathological value (a 10M-element array from a bad parse) degrades to flat
+  rather than exhausting the machine. That is a blast radius, not an economy.
 
 ### 3.5 Native element values
 
@@ -174,7 +188,7 @@ suite. **Stop at any stage that does not pay.**
 | # | Stage | Expected | Risk |
 | --- | --- | --- | --- |
 | 0 | *done* — remove the `snprintf` round-trip | 75 → 144 | none, shipped |
-| 1 | `mv_str_bytes()` accessor + the grep that enforces it. No behaviour change. | 0 | none; pure refactor, and it is the prerequisite for everything else |
+| 1 | *done* — `mv_str_bytes()` / `mv_str_wbytes()` + the grep that enforces them | 145 (unchanged, as intended) | none; the guard was proved by breaking it |
 | 2 | `dyn` built on first subscripted write; bytes materialise on demand | the 72% | stale-bytes bugs if a site is missed |
 | 3 | Elements hold native values | the value round-trip | MV type-equality rules |
 | 4 | Revisit `IX_STRIDE` / `IX_MIN_BYTES` with numbers | small | none |
@@ -211,6 +225,8 @@ compose.
 - Stage 2 does not beat 144 by a clear margin on the banked sieve.
 - The flat sieve regresses at all — 13,405 is the number that says the numeric
   fast path is intact.
-- Memory on a realistic record set grows more than ~2x.
+- Memory on a realistic record set grows enough to matter on a machine with
+  gigabytes of it — which is a far higher bar than the 1975 one, and is about
+  blast radius rather than economy (3.4).
 - Any stale-bytes bug that the suite does not catch, found by hand. That would
   say the accessor discipline is not enforceable, and the design rests on it.
