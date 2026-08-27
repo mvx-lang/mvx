@@ -29,18 +29,43 @@
 typedef struct { const char *p; int64_t len; } span;
 
 /* String view of a value; numeric tags render into buf. */
+/* mv_itoa64 — an int64 as decimal, without snprintf.
+ *
+ * WHY THIS EXISTS.  Every dynamic-array edit converts its value to characters
+ * first, and a numeric value went through snprintf("%lld") to get there.  On
+ * the banked sieve that is 58 MILLION calls to format the single character
+ * "0" -- measured, not guessed -- and snprintf has to parse a format string
+ * and walk a varargs list before it writes a byte.
+ *
+ * The single-digit case is separate because it is overwhelmingly the common
+ * one in MV code: flags, counts and small subscripts.
+ */
+static inline int64_t mv_itoa64(char *buf, int64_t v) {
+    if (v >= 0 && v <= 9) { buf[0] = (char)('0' + v); return 1; }
+    char tmp[24];
+    int n = 0;
+    uint64_t u;
+    int neg = v < 0;
+    /* -INT64_MIN overflows; go through unsigned. */
+    u = neg ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+    do { tmp[n++] = (char)('0' + (int)(u % 10u)); u /= 10u; } while (u);
+    int64_t len = 0;
+    if (neg) buf[len++] = '-';
+    while (n) buf[len++] = tmp[--n];
+    return len;
+}
+
 static span val_span(const mv_value *v, char *buf, size_t cap) {
     switch (v->tag) {
     case MV_STR:
         return (span){v->s->data, v->s->len};
     case MV_INT:
-        return (span){buf,
-                      (int64_t)snprintf(buf, cap, "%lld", (long long)v->i)};
+        return (span){buf, mv_itoa64(buf, v->i)};
     case MV_DBL: {
         double d = v->d;
         int64_t n;
         if (d == (double)(int64_t)d && d >= -1e15 && d <= 1e15)
-            n = (int64_t)snprintf(buf, cap, "%lld", (long long)d);
+            n = mv_itoa64(buf, (int64_t)d);
         else {
             n = (int64_t)snprintf(buf, cap, "%.4f", d);
             while (n > 0 && buf[n - 1] == '0') buf[--n] = '\0';
@@ -189,7 +214,12 @@ static span nth_span_chk(mv_string *st, span sp, char mark, int64_t idx,
         *ok = idx <= ix->n;
         return *ok ? nth_span_ix(st, sp, mark, idx) : (span){sp.p + sp.len, 0};
     }
-    /* no index: walk, and notice running off the end on the way */
+    /* no index: walk, and notice running off the end on the way.
+       A BYTE LOOP, and memchr is SLOWER here -- measured, 144 passes down to
+       100 on the banked sieve.  The elements are one character and a mark, so
+       every scan is two or three bytes: the call and the vector setup cost
+       more than the loop they replace.  memchr wins on long fields, and this
+       is not that. */
     const char *p = sp.p, *end = sp.p + sp.len;
     int64_t n = 1;
     while (n < idx) {

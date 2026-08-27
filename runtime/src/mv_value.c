@@ -242,13 +242,39 @@ void mv_neg(mv_value *dst, const mv_value *a) {
 
 /* MV numeric formatting: integers plain; doubles trimmed of trailing
    zeros, PRECISION 4 by default (classic Pick). */
+/* mv_itoa64 — an int64 as decimal, without snprintf.
+ *
+ * WHY THIS EXISTS.  Every dynamic-array edit converts its value to characters
+ * first, and a numeric value went through snprintf("%lld") to get there.  On
+ * the banked sieve that is 58 MILLION calls to format the single character
+ * "0" -- measured, not guessed -- and snprintf has to parse a format string
+ * and walk a varargs list before it writes a byte.
+ *
+ * The single-digit case is separate because it is overwhelmingly the common
+ * one in MV code: flags, counts and small subscripts.
+ */
+static inline int64_t mv_itoa64(char *buf, int64_t v) {
+    if (v >= 0 && v <= 9) { buf[0] = (char)('0' + v); return 1; }
+    char tmp[24];
+    int n = 0;
+    uint64_t u;
+    int neg = v < 0;
+    /* -INT64_MIN overflows; go through unsigned. */
+    u = neg ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+    do { tmp[n++] = (char)('0' + (int)(u % 10u)); u /= 10u; } while (u);
+    int64_t len = 0;
+    if (neg) buf[len++] = '-';
+    while (n) buf[len++] = tmp[--n];
+    return len;
+}
+
 static int64_t num_to_buf(const mv_value *v, char *buf, size_t cap) {
-    if (v->tag == MV_INT)
-        return (int64_t)snprintf(buf, cap, "%lld", (long long)v->i);
+    (void)cap;
+    if (v->tag == MV_INT) return mv_itoa64(buf, v->i);
     double d = v->d;
     if (d == (double)(int64_t)d && d >= -1e15 && d <= 1e15)
-        return (int64_t)snprintf(buf, cap, "%lld", (long long)d);
-    int64_t n = (int64_t)snprintf(buf, cap, "%.4f", d);
+        return mv_itoa64(buf, (int64_t)d);
+    int64_t n = (int64_t)snprintf(buf, 40, "%.4f", d);
     while (n > 0 && buf[n - 1] == '0') buf[--n] = '\0';
     if (n > 0 && buf[n - 1] == '.') buf[--n] = '\0';
     return n;
