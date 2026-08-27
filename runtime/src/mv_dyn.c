@@ -16,6 +16,7 @@
  */
 #include "mvx_runtime.h"
 #include "mv_intern.h"
+#include "mv_bytes.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -29,18 +30,43 @@
 typedef struct { const char *p; int64_t len; } span;
 
 /* String view of a value; numeric tags render into buf. */
+/* mv_itoa64 — an int64 as decimal, without snprintf.
+ *
+ * WHY THIS EXISTS.  Every dynamic-array edit converts its value to characters
+ * first, and a numeric value went through snprintf("%lld") to get there.  On
+ * the banked sieve that is 58 MILLION calls to format the single character
+ * "0" -- measured, not guessed -- and snprintf has to parse a format string
+ * and walk a varargs list before it writes a byte.
+ *
+ * The single-digit case is separate because it is overwhelmingly the common
+ * one in MV code: flags, counts and small subscripts.
+ */
+static inline int64_t mv_itoa64(char *buf, int64_t v) {
+    if (v >= 0 && v <= 9) { buf[0] = (char)('0' + v); return 1; }
+    char tmp[24];
+    int n = 0;
+    uint64_t u;
+    int neg = v < 0;
+    /* -INT64_MIN overflows; go through unsigned. */
+    u = neg ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+    do { tmp[n++] = (char)('0' + (int)(u % 10u)); u /= 10u; } while (u);
+    int64_t len = 0;
+    if (neg) buf[len++] = '-';
+    while (n) buf[len++] = tmp[--n];
+    return len;
+}
+
 static span val_span(const mv_value *v, char *buf, size_t cap) {
     switch (v->tag) {
     case MV_STR:
-        return (span){v->s->data, v->s->len};
+        return (span){mv_str_bytes(v->s), v->s->len};
     case MV_INT:
-        return (span){buf,
-                      (int64_t)snprintf(buf, cap, "%lld", (long long)v->i)};
+        return (span){buf, mv_itoa64(buf, v->i)};
     case MV_DBL: {
         double d = v->d;
         int64_t n;
         if (d == (double)(int64_t)d && d >= -1e15 && d <= 1e15)
-            n = (int64_t)snprintf(buf, cap, "%lld", (long long)d);
+            n = mv_itoa64(buf, (int64_t)d);
         else {
             n = (int64_t)snprintf(buf, cap, "%.4f", d);
             while (n > 0 && buf[n - 1] == '0') buf[--n] = '\0';
@@ -95,89 +121,115 @@ static span nth_span(span s, char mark, int64_t idx) {
    short chain of them -- one per level -- rather than a single slot the
    levels would evict each other from.  All of it is dropped the moment the
    bytes move. */
-#define IX_MIN_BYTES 128
-#define IX_STRIDE    16
-#define IX_MAX_CHAIN 3
+#define IX_MIN_BYTES 8
+#define IX_STRIDE    1
 
 struct mv_ix {
-    struct mv_ix *next;
     char    mark;
+    /* Is this list REALLY in the order a LOCATE claims?  Checked once and
+       remembered, because the answer costs a pass and the question gets asked
+       thousands of times. */
+    char    ord_dir, ord_just;
+    signed char ord_ok;         /* -1 not asked, 0 no, 1 yes */
     int64_t base, blen;     /* the indexed range, as an offset into data */
     int64_t n;              /* elements in it */
     int64_t noff;
     int64_t off[];          /* off[k]: start of element k*IX_STRIDE + 1 */
 };
 
+/* AM/VM/SM are 254/253/252 and a subscript can name no other level, so a
+   string needs exactly three slots -- and which one a lookup wants is
+   arithmetic rather than a search.  The chain this replaces cost as much as
+   the whole rest of the replace path put together: 854 samples against
+   mv_replace_fn's 862, because every subscripted write walked it twice and
+   the walk alternated AM then VM, so a move-to-front would have thrashed. */
+#define IX_LVLS 3
+static inline int ix_lvl(char mark) { return 254 - (int)(unsigned char)mark; }
+
+struct mv_ixset { struct mv_ix *lvl[IX_LVLS]; };
+
 void mvx_ix_drop(mv_string *s) {
-    if (!s) return;
-    struct mv_ix *ix = s->ix;
-    while (ix) { struct mv_ix *nx = ix->next; free(ix); ix = nx; }
+    if (!s || !s->ix) return;
+    struct mv_ixset *set = (struct mv_ixset *)s->ix;
+    for (int i = 0; i < IX_LVLS; i++) free(set->lvl[i]);
+    free(set);
     s->ix = NULL;
 }
 
 static struct mv_ix *ix_build(mv_string *st, span sp, char mark) {
+    /* AN OFFSET PER BOUNDARY, not one every IX_STRIDE elements.
+       A stride made the index small when memory was the thing to save; what it
+       costs is a forward scan for the END of every element, which is what
+       nth_span_ix spent 667 samples doing.  Eight bytes an element buys both
+       boundaries outright, and on a machine with gigabytes that is the cheaper
+       side of the trade (DESIGN-DYNAMIC-ARRAYS.md 3.4). */
     int64_t n = span_count(sp, mark);
-    int64_t noff = (n + IX_STRIDE - 1) / IX_STRIDE;
-    if (noff < 1) noff = 1;
+    int64_t noff = n + 1;
     struct mv_ix *ix = malloc(sizeof *ix + (size_t)noff * sizeof(int64_t));
     if (!ix) return NULL;
     ix->mark = mark;
-    ix->base = sp.p - st->data;
+    ix->ord_dir = 0; ix->ord_just = 0; ix->ord_ok = -1;
+    ix->base = sp.p - mv_str_wbytes(st);
     ix->blen = sp.len;
     ix->n    = n;
     ix->noff = noff;
     const char *p = sp.p, *end = sp.p + sp.len;
-    int64_t elem = 0, k = 0;
-    ix->off[k++] = 0;
-    while (p < end && k < noff) {
-        if (*p == mark) {
-            elem++;
-            if (elem % IX_STRIDE == 0) ix->off[k++] = (p + 1) - sp.p;
-        }
+    int64_t k = 0;
+    ix->off[k++] = 0;                       /* element 1 starts at 0 */
+    while (p < end && k < n) {
+        if (*p == mark) ix->off[k++] = (p + 1) - sp.p;
         p++;
     }
-    while (k < noff) ix->off[k++] = sp.len;
+    while (k < n) ix->off[k++] = sp.len;
+    /* One past the last element, so element i is [off[i-1], off[i]-1). */
+    ix->off[n] = sp.len + 1;
 
-    ix->next = st->ix;
-    st->ix = ix;
-    /* Keep the chain short; three levels is all a subscript can name. */
-    struct mv_ix *q = ix;
-    for (int i = 0; i < IX_MAX_CHAIN - 1 && q; i++) q = q->next;
-    if (q && q->next) {
-        struct mv_ix *drop = q->next;
-        q->next = NULL;
-        while (drop) { struct mv_ix *nx = drop->next; free(drop); drop = nx; }
+    struct mv_ixset *set = (struct mv_ixset *)st->ix;
+    if (!set) {
+        set = calloc(1, sizeof *set);
+        if (!set) { free(ix); return NULL; }
+        st->ix = (struct mv_ix *)set;
     }
+    int l = ix_lvl(mark);
+    if (l < 0 || l >= IX_LVLS) { free(ix); return NULL; }
+    free(set->lvl[l]);          /* one index per level; the newest range wins */
+    set->lvl[l] = ix;
     return ix;
 }
 
-/* The index for this range and level, building one if it is worth it. */
-static struct mv_ix *ix_for(mv_string *st, span sp, char mark) {
-    if (!st) return NULL;
-    int64_t base = sp.p - st->data;
-    for (struct mv_ix *ix = st->ix; ix; ix = ix->next)
-        if (ix->mark == mark && ix->base == base && ix->blen == sp.len)
-            return ix;
+/* The index for this range and level, building one if it is worth it.
+   THE HIT IS INLINE AND THE MISS IS NOT: a subscripted write asks twice, and
+   what it almost always gets back is the index it got last time. */
+static struct mv_ix *ix_miss(mv_string *st, span sp, char mark, int64_t base) {
     if (sp.len < IX_MIN_BYTES) return NULL;
+    (void)base;
     return ix_build(st, sp, mark);
 }
 
-/* nth_span, using the index when there is one.  The last element needs no
-   forward scan at all: it runs to the end of the range by definition. */
-static span nth_span_ix(mv_string *st, span sp, char mark, int64_t idx) {
+static inline struct mv_ix *ix_for(mv_string *st, span sp, char mark) {
+    if (!st || !st->ix) return st ? ix_miss(st, sp, mark, 0) : NULL;
+    int l = ix_lvl(mark);
+    if (l < 0 || l >= IX_LVLS) return NULL;
+    struct mv_ix *ix = ((struct mv_ixset *)st->ix)->lvl[l];
+    int64_t base = sp.p - mv_str_bytes(st);
+    if (ix && ix->base == base && ix->blen == sp.len) return ix;
+    return ix_miss(st, sp, mark, base);
+}
+
+/* Element idx out of an index that describes sp.  Both boundaries are in the
+   table, so this is arithmetic. */
+static inline span ix_span(struct mv_ix *ix, span sp, int64_t idx) {
+    int64_t b = ix->off[idx - 1], e = ix->off[idx] - 1;
+    return (span){sp.p + b, e - b};
+}
+
+/* nth_span, using the index when there is one.  Both boundaries come out of
+   the table, so there is no scanning left in a subscripted access at all. */
+static inline span nth_span_ix(mv_string *st, span sp, char mark, int64_t idx) {
     struct mv_ix *ix = ix_for(st, sp, mark);
-    if (!ix || idx > ix->n) return nth_span(sp, mark, idx);
-    int64_t b = (idx - 1) / IX_STRIDE;
-    int64_t rem = (idx - 1) % IX_STRIDE;
-    const char *p = sp.p + ix->off[b], *end = sp.p + sp.len;
-    while (rem-- > 0) {
-        while (p < end && *p != mark) p++;
-        if (p < end) p++;
-    }
-    if (idx == ix->n) return (span){p, end - p};
-    const char *q = p;
-    while (q < end && *q != mark) q++;
-    return (span){p, q - p};
+    if (!ix || idx > ix->n || idx < 1) return nth_span(sp, mark, idx);
+    int64_t b = ix->off[idx - 1], e = ix->off[idx] - 1;
+    return (span){sp.p + b, e - b};
 }
 
 /* nth_span_ix, reporting whether idx was within the element count, so a
@@ -189,7 +241,12 @@ static span nth_span_chk(mv_string *st, span sp, char mark, int64_t idx,
         *ok = idx <= ix->n;
         return *ok ? nth_span_ix(st, sp, mark, idx) : (span){sp.p + sp.len, 0};
     }
-    /* no index: walk, and notice running off the end on the way */
+    /* no index: walk, and notice running off the end on the way.
+       A BYTE LOOP, and memchr is SLOWER here -- measured, 144 passes down to
+       100 on the banked sieve.  The elements are one character and a mark, so
+       every scan is two or three bytes: the call and the vector setup cost
+       more than the loop they replace.  memchr wins on long fields, and this
+       is not that. */
     const char *p = sp.p, *end = sp.p + sp.len;
     int64_t n = 1;
     while (n < idx) {
@@ -318,7 +375,7 @@ static void modify(dbuf *out, span s, const char *marks,
    created.  Only the in-place path uses this; the general path pads. */
 static int locate(mv_string *st, int64_t a, int64_t v, int64_t s_, span *out) {
     static const char marks[3] = {AM, VM, SM};
-    span sp = {st->data, st->len};
+    span sp = {mv_str_bytes(st), st->len};
     int64_t idx[3];
     int n = 0;
     idx[n++] = a;
@@ -343,29 +400,101 @@ static int locate(mv_string *st, int64_t a, int64_t v, int64_t s_, span *out) {
    cheapest case -- a byte copy, and the index stays exact -- and a length
    change is still only a memmove of the tail while the capacity holds.
    Returns 0 when the general path has to run instead. */
+/* Take a private copy of a shared string, KEEPING ITS INDEX.
+ *
+ * `MAT BANK = ONES` points thirty-one thousand array elements at one string,
+ * and the first write to each has to copy before it can edit.  The copy is
+ * byte-for-byte identical, so every offset in the source's index still
+ * describes it exactly -- and throwing that away meant every bank rebuilt its
+ * index on every pass.  Measured on the banked sieve: 11,562,502 index builds
+ * before this, and 2 after.
+ *
+ * Returns 0 if the copy could not be made, in which case the caller falls back
+ * to the general rebuild.
+ */
+static int cow_keep_index(mv_value *dst) {
+    mv_string *old = dst->s;
+    mv_string *st = mvx_str_alloc_cap(old->len, old->cap);
+    if (!st) return 0;
+    memcpy(mv_str_wbytes(st), mv_str_bytes(old), (size_t)old->len);
+    mv_str_wbytes(st)[old->len] = '\0';
+    st->len = old->len;
+
+    struct mv_ixset *osrc = (struct mv_ixset *)old->ix;
+    if (osrc) {
+        struct mv_ixset *set = calloc(1, sizeof *set);
+        if (set) {
+            for (int i = 0; i < IX_LVLS; i++) {
+                struct mv_ix *o = osrc->lvl[i];
+                if (!o) continue;
+                size_t sz = sizeof *o + (size_t)(o->n + 1) * sizeof(int64_t);
+                struct mv_ix *c = malloc(sz);
+                if (!c) continue;
+                memcpy(c, o, sz);
+                set->lvl[i] = c;
+            }
+            st->ix = (struct mv_ix *)set;
+        }
+    }
+    mv_clear(dst);
+    dst->tag = MV_STR;
+    dst->s = st;
+    return 1;
+}
+
 static int inplace_repl(mv_value *dst, const mv_value *src, int64_t a,
                         int64_t v, int64_t s_, const mv_value *val) {
-    if (dst != src || dst->tag != MV_STR || dst->s->refs != 1) return 0;
+    if (dst != src || dst->tag != MV_STR) return 0;
+    /* Shared: copy it here, with its index, rather than letting the general
+       path rebuild both from nothing. */
+    if (dst->s->refs != 1 && !cow_keep_index(dst)) return 0;
     mv_string *st = dst->s;
     char vb[40];
     span vs = val_span(val, vb, sizeof vb);
     span e;
-    if (!locate(st, a, v, s_, &e)) return 0;
 
-    int64_t at = e.p - st->data;
+    /* ONE LEVEL WHEN THERE IS ONLY ONE.  `X<1,v>` on a value with no attribute
+       mark -- a list, a set of flags, one field's worth of values, which is
+       most of what MV code keeps in a dynamic array -- resolves level 1 to the
+       whole string.  Asking the AM level about it is a lookup and a call to be
+       told what we already know.  Go straight to the VM elements. */
+    if (a == 1 && s_ == 0 && v > 0) {
+        struct mv_ix *am = ix_for(st, (span){mv_str_bytes(st), st->len}, AM);
+        if (am && am->n == 1) {
+            span whole = {mv_str_bytes(st), st->len};
+            struct mv_ix *vm = ix_for(st, whole, VM);
+            if (vm && v <= vm->n) {
+                int64_t b = vm->off[v - 1], en = vm->off[v] - 1;
+                e = (span){whole.p + b, en - b};
+                goto located;
+            }
+        }
+    }
+    if (!locate(st, a, v, s_, &e)) return 0;
+located:;
+
+    int64_t at = e.p - mv_str_wbytes(st);
     int64_t delta = vs.len - e.len;
     if (delta == 0) {
-        memmove(st->data + at, vs.p, (size_t)vs.len);   /* may overlap */
+        /* ONE BYTE IS NOT WORTH A CALL.  A flag, a digit, a Y/N -- the
+           overwhelmingly common same-length replace in MV code is a single
+           character, and memmove is a PLT call into a vectorised routine that
+           checks alignment and direction before moving anything.  Measured on
+           the single-array sieve: memmove was 2466 samples out of ~2500, which
+           is the whole benchmark, for copies of one byte. */
+        char *d = mv_str_wbytes(st) + at;
+        if (vs.len == 1) *d = *vs.p;
+        else memmove(d, vs.p, (size_t)vs.len);          /* may overlap */
         return 1;                                       /* index still exact */
     }
     /* The value must not live in the bytes about to shift. */
-    if (vs.p >= st->data && vs.p < st->data + st->len) return 0;
+    if (vs.p >= mv_str_wbytes(st) && vs.p < mv_str_wbytes(st) + st->len) return 0;
     if (st->len + delta > st->cap) return 0;
-    char *tail = st->data + at + e.len;
+    char *tail = mv_str_wbytes(st) + at + e.len;
     memmove(tail + delta, tail, (size_t)(st->len - at - e.len));
-    memcpy(st->data + at, vs.p, (size_t)vs.len);
+    memcpy(mv_str_wbytes(st) + at, vs.p, (size_t)vs.len);
     st->len += delta;
-    st->data[st->len] = '\0';
+    mv_str_wbytes(st)[st->len] = '\0';
     mvx_ix_drop(st);            /* every offset past the edit has moved */
     return 1;
 }
@@ -387,13 +516,13 @@ static void run_op(mv_value *dst, const mv_value *src, int64_t a,
        this variable can be an in-place patch rather than another rebuild. */
     if (dst->tag == MV_STR && dst->s->refs == 1 && dst->s->cap >= out.len) {
         mv_string *st = dst->s;
-        memcpy(st->data, out.d ? out.d : "", (size_t)out.len);
+        memcpy(mv_str_wbytes(st), out.d ? out.d : "", (size_t)out.len);
         st->len = out.len;
-        st->data[out.len] = '\0';
+        mv_str_wbytes(st)[out.len] = '\0';
         mvx_ix_drop(st);
     } else {
         mv_string *st = mvx_str_alloc_cap(out.len, out.len + out.len / 2 + 16);
-        memcpy(st->data, out.d ? out.d : "", (size_t)out.len);
+        memcpy(mv_str_wbytes(st), out.d ? out.d : "", (size_t)out.len);
         mv_clear(dst);
         dst->tag = MV_STR;
         dst->s = st;
@@ -461,7 +590,71 @@ int64_t mv_locate_fn(const mv_value *item, const mv_value *src, int64_t a,
         if (dir != 'A' && dir != 'D') dir = 0;
     }
 
-    int64_t n = span_count(sp, mark);
+    /* AN ORDERED LOCATE IS TOLD THE LIST IS SORTED, so it should not read it
+       end to end.  `LOCATE(X, LIST; POS; "AL") THEN ... ELSE INSERT` is how MV
+       code keeps a list in order, and every lookup was a linear scan with a
+       memchr per element -- plus a span_count over the whole value first, just
+       to know how many there were.
+       With an element index, position k is arithmetic, so the search can be a
+       binary one.  20,000 elements: 20,000 comparisons become 15. */
+    mv_string *st = src->tag == MV_STR ? src->s : NULL;
+    struct mv_ix *ix = st ? ix_for(st, sp, mark) : NULL;
+
+    /* A BINARY SEARCH BELIEVES THE ORDER IT WAS TOLD; a linear scan does not.
+       On a list that is NOT in the stated order the two give different answers
+       -- `LOCATE("aaa", "bbb":AM:"aaa":AM:"ccc"; P; "AL")` is a miss to the
+       scan and a hit to the search, and both are defensible readings of a
+       program that lied about its data.  Classic Pick scans, so the scan is
+       what MVX must keep (DECISIONS.md: classic behaviour is the tie-breaker).
+       So ASK, once, and remember: the check is a pass over the elements, and
+       it is amortised over every lookup until the value is edited. */
+    if (ix && dir && !(ix->ord_ok >= 0 && ix->ord_dir == dir && ix->ord_just == just)) {
+        ix->ord_dir = dir; ix->ord_just = just; ix->ord_ok = 1;
+        for (int64_t k = 1; k < ix->n; k++) {
+            span x = ix_span(ix, sp, k), y = ix_span(ix, sp, k + 1);
+            int c = (just == 'R') ? cmp_right(x, y) : cmp_left(x, y);
+            if (dir == 'D') c = -c;
+            if (c > 0) { ix->ord_ok = 0; break; }
+        }
+    }
+
+    if (ix && dir && ix->ord_ok == 1) {
+        int64_t lo, hi;
+        /* first element the item does not sort after, and first it sorts
+           strictly before: everything between compares equal. */
+        int64_t a1 = 1, b1 = ix->n + 1;
+        while (a1 < b1) {
+            int64_t m = a1 + (b1 - a1) / 2;
+            span e = ix_span(ix, sp, m);
+            int c = (just == 'R') ? cmp_right(it, e) : cmp_left(it, e);
+            if (dir == 'D') c = -c;
+            if (c <= 0) b1 = m; else a1 = m + 1;
+        }
+        lo = a1;
+        a1 = lo; b1 = ix->n + 1;
+        while (a1 < b1) {
+            int64_t m = a1 + (b1 - a1) / 2;
+            span e = ix_span(ix, sp, m);
+            int c = (just == 'R') ? cmp_right(it, e) : cmp_left(it, e);
+            if (dir == 'D') c = -c;
+            if (c < 0) b1 = m; else a1 = m + 1;
+        }
+        hi = a1;
+        /* The run [lo, hi) compares equal; the answer is a BYTE match in it,
+           exactly as the scan below decides.  Ordering equal and bytes equal
+           are not the same question -- "01" and "1" answer them differently. */
+        for (int64_t k = lo; k < hi; k++) {
+            span e = ix_span(ix, sp, k);
+            if (e.len == it.len && memcmp(e.p, it.p, (size_t)e.len) == 0) {
+                *pos = k;
+                return 1;
+            }
+        }
+        *pos = hi;
+        return 0;
+    }
+
+    int64_t n = ix ? ix->n : span_count(sp, mark);
     const char *q = sp.p, *end = sp.p + sp.len;
     for (int64_t k = 1; k <= n; k++) {
         const char *m = memchr(q, mark, (size_t)(end - q));

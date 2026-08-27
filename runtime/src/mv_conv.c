@@ -20,6 +20,7 @@
  * STATUS() reflects the outcome: 0 ok, 1 bad input, 2 bad code.
  */
 #include "mvx_runtime.h"
+#include "mv_bytes.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -31,7 +32,7 @@ typedef struct { const char *p; int64_t len; } span;
 static span val_span(const mv_value *v, char *buf, size_t cap) {
     switch (v->tag) {
     case MV_STR:
-        return (span){v->s->data, v->s->len};
+        return (span){mv_str_bytes(v->s), v->s->len};
     case MV_INT:
         return (span){buf,
                       (int64_t)snprintf(buf, cap, "%lld", (long long)v->i)};

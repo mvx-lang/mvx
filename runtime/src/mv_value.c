@@ -12,6 +12,7 @@
 
 #include "mvx_runtime.h"
 #include "mv_intern.h"
+#include "mv_bytes.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -58,7 +59,7 @@ static mv_string *str_alloc_cap(int64_t len, int64_t cap) {
     s->len  = len;
     s->cap  = cap;
     s->ix   = NULL;
-    s->data[len] = '\0';
+    mv_str_wbytes(s)[len] = '\0';
     return s;
 }
 
@@ -108,14 +109,14 @@ void mv_set_dbl(mv_value *v, double d) {
 void mv_set_str(mv_value *v, const char *p, int64_t len) {
     if (v->tag == MV_STR && v->s->refs == 1 && v->s->cap >= len) {
         mv_string *s = v->s;
-        memmove(s->data, p, (size_t)len);
+        memmove(mv_str_wbytes(s), p, (size_t)len);
         s->len = len;
-        s->data[len] = '\0';
+        mv_str_wbytes(s)[len] = '\0';
         mvx_ix_drop(s);
         return;
     }
     mv_string *s = str_alloc(len);
-    memcpy(s->data, p, (size_t)len);
+    memcpy(mv_str_wbytes(s), p, (size_t)len);
     if (v->tag == MV_STR) str_release(v->s);
     v->tag = MV_STR;
     v->s = s;
@@ -146,7 +147,7 @@ static int str_as_num(const mv_string *s, double *out_d, int64_t *out_i,
                       int *is_int) {
     if (!s || s->len == 0) return 0;
     char *end = NULL;
-    const char *p = s->data;
+    const char *p = mv_str_bytes(s);
     long long iv = strtoll(p, &end, 10);
     if (end == p + s->len) { *out_i = iv; *is_int = 1; *out_d = (double)iv; return 1; }
     end = NULL;
@@ -162,7 +163,7 @@ int64_t mv_get_int(const mv_value *v) {
     case MV_STR: {
         double d; int64_t i; int is_int;
         if (str_as_num(v->s, &d, &i, &is_int)) return is_int ? i : (int64_t)d;
-        mvx_fatal("non-numeric value \"%s\" used in numeric context", v->s->data);
+        mvx_fatal("non-numeric value \"%s\" used in numeric context", mv_str_bytes(v->s));
     }
     default: warn_unassigned(); return 0;
     }
@@ -175,7 +176,7 @@ double mv_get_dbl(const mv_value *v) {
     case MV_STR: {
         double d; int64_t i; int is_int;
         if (str_as_num(v->s, &d, &i, &is_int)) return d;
-        mvx_fatal("non-numeric value \"%s\" used in numeric context", v->s->data);
+        mvx_fatal("non-numeric value \"%s\" used in numeric context", mv_str_bytes(v->s));
     }
     default: warn_unassigned(); return 0.0;
     }
@@ -242,13 +243,39 @@ void mv_neg(mv_value *dst, const mv_value *a) {
 
 /* MV numeric formatting: integers plain; doubles trimmed of trailing
    zeros, PRECISION 4 by default (classic Pick). */
+/* mv_itoa64 — an int64 as decimal, without snprintf.
+ *
+ * WHY THIS EXISTS.  Every dynamic-array edit converts its value to characters
+ * first, and a numeric value went through snprintf("%lld") to get there.  On
+ * the banked sieve that is 58 MILLION calls to format the single character
+ * "0" -- measured, not guessed -- and snprintf has to parse a format string
+ * and walk a varargs list before it writes a byte.
+ *
+ * The single-digit case is separate because it is overwhelmingly the common
+ * one in MV code: flags, counts and small subscripts.
+ */
+static inline int64_t mv_itoa64(char *buf, int64_t v) {
+    if (v >= 0 && v <= 9) { buf[0] = (char)('0' + v); return 1; }
+    char tmp[24];
+    int n = 0;
+    uint64_t u;
+    int neg = v < 0;
+    /* -INT64_MIN overflows; go through unsigned. */
+    u = neg ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+    do { tmp[n++] = (char)('0' + (int)(u % 10u)); u /= 10u; } while (u);
+    int64_t len = 0;
+    if (neg) buf[len++] = '-';
+    while (n) buf[len++] = tmp[--n];
+    return len;
+}
+
 static int64_t num_to_buf(const mv_value *v, char *buf, size_t cap) {
-    if (v->tag == MV_INT)
-        return (int64_t)snprintf(buf, cap, "%lld", (long long)v->i);
+    (void)cap;
+    if (v->tag == MV_INT) return mv_itoa64(buf, v->i);
     double d = v->d;
     if (d == (double)(int64_t)d && d >= -1e15 && d <= 1e15)
-        return (int64_t)snprintf(buf, cap, "%lld", (long long)d);
-    int64_t n = (int64_t)snprintf(buf, cap, "%.4f", d);
+        return mv_itoa64(buf, (int64_t)d);
+    int64_t n = (int64_t)snprintf(buf, 40, "%.4f", d);
     while (n > 0 && buf[n - 1] == '0') buf[--n] = '\0';
     if (n > 0 && buf[n - 1] == '.') buf[--n] = '\0';
     return n;
@@ -259,7 +286,7 @@ static int64_t num_to_buf(const mv_value *v, char *buf, size_t cap) {
 static const char *val_chars(const mv_value *v, char *buf, size_t cap,
                              int64_t *len) {
     switch (v->tag) {
-    case MV_STR: *len = v->s->len; return v->s->data;
+    case MV_STR: *len = v->s->len; return mv_str_bytes(v->s);
     case MV_INT:
     case MV_DBL: *len = num_to_buf(v, buf, cap); return buf;
     default:     warn_unassigned(); *len = 0; return "";
@@ -282,18 +309,18 @@ void mv_cat(mv_value *dst, const mv_value *a, const mv_value *b) {
        room: append in place.  With the headroom below, building a record up
        one field at a time stops being quadratic. */
     if (dst == a && dst->tag == MV_STR && dst->s->refs == 1 &&
-        pa == dst->s->data && dst->s->cap >= la + lb) {
+        pa == mv_str_wbytes(dst->s) && dst->s->cap >= la + lb) {
         mv_string *s = dst->s;
-        memmove(s->data + la, pb, (size_t)lb);
+        memmove(mv_str_wbytes(s) + la, pb, (size_t)lb);
         s->len = la + lb;
-        s->data[s->len] = '\0';
+        mv_str_wbytes(s)[s->len] = '\0';
         mvx_ix_drop(s);
         return;
     }
     int64_t need = la + lb;
     mv_string *s = str_alloc_cap(need, need + need / 2 + 16);
-    memcpy(s->data, pa, (size_t)la);
-    memcpy(s->data + la, pb, (size_t)lb);
+    memcpy(mv_str_wbytes(s), pa, (size_t)la);
+    memcpy(mv_str_wbytes(s) + la, pb, (size_t)lb);
     if (dst->tag == MV_STR) str_release(dst->s);
     dst->tag = MV_STR;
     dst->s = s;
@@ -388,7 +415,7 @@ void mv_arr_copy(mv_array *dst, const mv_array *src) {
 static const char *elem_chars(const mv_value *v, char *buf, size_t cap,
                               int64_t *len) {
     switch (v->tag) {
-    case MV_STR: *len = v->s->len; return v->s->data;
+    case MV_STR: *len = v->s->len; return mv_str_bytes(v->s);
     case MV_INT:
     case MV_DBL: *len = num_to_buf(v, buf, cap); return buf;
     default:     *len = 0; return "";
@@ -457,15 +484,15 @@ void mv_mat_build(const mv_array *a, mv_value *dst, const mv_value *delim) {
     mv_string *s = str_alloc(total);
     int64_t off = 0;
     for (int64_t k = 0; k < n; k++) {
-        if (k) { memcpy(s->data + off, d, (size_t)dl); off += dl; }
+        if (k) { memcpy(mv_str_wbytes(s) + off, d, (size_t)dl); off += dl; }
         p = elem_chars(&a->elems[k], b, sizeof b, &l);
-        memcpy(s->data + off, p, (size_t)l);
+        memcpy(mv_str_wbytes(s) + off, p, (size_t)l);
         off += l;
     }
-    while (off >= dl && memcmp(s->data + off - dl, d, (size_t)dl) == 0)
+    while (off >= dl && memcmp(mv_str_wbytes(s) + off - dl, d, (size_t)dl) == 0)
         off -= dl;
     s->len = off;
-    s->data[off] = '\0';
+    mv_str_wbytes(s)[off] = '\0';
     if (dst->tag == MV_STR) str_release(dst->s);
     dst->tag = MV_STR;
     dst->s = s;

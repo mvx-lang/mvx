@@ -2420,5 +2420,28 @@ if [ "$QUICK" = 0 ]; then
   fi
 fi
 
+# ---- the byte representation has one door -----------------------------------
+#
+# An mv_string is its bytes today, and is meant to stop being that: a dynamic
+# array becomes an element structure with the flat bytes as a cache
+# (DESIGN-DYNAMIC-ARRAYS.md).  On that day every ->data read behind the
+# runtime's back returns STALE BYTES -- silently, and only for values that were
+# edited by subscript first.
+#
+# The accessors went in while both sides were still `st->data`, which is the
+# only moment that change is provably behaviour-neutral.  This is what keeps
+# them in: a rule nothing checks is a rule that decays, and this one has to hold
+# across six files that have no other reason to agree with each other.
+echo "== byte accessor discipline"
+stray=$(grep -rn -- '->data' "$ROOT"/runtime/src/*.c 2>/dev/null \
+        | grep -v '^.*mv_str\.c:' || true)
+if [ -n "$stray" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL ->data outside mv_str.c -- use mv_str_bytes()/mv_str_wbytes():"
+  echo "$stray" | sed 's|^|    |'
+else
+  PASS=$((PASS + 1)); echo "  no raw ->data outside mv_str.c"
+fi
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
