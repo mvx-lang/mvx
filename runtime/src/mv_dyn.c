@@ -444,7 +444,15 @@ static int inplace_repl(mv_value *dst, const mv_value *src, int64_t a,
     int64_t at = e.p - mv_str_wbytes(st);
     int64_t delta = vs.len - e.len;
     if (delta == 0) {
-        memmove(mv_str_wbytes(st) + at, vs.p, (size_t)vs.len);   /* may overlap */
+        /* ONE BYTE IS NOT WORTH A CALL.  A flag, a digit, a Y/N -- the
+           overwhelmingly common same-length replace in MV code is a single
+           character, and memmove is a PLT call into a vectorised routine that
+           checks alignment and direction before moving anything.  Measured on
+           the single-array sieve: memmove was 2466 samples out of ~2500, which
+           is the whole benchmark, for copies of one byte. */
+        char *d = mv_str_wbytes(st) + at;
+        if (vs.len == 1) *d = *vs.p;
+        else memmove(d, vs.p, (size_t)vs.len);          /* may overlap */
         return 1;                                       /* index still exact */
     }
     /* The value must not live in the bytes about to shift. */
