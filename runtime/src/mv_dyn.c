@@ -126,6 +126,11 @@ static span nth_span(span s, char mark, int64_t idx) {
 
 struct mv_ix {
     char    mark;
+    /* Is this list REALLY in the order a LOCATE claims?  Checked once and
+       remembered, because the answer costs a pass and the question gets asked
+       thousands of times. */
+    char    ord_dir, ord_just;
+    signed char ord_ok;         /* -1 not asked, 0 no, 1 yes */
     int64_t base, blen;     /* the indexed range, as an offset into data */
     int64_t n;              /* elements in it */
     int64_t noff;
@@ -163,6 +168,7 @@ static struct mv_ix *ix_build(mv_string *st, span sp, char mark) {
     struct mv_ix *ix = malloc(sizeof *ix + (size_t)noff * sizeof(int64_t));
     if (!ix) return NULL;
     ix->mark = mark;
+    ix->ord_dir = 0; ix->ord_just = 0; ix->ord_ok = -1;
     ix->base = sp.p - mv_str_wbytes(st);
     ix->blen = sp.len;
     ix->n    = n;
@@ -208,6 +214,13 @@ static inline struct mv_ix *ix_for(mv_string *st, span sp, char mark) {
     int64_t base = sp.p - mv_str_bytes(st);
     if (ix && ix->base == base && ix->blen == sp.len) return ix;
     return ix_miss(st, sp, mark, base);
+}
+
+/* Element idx out of an index that describes sp.  Both boundaries are in the
+   table, so this is arithmetic. */
+static inline span ix_span(struct mv_ix *ix, span sp, int64_t idx) {
+    int64_t b = ix->off[idx - 1], e = ix->off[idx] - 1;
+    return (span){sp.p + b, e - b};
 }
 
 /* nth_span, using the index when there is one.  Both boundaries come out of
@@ -577,7 +590,71 @@ int64_t mv_locate_fn(const mv_value *item, const mv_value *src, int64_t a,
         if (dir != 'A' && dir != 'D') dir = 0;
     }
 
-    int64_t n = span_count(sp, mark);
+    /* AN ORDERED LOCATE IS TOLD THE LIST IS SORTED, so it should not read it
+       end to end.  `LOCATE(X, LIST; POS; "AL") THEN ... ELSE INSERT` is how MV
+       code keeps a list in order, and every lookup was a linear scan with a
+       memchr per element -- plus a span_count over the whole value first, just
+       to know how many there were.
+       With an element index, position k is arithmetic, so the search can be a
+       binary one.  20,000 elements: 20,000 comparisons become 15. */
+    mv_string *st = src->tag == MV_STR ? src->s : NULL;
+    struct mv_ix *ix = st ? ix_for(st, sp, mark) : NULL;
+
+    /* A BINARY SEARCH BELIEVES THE ORDER IT WAS TOLD; a linear scan does not.
+       On a list that is NOT in the stated order the two give different answers
+       -- `LOCATE("aaa", "bbb":AM:"aaa":AM:"ccc"; P; "AL")` is a miss to the
+       scan and a hit to the search, and both are defensible readings of a
+       program that lied about its data.  Classic Pick scans, so the scan is
+       what MVX must keep (DECISIONS.md: classic behaviour is the tie-breaker).
+       So ASK, once, and remember: the check is a pass over the elements, and
+       it is amortised over every lookup until the value is edited. */
+    if (ix && dir && !(ix->ord_ok >= 0 && ix->ord_dir == dir && ix->ord_just == just)) {
+        ix->ord_dir = dir; ix->ord_just = just; ix->ord_ok = 1;
+        for (int64_t k = 1; k < ix->n; k++) {
+            span x = ix_span(ix, sp, k), y = ix_span(ix, sp, k + 1);
+            int c = (just == 'R') ? cmp_right(x, y) : cmp_left(x, y);
+            if (dir == 'D') c = -c;
+            if (c > 0) { ix->ord_ok = 0; break; }
+        }
+    }
+
+    if (ix && dir && ix->ord_ok == 1) {
+        int64_t lo, hi;
+        /* first element the item does not sort after, and first it sorts
+           strictly before: everything between compares equal. */
+        int64_t a1 = 1, b1 = ix->n + 1;
+        while (a1 < b1) {
+            int64_t m = a1 + (b1 - a1) / 2;
+            span e = ix_span(ix, sp, m);
+            int c = (just == 'R') ? cmp_right(it, e) : cmp_left(it, e);
+            if (dir == 'D') c = -c;
+            if (c <= 0) b1 = m; else a1 = m + 1;
+        }
+        lo = a1;
+        a1 = lo; b1 = ix->n + 1;
+        while (a1 < b1) {
+            int64_t m = a1 + (b1 - a1) / 2;
+            span e = ix_span(ix, sp, m);
+            int c = (just == 'R') ? cmp_right(it, e) : cmp_left(it, e);
+            if (dir == 'D') c = -c;
+            if (c < 0) b1 = m; else a1 = m + 1;
+        }
+        hi = a1;
+        /* The run [lo, hi) compares equal; the answer is a BYTE match in it,
+           exactly as the scan below decides.  Ordering equal and bytes equal
+           are not the same question -- "01" and "1" answer them differently. */
+        for (int64_t k = lo; k < hi; k++) {
+            span e = ix_span(ix, sp, k);
+            if (e.len == it.len && memcmp(e.p, it.p, (size_t)e.len) == 0) {
+                *pos = k;
+                return 1;
+            }
+        }
+        *pos = hi;
+        return 0;
+    }
+
+    int64_t n = ix ? ix->n : span_count(sp, mark);
     const char *q = sp.p, *end = sp.p + sp.len;
     for (int64_t k = 1; k <= n; k++) {
         const char *m = memchr(q, mark, (size_t)(end - q));
