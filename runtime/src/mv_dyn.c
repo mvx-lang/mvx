@@ -439,7 +439,26 @@ static int inplace_repl(mv_value *dst, const mv_value *src, int64_t a,
     char vb[40];
     span vs = val_span(val, vb, sizeof vb);
     span e;
+
+    /* ONE LEVEL WHEN THERE IS ONLY ONE.  `X<1,v>` on a value with no attribute
+       mark -- a list, a set of flags, one field's worth of values, which is
+       most of what MV code keeps in a dynamic array -- resolves level 1 to the
+       whole string.  Asking the AM level about it is a lookup and a call to be
+       told what we already know.  Go straight to the VM elements. */
+    if (a == 1 && s_ == 0 && v > 0) {
+        struct mv_ix *am = ix_for(st, (span){mv_str_bytes(st), st->len}, AM);
+        if (am && am->n == 1) {
+            span whole = {mv_str_bytes(st), st->len};
+            struct mv_ix *vm = ix_for(st, whole, VM);
+            if (vm && v <= vm->n) {
+                int64_t b = vm->off[v - 1], en = vm->off[v] - 1;
+                e = (span){whole.p + b, en - b};
+                goto located;
+            }
+        }
+    }
     if (!locate(st, a, v, s_, &e)) return 0;
+located:;
 
     int64_t at = e.p - mv_str_wbytes(st);
     int64_t delta = vs.len - e.len;
