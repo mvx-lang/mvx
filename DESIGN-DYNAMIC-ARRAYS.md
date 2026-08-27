@@ -199,6 +199,40 @@ needs.
 
 ---
 
+## 4a. Prior art: uArray (gheydon/uarray, 2013)
+
+This design is not speculative. It was built in PHP, for the same problem, by
+the same person asking for it here — and the shape it settled on is the shape
+above, with three refinements worth stealing outright.
+
+```php
+private $data = array();        // the elements — truth once split
+private $output = NULL;         // the flat string — NULL when stale
+private $needs_exploding = FALSE;
+private $is_tainted = FALSE;
+```
+
+**Lazy in BOTH directions.** `$needs_exploding` means the string is not split
+until something subscripts it; `$output === NULL` means the string is not
+rebuilt until something stringifies it. A value read from a file, passed
+along and written back whole is never split at all. That is the JIT bound in
+3.4, and it was load-bearing there too.
+
+**Taint propagates to the parent.** A nested `uArray` holds a reference to the
+container that owns it, and marking a value dirty marks its field and the whole
+record dirty. MVX's equivalent is `<a,v,s>`: an edit at the SM level invalidates
+the VM split above it and the AM split above that. The C version needs this and
+it is the part most likely to be got wrong, because a stale parent index is
+exactly the silent-wrong-data failure of 3.1.
+
+**A scalar is not an array.** `__toString()` returns `$data[0]` directly when
+that is all there is, with the comment *"Don't cache the first 2 as it is not
+worth it"* — most MV values are one value, and the machinery should not charge
+them for the possibility of being more.
+
+The PHP version could be relaxed about copying where the C one cannot; what
+carries over is the state machine, not the implementation.
+
 ## 5. Alternatives considered
 
 **Strengthen the existing index** (#130's own suggestion 1–3: adjust offsets
