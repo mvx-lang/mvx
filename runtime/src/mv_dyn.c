@@ -121,12 +121,10 @@ static span nth_span(span s, char mark, int64_t idx) {
    short chain of them -- one per level -- rather than a single slot the
    levels would evict each other from.  All of it is dropped the moment the
    bytes move. */
-#define IX_MIN_BYTES 128
-#define IX_STRIDE    16
-#define IX_MAX_CHAIN 3
+#define IX_MIN_BYTES 8
+#define IX_STRIDE    1
 
 struct mv_ix {
-    struct mv_ix *next;
     char    mark;
     int64_t base, blen;     /* the indexed range, as an offset into data */
     int64_t n;              /* elements in it */
@@ -134,17 +132,34 @@ struct mv_ix {
     int64_t off[];          /* off[k]: start of element k*IX_STRIDE + 1 */
 };
 
+/* AM/VM/SM are 254/253/252 and a subscript can name no other level, so a
+   string needs exactly three slots -- and which one a lookup wants is
+   arithmetic rather than a search.  The chain this replaces cost as much as
+   the whole rest of the replace path put together: 854 samples against
+   mv_replace_fn's 862, because every subscripted write walked it twice and
+   the walk alternated AM then VM, so a move-to-front would have thrashed. */
+#define IX_LVLS 3
+static inline int ix_lvl(char mark) { return 254 - (int)(unsigned char)mark; }
+
+struct mv_ixset { struct mv_ix *lvl[IX_LVLS]; };
+
 void mvx_ix_drop(mv_string *s) {
-    if (!s) return;
-    struct mv_ix *ix = s->ix;
-    while (ix) { struct mv_ix *nx = ix->next; free(ix); ix = nx; }
+    if (!s || !s->ix) return;
+    struct mv_ixset *set = (struct mv_ixset *)s->ix;
+    for (int i = 0; i < IX_LVLS; i++) free(set->lvl[i]);
+    free(set);
     s->ix = NULL;
 }
 
 static struct mv_ix *ix_build(mv_string *st, span sp, char mark) {
+    /* AN OFFSET PER BOUNDARY, not one every IX_STRIDE elements.
+       A stride made the index small when memory was the thing to save; what it
+       costs is a forward scan for the END of every element, which is what
+       nth_span_ix spent 667 samples doing.  Eight bytes an element buys both
+       boundaries outright, and on a machine with gigabytes that is the cheaper
+       side of the trade (DESIGN-DYNAMIC-ARRAYS.md 3.4). */
     int64_t n = span_count(sp, mark);
-    int64_t noff = (n + IX_STRIDE - 1) / IX_STRIDE;
-    if (noff < 1) noff = 1;
+    int64_t noff = n + 1;
     struct mv_ix *ix = malloc(sizeof *ix + (size_t)noff * sizeof(int64_t));
     if (!ix) return NULL;
     ix->mark = mark;
@@ -153,57 +168,55 @@ static struct mv_ix *ix_build(mv_string *st, span sp, char mark) {
     ix->n    = n;
     ix->noff = noff;
     const char *p = sp.p, *end = sp.p + sp.len;
-    int64_t elem = 0, k = 0;
-    ix->off[k++] = 0;
-    while (p < end && k < noff) {
-        if (*p == mark) {
-            elem++;
-            if (elem % IX_STRIDE == 0) ix->off[k++] = (p + 1) - sp.p;
-        }
+    int64_t k = 0;
+    ix->off[k++] = 0;                       /* element 1 starts at 0 */
+    while (p < end && k < n) {
+        if (*p == mark) ix->off[k++] = (p + 1) - sp.p;
         p++;
     }
-    while (k < noff) ix->off[k++] = sp.len;
+    while (k < n) ix->off[k++] = sp.len;
+    /* One past the last element, so element i is [off[i-1], off[i]-1). */
+    ix->off[n] = sp.len + 1;
 
-    ix->next = st->ix;
-    st->ix = ix;
-    /* Keep the chain short; three levels is all a subscript can name. */
-    struct mv_ix *q = ix;
-    for (int i = 0; i < IX_MAX_CHAIN - 1 && q; i++) q = q->next;
-    if (q && q->next) {
-        struct mv_ix *drop = q->next;
-        q->next = NULL;
-        while (drop) { struct mv_ix *nx = drop->next; free(drop); drop = nx; }
+    struct mv_ixset *set = (struct mv_ixset *)st->ix;
+    if (!set) {
+        set = calloc(1, sizeof *set);
+        if (!set) { free(ix); return NULL; }
+        st->ix = (struct mv_ix *)set;
     }
+    int l = ix_lvl(mark);
+    if (l < 0 || l >= IX_LVLS) { free(ix); return NULL; }
+    free(set->lvl[l]);          /* one index per level; the newest range wins */
+    set->lvl[l] = ix;
     return ix;
 }
 
-/* The index for this range and level, building one if it is worth it. */
-static struct mv_ix *ix_for(mv_string *st, span sp, char mark) {
-    if (!st) return NULL;
-    int64_t base = sp.p - mv_str_wbytes(st);
-    for (struct mv_ix *ix = st->ix; ix; ix = ix->next)
-        if (ix->mark == mark && ix->base == base && ix->blen == sp.len)
-            return ix;
+/* The index for this range and level, building one if it is worth it.
+   THE HIT IS INLINE AND THE MISS IS NOT: a subscripted write asks twice, and
+   what it almost always gets back is the index it got last time. */
+static struct mv_ix *ix_miss(mv_string *st, span sp, char mark, int64_t base) {
     if (sp.len < IX_MIN_BYTES) return NULL;
+    (void)base;
     return ix_build(st, sp, mark);
 }
 
-/* nth_span, using the index when there is one.  The last element needs no
-   forward scan at all: it runs to the end of the range by definition. */
-static span nth_span_ix(mv_string *st, span sp, char mark, int64_t idx) {
+static inline struct mv_ix *ix_for(mv_string *st, span sp, char mark) {
+    if (!st || !st->ix) return st ? ix_miss(st, sp, mark, 0) : NULL;
+    int l = ix_lvl(mark);
+    if (l < 0 || l >= IX_LVLS) return NULL;
+    struct mv_ix *ix = ((struct mv_ixset *)st->ix)->lvl[l];
+    int64_t base = sp.p - mv_str_bytes(st);
+    if (ix && ix->base == base && ix->blen == sp.len) return ix;
+    return ix_miss(st, sp, mark, base);
+}
+
+/* nth_span, using the index when there is one.  Both boundaries come out of
+   the table, so there is no scanning left in a subscripted access at all. */
+static inline span nth_span_ix(mv_string *st, span sp, char mark, int64_t idx) {
     struct mv_ix *ix = ix_for(st, sp, mark);
-    if (!ix || idx > ix->n) return nth_span(sp, mark, idx);
-    int64_t b = (idx - 1) / IX_STRIDE;
-    int64_t rem = (idx - 1) % IX_STRIDE;
-    const char *p = sp.p + ix->off[b], *end = sp.p + sp.len;
-    while (rem-- > 0) {
-        while (p < end && *p != mark) p++;
-        if (p < end) p++;
-    }
-    if (idx == ix->n) return (span){p, end - p};
-    const char *q = p;
-    while (q < end && *q != mark) q++;
-    return (span){p, q - p};
+    if (!ix || idx > ix->n || idx < 1) return nth_span(sp, mark, idx);
+    int64_t b = ix->off[idx - 1], e = ix->off[idx] - 1;
+    return (span){sp.p + b, e - b};
 }
 
 /* nth_span_ix, reporting whether idx was within the element count, so a
