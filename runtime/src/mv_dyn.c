@@ -646,6 +646,29 @@ void mv_delete_fn(mv_value *dst, const mv_value *src, int64_t a,
 static int num_parse(span s, double *out) {
     char tmp[64];
     if (s.len == 0 || s.len >= (int64_t)sizeof tmp) return 0;
+
+    /* MOST MV NUMBERS ARE PLAIN INTEGERS -- quantities, counts, keys, dates as
+       day numbers -- and strtod is a locale-aware parser that also has to
+       consider hex, infinity and NaN before it reads a digit.  This reads the
+       digits.  Anything with a sign, a point, an exponent or a space falls
+       through to strtod, which stays the definition of what parses. */
+    {
+        const char *p = s.p, *e = s.p + s.len;
+        int neg = 0;
+        if (*p == '-') { neg = 1; p++; }
+        if (p < e && (e - p) <= 18) {              /* 18 digits: no overflow */
+            int64_t acc = 0;
+            const char *q = p;
+            while (q < e) {
+                unsigned c = (unsigned char)*q - '0';
+                if (c > 9) break;
+                acc = acc * 10 + (int64_t)c;
+                q++;
+            }
+            if (q == e) { *out = neg ? -(double)acc : (double)acc; return 1; }
+        }
+    }
+
     memcpy(tmp, s.p, (size_t)s.len);
     tmp[s.len] = '\0';
     char *end = NULL;
@@ -821,8 +844,11 @@ int64_t mv_dcount_fn(const mv_value *src, const mv_value *delim) {
 /* ---- SUM / MAXIMUM / MINIMUM -------------------------------------------- */
 
 static int64_t fmt_num(double d, char *buf, size_t cap) {
+    /* Same lesson as the dynamic-array edit path: snprintf parses a format
+       string and walks a varargs list before it writes a digit, and a total is
+       almost always a whole number. */
     if (d == (double)(int64_t)d && d >= -1e15 && d <= 1e15)
-        return snprintf(buf, cap, "%lld", (long long)d);
+        return mv_itoa64(buf, (int64_t)d);
     int64_t n = snprintf(buf, cap, "%.4f", d);
     while (n > 0 && buf[n - 1] == '0') buf[--n] = '\0';
     if (n > 0 && buf[n - 1] == '.') buf[--n] = '\0';
@@ -836,9 +862,12 @@ void mv_sum(mv_value *dst, const mv_value *src) {
     span s = val_span(src, nb, sizeof nb);
     char level = AM;
     int hasV = 0, hasS = 0;
+    /* SM is the deepest level there is, so once one is seen the answer is
+       settled and the rest of the value need not be read. */
     for (int64_t i = 0; i < s.len; i++) {
         unsigned char c = (unsigned char)s.p[i];
-        if (c == 0xFD) hasV = 1; else if (c == 0xFC) hasS = 1;
+        if (c == 0xFC) { hasS = 1; break; }
+        if (c == 0xFD) hasV = 1;
     }
     if (hasS) level = SM; else if (hasV) level = VM;
     dbuf out = {0, 0, 0};
