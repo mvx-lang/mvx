@@ -689,6 +689,22 @@ int64_t mv_count_fn(const mv_value *src, const mv_value *what) {
     span s = val_span(src, nb, sizeof nb);
     span w = val_span(what, wb, sizeof wb);
     if (w.len == 0 || s.len < w.len) return 0;
+
+    /* COUNTING MARKS IS SOMETHING THE INDEX ALREADY KNOWS.
+       `N = DCOUNT(LIST, VM)` ahead of a FOR is the most common line in MV code,
+       and it was a full scan of the value every time it ran -- 5,540 calls a
+       second on twenty thousand elements, because each one walked 140KB to
+       arrive at a number the index is holding.
+       Only for a single AM/VM/SM: COUNT takes an arbitrary substring, and an
+       index describes marks. */
+    if (w.len == 1 && src->tag == MV_STR) {
+        char m = w.p[0];
+        if (m == AM || m == VM || m == SM) {
+            struct mv_ix *ix = ix_for(src->s, s, m);
+            if (ix) return ix->n - 1;       /* elements = marks + 1 */
+        }
+    }
+
     int64_t n = 0;
     const char *p = s.p, *end = s.p + s.len;
     while (p + w.len <= end) {
