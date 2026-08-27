@@ -530,6 +530,99 @@ static void run_op(mv_value *dst, const mv_value *src, int64_t a,
     free(out.d);
 }
 
+/* INSERT and DELETE at the top level, without rebuilding the value.
+ *
+ * Both went through modify(), which walks the whole value and copies it into a
+ * fresh buffer, then drops the index.  A list that is being MAINTAINED -- kept
+ * in order, added to, removed from, which is what a dynamic array is for --
+ * paid that on every change.
+ *
+ * The bytes still have to move: an element in the middle shifts everything
+ * after it, and no representation avoids that.  What this avoids is the second
+ * pass and the third: the walk to find the position, and the rescan to rebuild
+ * an index that only needed its offsets shifted.
+ *
+ * Top level only (X<a>), which is the shape list maintenance uses.  Anything
+ * deeper, out of range, or short of capacity falls back to the general path --
+ * and the general path stays the definition of what these mean.
+ *
+ * Returns 0 when it did not do the work.
+ */
+static int inplace_insdel(mv_value *dst, const mv_value *src, int64_t a,
+                          int64_t v, int64_t s_, const mv_value *val, int op) {
+    if (dst != src || dst->tag != MV_STR) return 0;
+    if (v != 0 || s_ != 0 || a < 1) return 0;          /* top level only */
+    if (dst->s->refs != 1 && !cow_keep_index(dst)) return 0;
+    mv_string *st = dst->s;
+
+    span whole = {mv_str_bytes(st), st->len};
+    struct mv_ix *ix = ix_for(st, whole, AM);
+    if (!ix || ix->n < 1) return 0;
+    int64_t n = ix->n;
+    if (a > n) return 0;                               /* padding: general path */
+
+    char vb[40];
+    span vs = (op == OP_INS) ? val_span(val, vb, sizeof vb) : (span){"", 0};
+    /* The value must not live in the bytes about to shift. */
+    if (op == OP_INS && vs.p >= mv_str_bytes(st) &&
+        vs.p < mv_str_bytes(st) + st->len) return 0;
+
+    char *d = mv_str_wbytes(st);
+    int64_t at, cut, delta;
+
+    if (op == OP_INS) {
+        at = ix->off[a - 1];                    /* the new element starts here */
+        delta = vs.len + 1;                     /* value plus its mark */
+        if (st->len + delta > st->cap) return 0;
+        memmove(d + at + delta, d + at, (size_t)(st->len - at));
+        memcpy(d + at, vs.p, (size_t)vs.len);
+        d[at + vs.len] = AM;
+        cut = 0;
+    } else {                                    /* OP_DEL */
+        if (n == 1) {                           /* the only element: empty it */
+            st->len = 0; d[0] = '\0';
+            mvx_ix_drop(st);
+            return 1;
+        }
+        if (a == n) {                           /* last: take the mark BEFORE it */
+            at = ix->off[a - 1] - 1;
+            cut = st->len - at;
+        } else {                                /* take the mark AFTER it */
+            at = ix->off[a - 1];
+            cut = ix->off[a] - at;
+        }
+        delta = -cut;
+        memmove(d + at, d + at + cut, (size_t)(st->len - at - cut));
+    }
+
+    st->len += delta;
+    d[st->len] = '\0';
+
+    /* ---- and the index follows, rather than being thrown away ---------- */
+    int64_t nn = n + (op == OP_INS ? 1 : -1);
+    struct mv_ix *nx = malloc(sizeof *nx + (size_t)(nn + 1) * sizeof(int64_t));
+    if (!nx) { mvx_ix_drop(st); return 1; }     /* the bytes are right; rebuild later */
+    *nx = *ix;
+    nx->n = nn;
+    nx->blen = st->len;
+    nx->ord_ok = -1;                            /* the order may have changed */
+    if (op == OP_INS) {
+        for (int64_t k = 0; k <= a - 1; k++) nx->off[k] = ix->off[k];
+        for (int64_t k = a; k <= n + 1; k++)   nx->off[k] = ix->off[k - 1] + delta;
+    } else {
+        for (int64_t k = 0; k <= a - 1; k++) nx->off[k] = ix->off[k];
+        for (int64_t k = a; k <= nn; k++)     nx->off[k] = ix->off[k + 1] + delta;
+    }
+    struct mv_ixset *set = (struct mv_ixset *)st->ix;
+    int l = ix_lvl(AM);
+    free(set->lvl[l]);
+    set->lvl[l] = nx;
+    /* The deeper levels described ranges that have just moved. */
+    for (int i = 0; i < IX_LVLS; i++)
+        if (i != l) { free(set->lvl[i]); set->lvl[i] = NULL; }
+    return 1;
+}
+
 void mv_replace_fn(mv_value *dst, const mv_value *src, int64_t a,
                    int64_t v, int64_t s, const mv_value *val) {
     if (inplace_repl(dst, src, a, v, s, val)) return;
@@ -538,11 +631,13 @@ void mv_replace_fn(mv_value *dst, const mv_value *src, int64_t a,
 
 void mv_insert_fn(mv_value *dst, const mv_value *src, int64_t a,
                   int64_t v, int64_t s, const mv_value *val) {
+    if (inplace_insdel(dst, src, a, v, s, val, OP_INS)) return;
     run_op(dst, src, a, v, s, val, OP_INS);
 }
 
 void mv_delete_fn(mv_value *dst, const mv_value *src, int64_t a,
                   int64_t v, int64_t s) {
+    if (inplace_insdel(dst, src, a, v, s, NULL, OP_DEL)) return;
     run_op(dst, src, a, v, s, NULL, OP_DEL);
 }
 
