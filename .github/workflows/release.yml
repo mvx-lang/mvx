@@ -6,7 +6,11 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    # ONE rolling dev tag, moved to develop's HEAD by the nightly when there is
+    # something new and CI is green.  It builds through THIS workflow rather
+    # than a second copy of it, so a dev build is the same artifacts by the same
+    # steps as a release -- the only way a dev build is worth having.
+    tags: ["v*", "dev"]
   workflow_dispatch:
     inputs:
       tag:
@@ -21,8 +25,72 @@ env:
   LLVM_VERSION: "21"
 
 jobs:
+  # ---- nothing is published from a commit CI has not passed on -----------
+  # A release is a promise that this build works.  Without this the promise is
+  # that it compiled on the machine that tagged it.
+  ci-gate:
+    name: CI must be green for this commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Require a green ci run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          now() { date +%s; }
+          api="repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100"
+          appear_by=$(( $(now) + 600 ))    # 10 min for the run to show up
+          finish_by=$(( $(now) + 3600 ))   # 60 min for it to finish
+
+          while :; do
+            run="$(gh api "$api" --jq '.workflow_runs | sort_by(.run_started_at) | last // empty')"
+
+            if [ -z "$run" ]; then
+              if [ "$(now)" -ge "$appear_by" ]; then
+                echo "::error::no ci run for $SHA. Release only a commit CI has run on: push it, let ci finish, then tag it."
+                exit 1
+              fi
+              echo "no ci run for $SHA yet, waiting ..."; sleep 20; continue
+            fi
+
+            id="$(printf '%s' "$run" | jq -r .id)"
+            url="$(printf '%s' "$run" | jq -r .html_url)"
+            status="$(printf '%s' "$run" | jq -r .status)"
+
+            if [ "$status" != completed ]; then
+              if [ "$(now)" -ge "$finish_by" ]; then
+                echo "::error::ci run $url is still '$status' after 60 minutes. Not releasing on an unfinished run."
+                exit 1
+              fi
+              echo "ci run is '$status' ($url), waiting ..."; sleep 20; continue
+            fi
+
+            concl="$(printf '%s' "$run" | jq -r .conclusion)"
+            if [ "$concl" != success ]; then
+              echo "::error::ci concluded '$concl' for $SHA ($url). Nothing will be published."
+              exit 1
+            fi
+
+            # A run whose job was renamed, removed or never scheduled still
+            # concludes 'success' overall.  A job that did not run is not a job
+            # that passed.
+            jobs="$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+                      --jq '[.jobs[] | select(.conclusion == "success") | .name]')"
+            printf '%s' "$jobs" | jq -e 'index("build-test")' >/dev/null || {
+              echo "::error::ci run $url has no successful 'build-test' job."
+              exit 1
+            }
+
+            echo "ci is green for $SHA: $url"
+            break
+          done
+
   # ---- native Linux binaries, one job per architecture -------------------
   binaries:
+    needs: ci-gate
     strategy:
       fail-fast: false
       matrix:
@@ -99,6 +167,7 @@ jobs:
 
   # ---- multi-arch container images to the GitHub Container Registry ------
   images:
+    needs: ci-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -153,3 +222,31 @@ jobs:
           tags: |
             ghcr.io/mvx-lang/mvx-demo:${{ steps.v.outputs.tag }}
             ghcr.io/mvx-lang/mvx-demo:latest
+
+  # ---- what kind of release is this? ------------------------------------
+  # Every publish step above can CREATE the release, and an unset prerelease
+  # field defaults to "full release" -- so whichever ran first decided, and a
+  # dev build promoted to Latest is what anyone installing by name would get.
+  # Say it once, at the end, when there is nothing left to race with.
+  mark:
+    needs: [binaries, images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say what this release is
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Stable is the one that is NOT a pre-release: dev, beta and rc all
+          # are, and a stable tag is anything with no suffix -- v2.1.0, not
+          # v2.1.0-rc1 and not dev.  Both directions are set explicitly, because
+          # leaving the stable case alone means it keeps whatever the first
+          # publish step happened to decide.
+          case "$TAG" in
+            dev|*-*) gh release edit "$TAG" --prerelease --latest=false
+                     echo "$TAG is a pre-release, and not latest." ;;
+            *)       gh release edit "$TAG" --prerelease=false --latest
+                     echo "$TAG is a stable release, and is latest." ;;
+          esac
