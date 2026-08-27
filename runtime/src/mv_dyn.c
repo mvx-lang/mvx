@@ -387,9 +387,54 @@ static int locate(mv_string *st, int64_t a, int64_t v, int64_t s_, span *out) {
    cheapest case -- a byte copy, and the index stays exact -- and a length
    change is still only a memmove of the tail while the capacity holds.
    Returns 0 when the general path has to run instead. */
+/* Take a private copy of a shared string, KEEPING ITS INDEX.
+ *
+ * `MAT BANK = ONES` points thirty-one thousand array elements at one string,
+ * and the first write to each has to copy before it can edit.  The copy is
+ * byte-for-byte identical, so every offset in the source's index still
+ * describes it exactly -- and throwing that away meant every bank rebuilt its
+ * index on every pass.  Measured on the banked sieve: 11,562,502 index builds
+ * before this, and 2 after.
+ *
+ * Returns 0 if the copy could not be made, in which case the caller falls back
+ * to the general rebuild.
+ */
+static int cow_keep_index(mv_value *dst) {
+    mv_string *old = dst->s;
+    mv_string *st = mvx_str_alloc_cap(old->len, old->cap);
+    if (!st) return 0;
+    memcpy(mv_str_wbytes(st), mv_str_bytes(old), (size_t)old->len);
+    mv_str_wbytes(st)[old->len] = '\0';
+    st->len = old->len;
+
+    struct mv_ixset *osrc = (struct mv_ixset *)old->ix;
+    if (osrc) {
+        struct mv_ixset *set = calloc(1, sizeof *set);
+        if (set) {
+            for (int i = 0; i < IX_LVLS; i++) {
+                struct mv_ix *o = osrc->lvl[i];
+                if (!o) continue;
+                size_t sz = sizeof *o + (size_t)(o->n + 1) * sizeof(int64_t);
+                struct mv_ix *c = malloc(sz);
+                if (!c) continue;
+                memcpy(c, o, sz);
+                set->lvl[i] = c;
+            }
+            st->ix = (struct mv_ix *)set;
+        }
+    }
+    mv_clear(dst);
+    dst->tag = MV_STR;
+    dst->s = st;
+    return 1;
+}
+
 static int inplace_repl(mv_value *dst, const mv_value *src, int64_t a,
                         int64_t v, int64_t s_, const mv_value *val) {
-    if (dst != src || dst->tag != MV_STR || dst->s->refs != 1) return 0;
+    if (dst != src || dst->tag != MV_STR) return 0;
+    /* Shared: copy it here, with its index, rather than letting the general
+       path rebuild both from nothing. */
+    if (dst->s->refs != 1 && !cow_keep_index(dst)) return 0;
     mv_string *st = dst->s;
     char vb[40];
     span vs = val_span(val, vb, sizeof vb);
