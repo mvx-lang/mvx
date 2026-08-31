@@ -39,6 +39,9 @@ set_property(CACHE MVX_WITH_POSTGRES PROPERTY STRINGS AUTO ON OFF)
 set(MVX_WITH_MONGO "${_mvx_pg_default}" CACHE STRING
   "MongoDB driver: AUTO (build if libmongoc present), ON (require it), OFF")
 set_property(CACHE MVX_WITH_MONGO PROPERTY STRINGS AUTO ON OFF)
+set(MVX_WITH_SQLITE "${_mvx_pg_default}" CACHE STRING
+  "SQLite driver: AUTO (build if sqlite3 present), ON (require it), OFF")
+set_property(CACHE MVX_WITH_SQLITE PROPERTY STRINGS AUTO ON OFF)
 option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
   ${_mvx_daemon_default})
 # Packages built into the system account at build time (#54): always available
@@ -134,6 +137,26 @@ if(MVX_POSTGRES_ENABLED)
   mvx_driver(postgres runtime/src/mvx_drv_postgres.c)
   target_include_directories(mvxdrv_postgres PRIVATE ${LIBPQ_INCLUDE_DIR})
   target_link_libraries(mvxdrv_postgres PRIVATE ${LIBPQ_LIBRARY})
+endif()
+
+# sqlite driver — an embedded SQL backend with the full push-down set.
+# Unlike postgres it needs no server, and because an account's files are all
+# tables in ONE database file, cross-file JOIN/ORDER BY are always available.
+set(MVX_SQLITE_ENABLED OFF)
+if(NOT MVX_WITH_SQLITE STREQUAL "OFF")
+  find_path(SQLITE3_INCLUDE_DIR sqlite3.h
+            HINTS /opt/homebrew/opt/sqlite/include /usr/local/opt/sqlite/include)
+  find_library(SQLITE3_LIBRARY NAMES sqlite3
+               HINTS /opt/homebrew/opt/sqlite/lib /usr/local/opt/sqlite/lib)
+  if(SQLITE3_INCLUDE_DIR AND SQLITE3_LIBRARY)
+    set(MVX_SQLITE_ENABLED ON)
+    message(STATUS "Building sqlite driver against ${SQLITE3_LIBRARY}")
+    mvx_driver(sqlite runtime/src/mvx_drv_sqlite.c)
+    target_include_directories(mvxdrv_sqlite PRIVATE ${SQLITE3_INCLUDE_DIR})
+    target_link_libraries(mvxdrv_sqlite PRIVATE ${SQLITE3_LIBRARY})
+  else()
+    message(STATUS "sqlite driver: sqlite3 not found, skipping")
+  endif()
 endif()
 
 # mongo driver — gated by MVX_WITH_MONGO.  The mongo-c-driver ships pkg-config
@@ -297,6 +320,9 @@ if(MVX_POSTGRES_ENABLED)
 endif()
 if(MVX_MONGO_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxdrv_mongo)
+endif()
+if(MVX_SQLITE_ENABLED)
+  list(APPEND MVX_INSTALL_DRIVERS mvxdrv_sqlite)
 endif()
 install(TARGETS ${MVX_INSTALL_DRIVERS} LIBRARY DESTINATION lib)
 install(FILES ${CMAKE_BINARY_DIR}/lib/mvx_crt.o DESTINATION lib)

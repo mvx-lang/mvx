@@ -2297,6 +2297,77 @@ else
   echo "  (postgres test skipped — set MVX_PG to run)"
 fi
 
+# sqlite backend.  UNCONDITIONAL, unlike postgres/mongo: an embedded backend
+# needs no server, which is the whole reason it exists — so if it is built, it
+# is tested on every run rather than behind an env var nobody sets.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== sqlite backend"
+  SQA="$TESTROOT/sqacct"; mkdir -p "$SQA"
+  printf '# MVX account descriptor\nname=sqacct\nversion=1\n' > "$SQA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$SQA" > "$SQA/BINDINGS"
+  "$TCL" -a "$SQA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/sqseed.b" <<'SQEOF'
+OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
+WRITE "Ada":@AM:"London":@AM:"42" ON F, "C1"
+WRITE "Grace":@AM:"York":@AM:"7" ON F, "C2"
+WRITE "Alan":@AM:"Cambridge":@AM:"115" ON F, "C3"
+READ R FROM F, "C2" THEN
+   PRINT "rt=":R<1>:"/":R<3>
+END ELSE PRINT "rt=LOST"
+DELETE F, "C3"
+N = 0
+SELECT F
+D = 0
+LOOP UNTIL D DO
+   READNEXT ID ELSE D = 1
+   IF NOT(D) THEN N += 1
+REPEAT
+PRINT "n=":N
+SQEOF
+  "$MVX" "$TESTROOT/sqseed.b" -o "$TESTROOT/sqseed" >/dev/null 2>&1
+  sqout="$(cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqseed" 2>&1)"
+  # a record survives the round trip with its marks, and DELETE really deletes
+  case "$sqout" in
+    *"rt=Grace/7"*) PASS=$((PASS+1)); echo "  record round-trips byte-exact" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite round-trip: $sqout" ;;
+  esac
+  case "$sqout" in
+    *"n=2"*) PASS=$((PASS+1)); echo "  select sees the delete" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite select/delete: $sqout" ;;
+  esac
+  # LISTF names the file AND its driver -- the cross-file listing this
+  # backend exists for, and the path that used to work only for postgres
+  lf="$("$TCL" -a "$SQA" -c 'LISTF' 2>&1)"
+  case "$lf" in
+    *"CUST"*"sqlite"*) PASS=$((PASS+1)); echo "  LISTF enumerates via the driver" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite LISTF: $lf" ;;
+  esac
+  # COUNT and a WITH filter run IN the backend, not by streaming ids to the
+  # verb: DESCRIBE shows the statement, so this asserts the push-down happened
+  # rather than merely that the answer was right.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DICT CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdict.b" <<'SQDEOF'
+OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L":@AM:"S" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+SQDEOF
+  "$MVX" "$TESTROOT/sqdict.b" -o "$TESTROOT/sqdict" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdict" >/dev/null 2>&1)
+  cnt="$("$TCL" -a "$SQA" -c 'COUNT CUST WITH CITY = "London"' 2>&1)"
+  case "$cnt" in
+    *"1 record"*) PASS=$((PASS+1)); echo "  filtered COUNT is correct" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite COUNT: $cnt" ;;
+  esac
+  desc="$("$TCL" -a "$SQA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
+  case "$desc" in
+    *"SELECT id FROM"*"mvx_attr"*) PASS=$((PASS+1))
+      echo "  WITH is pushed into SQL, not scanned in the verb" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite push-down plan: $desc" ;;
+  esac
+else
+  echo "  (sqlite test skipped — driver not built)"
+fi
+
 # mongo backend — only when MVX_MONGO names a reachable MongoDB, e.g.
 #   MVX_MONGO='address=localhost:27017 namespace=mvxtest'
 if [ -n "${MVX_MONGO:-}" ]; then

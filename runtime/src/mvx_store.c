@@ -2689,6 +2689,16 @@ int64_t mvx_readnext(mvx_ctx *ctx, mv_value *id) {
     return 1;
 }
 
+/* Furniture the account owns but a file listing should not show: a file's
+   dictionary and its index tables.  The driver contract says drivers hand
+   these up and the RUNTIME filters them, so the rule lives here once rather
+   than being restated (and diverging) per enumeration source — which is how
+   an index table came to be visible through one path and not another. */
+static int fl_internal(const char *p, size_t n) {
+    return (n > 5 && memcmp(p, "DICT.", 5) == 0) ||
+           memmem(p, n, ".IDX.", 5) != NULL;
+}
+
 /* FILELIST(): every MV file in the account — subdirectories (directory
    driver) plus LMDB named DBs, as "name @VM type" attributes.  DICT
    stores and infrastructure directories are filtered out. */
@@ -2697,9 +2707,15 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
     char *buf = NULL;
     size_t len = 0, cap = 0;
 
-#define FL_PUT(p, n, ty)                                                  \
+/* Each entry is "name" @VM "driver".  The type is the DRIVER'S OWN NAME,
+   never a code assigned here: a letter per backend has to be invented in
+   this file and then decoded again in the LISTF verb, so the two drift and
+   every new driver needs an edit in both.  The name travels intact and the
+   verb prints what it is given. */
+#define FL_PUTS(p, n, tystr)                                              \
     do {                                                                  \
-        size_t need = (n) + 3;                                            \
+        size_t tl = strlen(tystr);                                        \
+        size_t need = (n) + tl + 2;                                       \
         if (len + need > cap) {                                           \
             cap = cap ? cap * 2 : 256;                                    \
             while (cap < len + need) cap *= 2;                            \
@@ -2711,7 +2727,8 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
         memcpy(buf + len, (p), (n));                                      \
         len += (n);                                                       \
         buf[len++] = (char)0xFD;                                          \
-        buf[len++] = (ty);                                                \
+        memcpy(buf + len, (tystr), tl);                                   \
+        len += tl;                                                        \
     } while (0)
 
     const char *acct = getenv("MVXACCOUNT");
@@ -2728,7 +2745,7 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             snprintf(p, sizeof p, "%s/%s", acct, nm);
             struct stat sb;
             if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode))
-                FL_PUT(nm, strlen(nm), 'D');
+                FL_PUTS(nm, strlen(nm), "dir");
         }
         free(ents[i]);
     }
@@ -2745,9 +2762,7 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             while (p < end) {
                 const char *am = memchr(p, '\xFE', (size_t)(end - p));
                 size_t n = (am ? am : end) - p;
-                int internal = (n > 5 && memcmp(p, "DICT.", 5) == 0) ||
-                               memmem(p, n, ".IDX.", 5) != NULL;
-                if (n > 0 && !internal) FL_PUT(p, n, 'L');
+                if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, "lmdb");
                 p = am ? am + 1 : end;
             }
         }
@@ -2806,27 +2821,28 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             fclose(rf);
         }
     }
-    /* Whole-account Postgres binding (`* @conn` resolving to driver=postgres):
-       per-file BINDINGS lines list nothing here, so enumerate the schema's
-       record tables via the driver.  The empty spec matches only the `*`
-       policy (never an exact file), giving the star driver and its @conn. */
+    /* Whole-account binding to a driver that can enumerate itself: the
+       per-file BINDINGS lines list nothing, so ask the driver.  ANY driver
+       offering names() qualifies — this used to test for postgres BY NAME,
+       which meant a new backend silently listed no files at all however
+       complete its names() was.  The empty spec matches only the `*` policy
+       (never an exact file), giving the star driver and its params. */
     {
         char bdrv[64] = "", bparm[512] = "";
         if (binding_for("", bdrv, sizeof bdrv, bparm, sizeof bparm) &&
-            strcmp(bdrv, "postgres") == 0) {
-            const mvx_driver *pg = driver_load("postgres");
-            if (pg->names) {
+            bdrv[0] && mvx_driver_available(bdrv)) {
+            const mvx_driver *bd = driver_load(bdrv);
+            if (bd->names) {
                 mv_value names;
                 mv_init(&names);
                 char err[256] = "";
-                if (pg->names(bparm, &names, err, sizeof err) &&
+                if (bd->names(bparm, &names, err, sizeof err) &&
                     names.tag == MV_STR && names.s->len > 0) {
                     const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
                     while (p < end) {
                         const char *am = memchr(p, '\xFE', (size_t)(end - p));
                         size_t n = (am ? am : end) - p;
-                        int internal = n > 5 && memcmp(p, "DICT.", 5) == 0;
-                        if (n > 0 && !internal) FL_PUT(p, n, 'P');
+                        if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, bdrv);
                         p = am ? am + 1 : end;
                     }
                 }
@@ -2834,32 +2850,10 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             }
         }
     }
-    const char *dmn = getenv("MVXDAEMON");
-    if (!listed_bound && dmn && dmn[0]) {
-        const mvx_driver *net = driver_load("lmdbnet");
-        if (net->names) {
-            mv_value names;
-            mv_init(&names);
-            char err[256] = "";
-            if (net->names(NULL, &names, err, sizeof err) &&
-                names.tag == MV_STR && names.s->len > 0) {
-                const char *p = mv_str_bytes(names.s);
-                const char *end = p + names.s->len;
-                while (p < end) {
-                    const char *am = memchr(p, '\xFE',
-                                            (size_t)(end - p));
-                    size_t n = (am ? am : end) - p;
-                    int internal =
-                        (n > 5 && memcmp(p, "DICT.", 5) == 0) ||
-                        memmem(p, n, ".IDX.", 5) != NULL;
-                    if (n > 0 && !internal) FL_PUT(p, n, 'N');
-                    p = am ? am + 1 : end;
-                }
-            }
-            mv_clear(&names);
-        }
-    }
-#undef FL_PUT
+    /* The bare-$MVXDAEMON case used to be enumerated by a third block that
+       loaded "lmdbnet" by name.  It is gone: binding_for() already resolves a
+       daemon with no BINDINGS record to that driver, so the block above covers
+       it — and running both listed every file twice. */
 
     mv_set_str(dst, buf ? buf : "", (int64_t)len);
     free(buf);
