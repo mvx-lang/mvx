@@ -1037,6 +1037,45 @@ RGEOF
     ( cd "$MGSUB/acct" && "$ROOT/build/bin/mvx-git" log --oneline 2>&1 \
         | sed -E 's/[0-9a-f]{7,40}/HASH/g' ))"
 
+  # `mvx-git adopt` — what it ASKS about the open form (mv_git#124).
+  #
+  # Three rules, one engine decision shared with udt-git and uv-git, and the
+  # wording matters as much as the trigger:
+  #   open form, flag off  -> ask to ENABLE (the data is already portable; the
+  #                           flag is what is missing, and it does not travel
+  #                           with a clone).  Asking to "convert" something that
+  #                           already IS open reads as nonsense.
+  #   native to ANOTHER MV -> ask to CONVERT; it is being converted either way.
+  #   native to THIS MV    -> say nothing; there is nothing to convert.
+  #
+  # Untested until now on MVX: the logic lived in the U2 CLIs and in one
+  # person's hand-checking, which is how `mvx-git adopt` came to print "account
+  # rebuild failed" and exit 0.
+  MGASK="$TESTROOT/mgask"
+  mgask() { # <dir> <descriptor-name>
+    rm -rf "$MGASK/$1"; mkdir -p "$MGASK/$1/CUST"
+    printf 'x
+' > "$MGASK/$1/CUST/C1"
+    printf '# descriptor
+name = t
+version = 1
+' > "$MGASK/$1/$2"
+    ( cd "$MGASK/$1" && git init -q . && git add -A >/dev/null 2>&1 &&       git -c user.email=t@t -c user.name=t commit -qm x >/dev/null 2>&1 )
+  }
+  mgask open .mv-account ; mgask foreign .udt ; mgask own .mvx
+  # The adopt itself may fail here (mvx-git-adopt need not be on PATH in a bare
+  # test tree); what is asserted is the QUESTION, decided before anything is built.
+  mgasked() {
+    out=$( cd "$MGASK/$1" && MVXGIT_OPEN_ACCOUNT=0 MVXCONVERT="$CONV" \
+             "$ROOT/build/bin/mvx-git" adopt 2>&1 || true )
+    case "$out" in
+      *"already in the open account format"*) echo "$1: asks to enable" ;;
+      *"will be converted to an MVX one"*)    echo "$1: asks to convert" ;;
+      *)                                       echo "$1: asks nothing" ;;
+    esac
+  }
+  check tcl-mvxgit-adopt-asks "$(mgasked open; mgasked foreign; mgasked own)"
+
   # open account format, commit side (mvx#73): with mvx.openaccount set, `add`
   # normalises the staged git objects to the open form - %FILE% becomes DIR/hash,
   # .mvx is stored at .mv-account, and the binary lmdb store is never tracked -
