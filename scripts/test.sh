@@ -2440,11 +2440,14 @@ SQDDEOF
   fi
   # Native has no record to project from -- the columns ARE the record -- so
   # there it takes one mapping per attribute, and the switch is refused.
+  # ...and refusing is only half an answer, so it names the one to keep: the
+  # identity field, which rebuilds the attribute exactly where MD2 cannot.
   nm="$("$TCL" -a "$SQA" -c 'MAP-MODE DUP native' 2>&1)"
   case "$nm" in
-    *"both map attribute 2"*"still mirror"*|*"both map attribute 2"*)
-      PASS=$((PASS+1)); echo "  native refuses a second mapping of one attribute" ;;
-    *) FAIL=$((FAIL+1)); echo "FAIL sqlite native accepted a duplicate: $nm" ;;
+    *"attribute 2 is mapped by"*"for native keep PRICE.RAW"*"still mirror"*)
+      PASS=$((PASS+1))
+      echo "  native refuses a second mapping, naming the one to keep" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite native duplicate advice: $nm" ;;
   esac
 
   # Which is what makes the read-back rank the fields rather than take the
