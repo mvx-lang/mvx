@@ -204,6 +204,26 @@ static int exec_sql(sqlite3 *db, const char *sql) {
     return rc == SQLITE_OK;
 }
 
+/* Atomicity for an operation the DRIVER owns end to end.
+ *
+ * map_child_apply is a DELETE followed by one INSERT per row: interrupted
+ * halfway it leaves an association with some of its values and not the rest,
+ * which is worse than either extreme because nothing reports it.  These wrap
+ * such a sequence.
+ *
+ * begin() returns whether it actually started a transaction -- inside a
+ * backfill one is already open, and then the outer one carries the atomicity
+ * and only its owner may commit.  end() rolls back on failure, which is the
+ * part a plain commit-or-nothing cannot express. */
+static int txn_begin(sqlite3 *db) {
+    if (!sqlite3_get_autocommit(db)) return 0;   /* already inside one */
+    return exec_sql(db, "BEGIN") ? 1 : 0;
+}
+static void txn_end(sqlite3 *db, int started, int ok) {
+    if (!started) return;
+    exec_sql(db, ok ? "COMMIT" : "ROLLBACK");
+}
+
 /* Collect an id column into a cursor.  Every push-down below ends here,
    so they all share one snapshot-then-stream shape. */
 static mvx_cursor *cursor_from(sqlite3_stmt *st) {
@@ -408,12 +428,35 @@ static int sq_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     return 1;
 }
 
-/* Bulk-write bracketing: one commit per batch during a backfill. */
+/* Transaction bracketing, for a backfill batch AND for one logical write.
+ *
+ * NESTING IS THE WHOLE DIFFICULTY.  A mapped WRITE touches the record, the
+ * parent columns and a child table per association -- several statements that
+ * must land together or not at all -- so the runtime brackets them.  But a
+ * BACKFILL already holds a transaction open around thousands of such writes,
+ * and SQLite refuses "cannot start a transaction within a transaction".
+ *
+ * sqlite3_get_autocommit() answers exactly the question: it is true when NO
+ * transaction is open.  So an inner bracket becomes a no-op and the outer one
+ * provides the atomicity, which is what nesting should mean.  begin() reports
+ * whether it actually started one, and only that caller commits. */
 static int sq_bulk_begin(mvx_file *fh) {
-    return exec_sql(((sq_file *)fh)->db, "BEGIN");
+    sqlite3 *db = ((sq_file *)fh)->db;
+    if (!sqlite3_get_autocommit(db)) return 0;   /* already inside one */
+    return exec_sql(db, "BEGIN") ? 1 : 0;
 }
+/* Discard everything since bulk_begin.  The runtime calls this when a mapped
+   write fails part way, rather than committing a record whose projection does
+   not match it. */
+static int sq_rollback(mvx_file *fh) {
+    sqlite3 *db = ((sq_file *)fh)->db;
+    if (sqlite3_get_autocommit(db)) return 1;    /* nothing open */
+    return exec_sql(db, "ROLLBACK");
+}
+
 static int sq_bulk_commit(mvx_file *fh) {
     sqlite3 *db = ((sq_file *)fh)->db;
+    if (sqlite3_get_autocommit(db)) return 1;    /* nothing open: nothing to do */
     if (exec_sql(db, "COMMIT")) return 1;
     exec_sql(db, "ROLLBACK");                 /* a failed batch rolls back */
     return 0;
@@ -540,15 +583,20 @@ static int sq_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     char nm[512], qn[600];
     child_name(f, assoc, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
+    /* The DELETE and the INSERTs are one replacement, not a sequence. */
+    int started = txn_begin(f->db);
 
     char dsql[700];
     snprintf(dsql, sizeof dsql, "DELETE FROM %s WHERE id = ?1", qn);
     sqlite3_stmt *ds = NULL;
-    if (sqlite3_prepare_v2(f->db, dsql, -1, &ds, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(f->db, dsql, -1, &ds, NULL) != SQLITE_OK) {
+        txn_end(f->db, started, 0);
+        return 0;
+    }
     sqlite3_bind_blob(ds, 1, id, (int)idlen, SQLITE_STATIC);
     sqlite3_step(ds);
     sqlite3_finalize(ds);
-    if (nrows < 1) return 1;
+    if (nrows < 1) { txn_end(f->db, started, 1); return 1; }
 
     char sql[8192];
     size_t p = (size_t)snprintf(sql, sizeof sql, "INSERT INTO %s (id, seq", qn);
@@ -556,7 +604,7 @@ static int sq_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         char qc[300];
         quote_ident(cols[c].name, qc, sizeof qc);
         p += (size_t)snprintf(sql + p, sizeof sql - p, ", %s", qc);
-        if (p >= sizeof sql) return 0;
+        if (p >= sizeof sql) { txn_end(f->db, started, 0); return 0; }
     }
     p += (size_t)snprintf(sql + p, sizeof sql - p, ") VALUES (?1, ?2");
     for (int c = 0; c < ncols; c++)
@@ -564,7 +612,10 @@ static int sq_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     snprintf(sql + p, sizeof sql - p, ")");
 
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(f->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(f->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        txn_end(f->db, started, 0);
+        return 0;
+    }
     int ok = 1;
     for (int r = 0; r < nrows && ok; r++) {
         sqlite3_reset(st);
@@ -579,6 +630,7 @@ static int sq_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         ok = sqlite3_step(st) == SQLITE_DONE;
     }
     sqlite3_finalize(st);
+    txn_end(f->db, started, ok);
     return ok;
 }
 
@@ -1095,6 +1147,7 @@ static const mvx_driver mvx_driver_sqlite = {
                                              SQL is a job of its own; the verb
                                              sorts the reference itself, which
                                              is correct and only slower */
+    sq_rollback,                          /* abort a failed logical write */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

@@ -1127,6 +1127,19 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
         mv_init(&old);
         had_old = b->driver->read(f, ip, idlen, &old);
     }
+    /* ONE LOGICAL WRITE, ONE TRANSACTION.  With a mapping this is not one
+       statement but several across several tables: the record, then the parent
+       columns, then a DELETE + N INSERTs for every association that changed.
+       Half of that is worse than none of it -- the record and its projection
+       disagree, and nothing afterwards can tell, because each part succeeded.
+       So the whole sequence is bracketed and rolled back as a unit.
+       bulk_begin returns 0 when a transaction is ALREADY open (a backfill
+       batch around this write); then the outer one owns the atomicity and
+       this bracket must neither commit nor roll back. */
+    int txn = 0;
+    if (o && o->map.nf > 0 && b->driver->bulk_begin && b->driver->bulk_commit)
+        txn = b->driver->bulk_begin(f);
+
     if (o && o->ix.n > 0 && b->driver->write_ix) {
         mvx_ixop ops[IX_MAX_ITEMS * IX_MAX_VALS * 2];
         static ixvals pool[IX_MAX_ITEMS * 2];
@@ -1136,6 +1149,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
         ok = b->driver->write(f, ip, idlen, rec);
     }
     if (!ok) {
+        if (txn && b->driver->rollback) b->driver->rollback(f);
         if (need_old) mv_clear(&old);
         if (onerr) return -2;
         mvx_fatal("WRITE failed on %s id %.*s", b->spec, (int)idlen, ip);
@@ -1144,9 +1158,19 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
        diff against the prior record and write only the columns/child rows
        that changed; a new record projects in full.  Native mode already
        validated above; mirror mode is best-effort (mismatch -> NULL). */
+    int mok = 1;
     if (o && o->map.nf > 0)
-        map_project(ctx, f, &o->map, ip, idlen, rec, had_old ? &old : NULL);
+        mok = map_project(ctx, f, &o->map, ip, idlen, rec,
+                          had_old ? &old : NULL);
+    if (txn) {
+        /* The record went in; if its projection did not, take the record back
+           out with it rather than leave the two disagreeing. */
+        if (mok) b->driver->bulk_commit(f);
+        else if (b->driver->rollback) b->driver->rollback(f);
+        else b->driver->bulk_commit(f);   /* no rollback offered: best effort */
+    }
     if (need_old) mv_clear(&old);
+    if (!mok && onerr) return -2;
     if (!keep_lock) {                   /* WRITE releases; WRITEU keeps */
         char *key = lock_key(f, ip, idlen);
         lock_drop(st, key);
@@ -1764,8 +1788,11 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
     if (progress) clock_gettime(CLOCK_MONOTONIC, &t0);
     /* Batch the per-record writes in one transaction, committing every 10k rows,
        so a large backfill pays a handful of commits instead of one per record. */
-    int bulk = b->driver->bulk_begin && b->driver->bulk_commit;
-    if (bulk) b->driver->bulk_begin(f);
+    /* Own the batch only if we actually STARTED it: bulk_begin returns 0 when
+       a transaction was already open, and committing one we did not open would
+       end somebody else's. */
+    int bulk = b->driver->bulk_begin && b->driver->bulk_commit
+               && b->driver->bulk_begin(f);
     int64_t count = 0, rc = 0;
     mv_value rid, rec;
     mv_init(&rid); mv_init(&rec);
@@ -1778,7 +1805,7 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
         count++;
         if (bulk && count % 10000 == 0) {
             b->driver->bulk_commit(f);
-            b->driver->bulk_begin(f);
+            bulk = b->driver->bulk_begin(f);   /* re-arm, honouring the return */
         }
         if (progress && count % 1000 == 0) mapbuild_progress(count, total, &t0);
     }
