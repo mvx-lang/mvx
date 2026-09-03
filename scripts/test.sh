@@ -2410,6 +2410,98 @@ SQW2EOF
   # A transaction left open would keep the write invisible to a second
   # connection; the sqlite3 CLI above IS a second connection, so the counts
   # having been readable at all is the evidence that it committed.
+
+  # TWO FIELDS ON ONE ATTRIBUTE (#158).  Two dictionary items may name the same
+  # attribute -- PRICE with MD2 and PRICE.RAW with no conversion are one stored
+  # value read two ways.  Mirroring both is the point of mirror mode: every
+  # column is a projection of the record, so a secondary version of a field
+  # costs a column and needs no cast to query it.  CREATE-MAP must allow it.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DUP' >/dev/null 2>&1
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DICT DUP' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdupd.b" <<'SQDDEOF'
+OPEN "DICT", "DUP" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"10L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"MD2":@AM:"Price":@AM:"8R" ON D, "PRICE"
+WRITE "D":@AM:"2":@AM:"":@AM:"PriceRaw":@AM:"8R" ON D, "PriceRaw"
+OPEN "DUP" TO F ELSE STOP
+WRITE "widget":@AM:990 ON F, "D1"
+SQDDEOF
+  sed -i.bak 's/"PriceRaw"$/"PRICE.RAW"/' "$TESTROOT/sqdupd.b" && rm -f "$TESTROOT/sqdupd.b.bak"
+  "$MVX" "$TESTROOT/sqdupd.b" -o "$TESTROOT/sqdupd" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdupd" >/dev/null 2>&1)
+  dm="$("$TCL" -a "$SQA" -c 'CREATE-MAP DUP NAME PRICE PRICE.RAW' 2>&1)"
+  cols="$(sqlite3 "$SQA/acct.sqlite" \
+    "SELECT COUNT(*) FROM pragma_table_info('DUP') \
+     WHERE name IN ('PRICE','PRICE.RAW');" 2>/dev/null)"
+  if [ "$cols" = 2 ]; then
+    PASS=$((PASS+1)); echo "  a second field on one attribute projects its own column"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL sqlite second field not projected: cols='$cols' ($dm)"
+  fi
+  # Native has no record to project from -- the columns ARE the record -- so
+  # there it takes one mapping per attribute, and the switch is refused.
+  # ...and refusing is only half an answer, so it names the one to keep: the
+  # identity field, which rebuilds the attribute exactly where MD2 cannot.
+  nm="$("$TCL" -a "$SQA" -c 'MAP-MODE DUP native' 2>&1)"
+  case "$nm" in
+    *"attribute 2 is mapped by"*"for native keep PRICE.RAW"*"still mirror"*)
+      PASS=$((PASS+1))
+      echo "  native refuses a second mapping, naming the one to keep" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite native duplicate advice: $nm" ;;
+  esac
+
+  # Which is what makes the read-back rank the fields rather than take the
+  # last: the identity field carries the stored value, MD2 has lost the raw
+  # digits.  Native mode reads from the columns, so both %MAP% orders must
+  # still answer with the identity column's 777 -- that determinism is what
+  # lets the SQL backends allow this at all.
+  dupok=1
+  for ord in A B; do
+    f="DUP$ord"
+    "$TCL" -a "$SQA" -c "CREATE-FILE $f" >/dev/null 2>&1
+    "$TCL" -a "$SQA" -c "CREATE-FILE DICT $f" >/dev/null 2>&1
+    cat > "$TESTROOT/sqdup.b" <<SQDEOF
+OPEN "DICT", "$f" TO D ELSE STOP
+P = "PRICE":@VM:2:@VM:"MD2":@VM:"NUMERIC":@VM:""
+R = "PRICE.RAW":@VM:2:@VM:"":@VM:"TEXT":@VM:""
+SPEC = "NAME":@VM:1:@VM:"":@VM:"TEXT":@VM:""
+IF "$ord" = "A" THEN
+   SPEC<2> = P
+   SPEC<3> = R
+END ELSE
+   SPEC<2> = R
+   SPEC<3> = P
+END
+WRITE SPEC ON D, "%MAP%"
+* a mapping that predates the check: native, with two fields on attribute 2
+WRITE "native" ON D, "%MAPMODE%"
+OPEN "$f" TO F ELSE STOP
+WRITE "widget":@AM:990 ON F, "D1"
+SQDEOF
+    "$MVX" "$TESTROOT/sqdup.b" -o "$TESTROOT/sqdup" || dupok=0
+    (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdup" >/dev/null 2>&1)
+    # an external writer changes both columns; id is a BLOB, so CAST or the
+    # UPDATE silently matches nothing and the test measures the old value
+    sqlite3 "$SQA/acct.sqlite" \
+      "UPDATE \"$f\" SET \"PRICE\"=55.55, \"PRICE.RAW\"='777' \
+       WHERE id=CAST('D1' AS BLOB);" 2>/dev/null
+    ch="$(sqlite3 "$SQA/acct.sqlite" \
+      "SELECT COUNT(*) FROM \"$f\" WHERE \"PRICE.RAW\"='777';" 2>/dev/null)"
+    cat > "$TESTROOT/sqdupr.b" <<SQREOF
+OPEN "$f" TO F ELSE STOP
+READ R FROM F, "D1" THEN PRINT R<2>
+SQREOF
+    "$MVX" "$TESTROOT/sqdupr.b" -o "$TESTROOT/sqdupr" || dupok=0
+    got="$(cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdupr" 2>/dev/null)"
+    if [ "$ch" != 1 ] || [ "$got" != 777 ]; then
+      dupok=0; echo "FAIL sqlite duplicate read-back order $ord: updated='$ch' got='$got' want 777"
+    fi
+  done
+  if [ "$dupok" = 1 ]; then
+    PASS=$((PASS+1)); echo "  read-back takes the identity column whatever the map order"
+  else
+    FAIL=$((FAIL+1))
+  fi
 else
   echo "  (sqlite test skipped — driver not built)"
 fi
