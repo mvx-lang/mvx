@@ -46,6 +46,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build gcc g++ liblmdb-dev libedit-dev \
             libgit2-dev libpq-dev postgresql-client libmongoc-dev pkg-config \
+            libmariadb-dev \
             zlib1g-dev libzstd-dev libncurses-dev \
             wget lsb-release software-properties-common gnupg ca-certificates
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh

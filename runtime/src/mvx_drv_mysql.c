@@ -12,8 +12,13 @@
 
 /* MySQL / MariaDB storage driver.
  *
- * Built against the MariaDB Connector/C, which speaks the MySQL wire
- * protocol, so one driver serves both servers.
+ * Built against the MariaDB Connector/C -- DELIBERATELY, and not against
+ * libmysqlclient.  Connector/C speaks the MySQL wire protocol, so this one
+ * driver talks to MySQL and MariaDB servers alike; what narrows is only the
+ * BUILD dependency, and that buys a single set of types.  MySQL 8.0 dropped
+ * my_bool, which MYSQL_BIND still uses on MariaDB, so supporting both client
+ * libraries means a conditional typedef and two untested-against-each-other
+ * build paths.  One connector, one path.
  *
  * Shape: postgres's (a pooled server connection per location, a table per
  * MV file) with sqlite's push-downs.  What differs is the dialect, and
@@ -36,6 +41,7 @@
 
 #include <mysql.h>
 #include <stdio.h>
+
 #include <stdlib.h>
 #include <string.h>
 

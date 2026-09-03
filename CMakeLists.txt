@@ -162,27 +162,44 @@ if(NOT MVX_WITH_SQLITE STREQUAL "OFF")
   endif()
 endif()
 
-# mysql/mariadb driver — one driver for both servers: built against the MariaDB
-# Connector/C, which speaks the MySQL wire protocol.  Unlike postgres it needs no
-# CREATE FUNCTION privilege (attribute extraction is a plain expression), so it
-# works on a hosted database account.
+# mysql/mariadb driver — built against the MariaDB Connector/C, which speaks the
+# MySQL wire protocol, so it serves BOTH servers at run time.  It is found
+# specifically, never libmysqlclient: MySQL 8 dropped my_bool (still used by
+# MYSQL_BIND on MariaDB), so accepting either client library means a conditional
+# typedef and two build paths that are never tested against each other.  On a
+# GitHub runner MySQL's headers are present by default, so a loose search finds
+# THOSE -- which is how that break was discovered rather than designed around.
+#
+# Debian/Ubuntu: libmariadb-dev.  Homebrew: mariadb-connector-c.
 set(MVX_MYSQL_ENABLED OFF)
 if(NOT MVX_WITH_MYSQL STREQUAL "OFF")
-  find_path(MARIADB_INCLUDE_DIR mysql.h
-            HINTS /opt/homebrew/opt/mariadb-connector-c/include/mariadb
-                  /usr/local/opt/mariadb-connector-c/include/mariadb
-                  /usr/include/mariadb /usr/include/mysql)
-  find_library(MARIADB_LIBRARY NAMES mariadb mysqlclient
-               HINTS /opt/homebrew/opt/mariadb-connector-c/lib
-                     /usr/local/opt/mariadb-connector-c/lib)
-  if(MARIADB_INCLUDE_DIR AND MARIADB_LIBRARY)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(MARIADB QUIET IMPORTED_TARGET libmariadb)
+  endif()
+  if(NOT MARIADB_FOUND)
+    find_path(MARIADB_INCLUDE_DIR mysql.h
+              HINTS /opt/homebrew/opt/mariadb-connector-c/include/mariadb
+                    /usr/local/opt/mariadb-connector-c/include/mariadb
+                    /usr/include/mariadb
+              NO_DEFAULT_PATH)
+    find_library(MARIADB_LIBRARY NAMES mariadb
+                 HINTS /opt/homebrew/opt/mariadb-connector-c/lib
+                       /usr/local/opt/mariadb-connector-c/lib)
+  endif()
+  if(MARIADB_FOUND)
+    set(MVX_MYSQL_ENABLED ON)
+    message(STATUS "Building mysql driver against MariaDB Connector/C (pkg-config)")
+    mvx_driver(mysql runtime/src/mvx_drv_mysql.c)
+    target_link_libraries(mvxdrv_mysql PRIVATE PkgConfig::MARIADB)
+  elseif(MARIADB_INCLUDE_DIR AND MARIADB_LIBRARY)
     set(MVX_MYSQL_ENABLED ON)
     message(STATUS "Building mysql driver against ${MARIADB_LIBRARY}")
     mvx_driver(mysql runtime/src/mvx_drv_mysql.c)
     target_include_directories(mvxdrv_mysql PRIVATE ${MARIADB_INCLUDE_DIR})
     target_link_libraries(mvxdrv_mysql PRIVATE ${MARIADB_LIBRARY})
   else()
-    message(STATUS "mysql driver: no client library found, skipping")
+    message(STATUS "mysql driver: MariaDB Connector/C not found, skipping")
   endif()
 endif()
 
