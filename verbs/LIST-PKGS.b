@@ -46,7 +46,14 @@ FOR LI = 1 TO NP
    END
    SYSTXT = ""
    IF PSYS # "" THEN SYSTXT = " [":PSYS:"]"
-   PRINT FMT(PNAME:"@":PVER, "L#14"):" ":FMT(STATE, "L#6"):" ":FMT(CUR, "L#46"):" ":DEPTXT:SYSTXT
+   * Pad the path column rather than FMT it: "L#46" cuts anything longer, and
+   * a path is the one column where a silent truncation is useless -- a deep
+   * checkout printed a prefix that named no directory you could cd to.  Pad
+   * to the same width so short paths line up exactly as before, and let a
+   * long one run past the column with its single separating space.
+   PAD = 47 - LEN(CUR)
+   IF PAD < 1 THEN PAD = 1
+   PRINT FMT(PNAME:"@":PVER, "L#14"):" ":FMT(STATE, "L#6"):" ":CUR:SPACE(PAD):DEPTXT:SYSTXT
 NEXT LI
 PRINT NP:" package(s) linked"
 STOP
