@@ -296,6 +296,48 @@ check tcl-query "$(printf '%s\n' \
   'LIST DICT PARTS' \
   'CT DICT PARTS PRICE' | tclrun)"
 
+# PHRASES (mvx#164).  A PH item is not a column: its attribute 2 is a list of
+# column NAMES, and resolving one as a D item read that list as an attribute
+# number and stopped the runtime.  Named, a phrase now expands to the columns
+# it stands for; named nothing, the file's own %PH% applies -- the furniture
+# record beside %FILE%, hidden from a DICT listing by the same leading-% rule.
+cat > "$TESTROOT/ph.b" <<'PHEOF'
+OPEN "DICT", "PARTS" TO D ELSE STOP
+WRITE "PH":@AM:"NAME PRICE" ON D, "SHORT"
+WRITE "PH":@AM:"NAME COLOR PRICE" ON D, "%PH%"
+PHEOF
+"$MVX" "$TESTROOT/ph.b" -o "$TESTROOT/phbin" 2>/dev/null
+(cd "$ACCT" && MVXACCOUNT=. "$TESTROOT/phbin")
+phn="$("$TCL" -a "$ACCT" -c 'LIST PARTS SHORT' 2>&1)"
+case "$phn" in
+  *Name*Price*) PASS=$((PASS+1)); echo "  a named phrase expands to its columns" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL phrase not expanded: $phn" ;;
+esac
+# and it must not have become a column in its own right
+case "$phn" in
+  *SHORT*) FAIL=$((FAIL+1)); echo "FAIL the phrase name leaked as a column: $phn" ;;
+  *) PASS=$((PASS+1)); echo "  the phrase itself is not a column" ;;
+esac
+phd="$("$TCL" -a "$ACCT" -c 'LIST PARTS' 2>&1)"
+case "$phd" in
+  *Name*Colour*Price*) PASS=$((PASS+1)); echo "  %PH% supplies the default columns" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL %PH% default not applied: $phd" ;;
+esac
+# A file with no %PH% keeps the old behaviour -- id only.  Without this the
+# default could be coming from anywhere.
+"$TCL" -a "$ACCT" -c 'CREATE-FILE NOPH' >/dev/null 2>&1
+nph="$("$TCL" -a "$ACCT" -c 'LIST NOPH' 2>&1)"
+case "$nph" in
+  *Name*|*Colour*) FAIL=$((FAIL+1)); echo "FAIL a file without %PH% got columns: $nph" ;;
+  *) PASS=$((PASS+1)); echo "  a file with no %PH% still lists the id alone" ;;
+esac
+# SORT shares the resolution, and had the same gap
+sph="$("$TCL" -a "$ACCT" -c 'SORT PARTS SHORT' 2>&1)"
+case "$sph" in
+  *Name*Price*) PASS=$((PASS+1)); echo "  SORT expands phrases too" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL SORT did not expand the phrase: $sph" ;;
+esac
+
 # SORT (LIST sorted by id by default, or BY key) and SSELECT (a sorted
 # select list feeding the next command)
 check tcl-sort "$(printf '%s\n' \

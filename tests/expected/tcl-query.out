@@ -10,10 +10,10 @@ W100         Widget
 2 record(s) selected
 2 record(s) counted
 3 record(s) counted
-@ID         
-COLOR       
-NAME        
-PRICE       
+@ID          Type Attr     Conv  Heading          Format S/M Assoc       
+COLOR        D    3              Colour           8L                     
+NAME         D    1              Name             12L                    
+PRICE        D    2        MD2$  Price            10R                    
 3 record(s) listed
 PRICE
 001 D
