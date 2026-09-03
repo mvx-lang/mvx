@@ -89,6 +89,50 @@ FOR K = 1 TO NW
    END
 NEXT K
 
+* ---- expand phrases -----------------------------------------------------
+* A PH item is not a column.  Its attribute 2 is a LIST OF COLUMN NAMES, not
+* an attribute number, so resolving one as a D item reads the member list as
+* a number and the runtime stops with "non-numeric value ... used in numeric
+* context".  Expand it into the columns it stands for instead.
+*
+* With nothing named at all, the file's own default list applies: %PH% in the
+* dictionary, beside %FILE% and %MAP%, and hidden from a DICT listing by the
+* same leading-% rule.  That is the open-account spelling of the default
+* column list other MV systems keep as `@` (mvx#164).
+*
+* One level, deliberately: a phrase naming another phrase is a loop waiting
+* to happen, and no MV system this has to agree with resolves them either.
+* Name it rather than splitting it here: %PH% is itself a PH item, so the
+* expansion below turns it into its members and there is one splitter.
+IF COLS = "" AND DOPEN THEN
+   READ PHD FROM DC, "%PH%" THEN
+      IF PHD<1>[1, 1] = "P" THEN COLS = "%PH%"
+   END
+END
+IF DOPEN THEN
+   NEWC = ""
+   PN = DCOUNT(COLS, @AM)
+   FOR P = 1 TO PN
+      PNM = COLS<P>
+      PEX = 0
+      IF PNM # "@ID" THEN
+         READ PD FROM DC, PNM THEN
+            IF PD<1>[1, 1] = "P" THEN
+               PML = TRIM(PD<2>)
+               PMN = DCOUNT(PML, " ")
+               FOR PM = 1 TO PMN
+                  PMM = FIELD(PML, " ", PM)
+                  IF PMM # "" THEN NEWC<-1> = PMM
+               NEXT PM
+               PEX = 1
+            END
+         END
+      END
+      IF PEX = 0 THEN NEWC<-1> = PNM
+   NEXT P
+   COLS = NEWC
+END
+
 * ---- resolve dictionary items ------------------------------------------
 * Column layout: parallel dynamic arrays; slot 0 conventions: attr no 0
 * means the record id itself.
@@ -153,6 +197,30 @@ IF BAD # "" THEN
    PRINT BAD:" is not a dictionary item in ":FN
    STOP
 END
+
+* ---- a dictionary listing describes its items ----------------------------
+* A DICT listing has no dictionary of its own to resolve columns from, so
+* with nothing named it showed @ID and nothing else -- the one listing where
+* what you want IS the record.  Describe the D-item shape instead, which is
+* what UniData gives you by shipping the phrase in its dict-of-dicts.
+*
+* Set here rather than through COLS because there is nothing to look these
+* up in: the attribute numbers ARE the definition.  S/M before the
+* association, so the pair reads the way it does on the other systems.
+IF DICTF AND CN = 0 THEN
+   CN = 7
+   ANOS   = 1:@AM:2:@AM:3:@AM:4:@AM:5:@AM:7:@AM:6
+   ISPECS = "":@AM:"":@AM:"":@AM:"":@AM:"":@AM:"":@AM:""
+   CONVS  = "":@AM:"":@AM:"":@AM:"":@AM:"":@AM:"":@AM:""
+   ASSOCS = "":@AM:"":@AM:"":@AM:"":@AM:"":@AM:"":@AM:""
+   HEADS  = "Type":@AM:"Attr":@AM:"Conv":@AM:"Heading":@AM:"Format":@AM:"S/M":@AM:"Assoc"
+   * Attr is LEFT-justified though it usually holds a number: attribute 2 of
+   * an I item is its expression and of a PH item its member list, and
+   * right-justifying those shows the last few characters -- "RICE" out of
+   * EPRICE -- where the first few at least say what it is.
+   MASKS  = "L#4":@AM:"L#8":@AM:"L#5":@AM:"L#16":@AM:"L#6":@AM:"L#3":@AM:"L#12"
+END
+
 
 * WITH item resolution — one attribute (or I-descriptor) per condition
 WANOS = ""
