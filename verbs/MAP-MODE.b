@@ -39,6 +39,33 @@ CASE MODE = "mirror"
    WRITE "mirror" ON DD, "%MAPMODE%"
    PRINT FN:" mapping mode: mirror"
 CASE MODE = "native"
+   * ONE COLUMN PER ATTRIBUTE.  Two dictionary items may name the same
+   * attribute: PRICE with MD2 and PRICE.RAW with no conversion are one stored
+   * value read two ways.  Mirroring both is the point of mirror mode, where
+   * every column is a projection of the record, so a secondary version of a
+   * field costs an extra column and needs no cast to query it.
+   *
+   * Native has no record to project from -- the columns ARE the record -- so
+   * two of them on one attribute leaves nothing to say which one reconstructs
+   * it, and the answer came down to the order %MAP% happened to list them in
+   * (mvx#158).  So native takes one mapping per attribute, on every backend.
+   DUP = ""
+   NS = DCOUNT(SPEC, @AM)
+   FOR I = 1 TO NS
+      FOR J = I + 1 TO NS
+         IF SPEC<J, 2> = SPEC<I, 2> THEN
+            IF DUP = "" THEN
+               DUP = SPEC<I, 1>:" and ":SPEC<J, 1>
+               DUP = DUP:" both map attribute ":SPEC<I, 2>
+            END
+         END
+      NEXT J
+   NEXT I
+   IF DUP # "" THEN
+      PRINT DUP
+      PRINT "native takes one mapping per attribute; still mirror"
+      STOP
+   END
    OPEN FN TO F ELSE
       PRINT "cannot open ":FN
       STOP
