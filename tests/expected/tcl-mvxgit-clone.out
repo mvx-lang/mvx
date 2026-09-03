@@ -2,6 +2,6 @@ descriptor: .mvx
 no .mv-account on disk
 records in backend, not on disk
 disk %FILE%: native
-PARTS                    directory
+PARTS                    dir
 ORDERS                   lmdb
 W1           Widget      
