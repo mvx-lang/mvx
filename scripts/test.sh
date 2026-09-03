@@ -2368,6 +2368,78 @@ else
   echo "  (sqlite test skipped — driver not built)"
 fi
 
+# mysql/mariadb backend — only when MVX_MYSQL names a reachable server, e.g.
+#   MVX_MYSQL='host=127.0.0.1 port=3306 user=root password=secret dbname=mvxtest'
+# Gated like postgres and mongo: it needs a server, unlike the embedded sqlite.
+if [ -n "${MVX_MYSQL:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 2>&1; then
+  echo "== mysql backend"
+  MYA="$TESTROOT/myacct"; mkdir -p "$MYA"
+  printf '# MVX account descriptor\nname=myacct\nversion=1\n' > "$MYA/.mvx"
+  printf '* mysql %s\n' "$MVX_MYSQL" > "$MYA/BINDINGS"
+  "$TCL" -a "$MYA" -c 'DELETE-FILE CUST' >/dev/null 2>&1
+  "$TCL" -a "$MYA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/myseed.b" <<'MYEOF'
+OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
+WRITE "Ada":@AM:"London":@AM:"42" ON F, "C1"
+WRITE "Grace":@AM:"York":@AM:"7" ON F, "C2"
+WRITE "Alan":@AM:"Cambridge":@AM:"115" ON F, "C3"
+WRITE "Solo" ON F, "C9"
+READ R FROM F, "C2" THEN
+   PRINT "rt=":R<1>:"/":R<3>
+END ELSE PRINT "rt=LOST"
+DELETE F, "C3"
+N = 0
+SELECT F
+D = 0
+LOOP UNTIL D DO
+   READNEXT ID ELSE D = 1
+   IF NOT(D) THEN N += 1
+REPEAT
+PRINT "n=":N
+MYEOF
+  "$MVX" "$TESTROOT/myseed.b" -o "$TESTROOT/myseed" >/dev/null 2>&1
+  myout="$(cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myseed" 2>&1)"
+  case "$myout" in
+    *"rt=Grace/7"*) PASS=$((PASS+1)); echo "  record round-trips byte-exact" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql round-trip: $myout" ;;
+  esac
+  case "$myout" in
+    *"n=3"*) PASS=$((PASS+1)); echo "  select sees the delete" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql select/delete: $myout" ;;
+  esac
+  lf="$("$TCL" -a "$MYA" -c 'LISTF' 2>&1)"
+  case "$lf" in
+    *"CUST"*"mysql"*) PASS=$((PASS+1)); echo "  LISTF enumerates via the driver" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql LISTF: $lf" ;;
+  esac
+  "$TCL" -a "$MYA" -c 'CREATE-FILE DICT CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/mydict.b" <<'MYDEOF'
+OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"6R":@AM:"S" ON D, "QTY"
+MYDEOF
+  "$MVX" "$TESTROOT/mydict.b" -o "$TESTROOT/mydict" >/dev/null 2>&1
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/mydict" >/dev/null 2>&1)
+  cnt="$("$TCL" -a "$MYA" -c 'COUNT CUST WITH CITY = "London"' 2>&1)"
+  case "$cnt" in
+    *"1 record"*) PASS=$((PASS+1)); echo "  filtered COUNT is correct" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql COUNT: $cnt" ;;
+  esac
+  cnt2="$("$TCL" -a "$MYA" -c 'COUNT CUST WITH QTY = ""' 2>&1)"
+  case "$cnt2" in
+    *"1 record"*) PASS=$((PASS+1)); echo "  attribute past the end reads as empty" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql short-record attr: $cnt2" ;;
+  esac
+  desc="$("$TCL" -a "$MYA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
+  case "$desc" in
+    *"SELECT id FROM"*"SUBSTRING_INDEX"*) PASS=$((PASS+1))
+      echo "  WITH is pushed into SQL, not scanned in the verb" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql push-down plan: $desc" ;;
+  esac
+else
+  echo "  (mysql test skipped — set MVX_MYSQL to run)"
+fi
+
 # mongo backend — only when MVX_MONGO names a reachable MongoDB, e.g.
 #   MVX_MONGO='address=localhost:27017 namespace=mvxtest'
 if [ -n "${MVX_MONGO:-}" ]; then

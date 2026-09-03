@@ -42,6 +42,9 @@ set_property(CACHE MVX_WITH_MONGO PROPERTY STRINGS AUTO ON OFF)
 set(MVX_WITH_SQLITE "${_mvx_pg_default}" CACHE STRING
   "SQLite driver: AUTO (build if sqlite3 present), ON (require it), OFF")
 set_property(CACHE MVX_WITH_SQLITE PROPERTY STRINGS AUTO ON OFF)
+set(MVX_WITH_MYSQL "${_mvx_pg_default}" CACHE STRING
+  "MySQL/MariaDB driver: AUTO (build if a client library is present), ON, OFF")
+set_property(CACHE MVX_WITH_MYSQL PROPERTY STRINGS AUTO ON OFF)
 option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
   ${_mvx_daemon_default})
 # Packages built into the system account at build time (#54): always available
@@ -156,6 +159,30 @@ if(NOT MVX_WITH_SQLITE STREQUAL "OFF")
     target_link_libraries(mvxdrv_sqlite PRIVATE ${SQLITE3_LIBRARY})
   else()
     message(STATUS "sqlite driver: sqlite3 not found, skipping")
+  endif()
+endif()
+
+# mysql/mariadb driver — one driver for both servers: built against the MariaDB
+# Connector/C, which speaks the MySQL wire protocol.  Unlike postgres it needs no
+# CREATE FUNCTION privilege (attribute extraction is a plain expression), so it
+# works on a hosted database account.
+set(MVX_MYSQL_ENABLED OFF)
+if(NOT MVX_WITH_MYSQL STREQUAL "OFF")
+  find_path(MARIADB_INCLUDE_DIR mysql.h
+            HINTS /opt/homebrew/opt/mariadb-connector-c/include/mariadb
+                  /usr/local/opt/mariadb-connector-c/include/mariadb
+                  /usr/include/mariadb /usr/include/mysql)
+  find_library(MARIADB_LIBRARY NAMES mariadb mysqlclient
+               HINTS /opt/homebrew/opt/mariadb-connector-c/lib
+                     /usr/local/opt/mariadb-connector-c/lib)
+  if(MARIADB_INCLUDE_DIR AND MARIADB_LIBRARY)
+    set(MVX_MYSQL_ENABLED ON)
+    message(STATUS "Building mysql driver against ${MARIADB_LIBRARY}")
+    mvx_driver(mysql runtime/src/mvx_drv_mysql.c)
+    target_include_directories(mvxdrv_mysql PRIVATE ${MARIADB_INCLUDE_DIR})
+    target_link_libraries(mvxdrv_mysql PRIVATE ${MARIADB_LIBRARY})
+  else()
+    message(STATUS "mysql driver: no client library found, skipping")
   endif()
 endif()
 
@@ -323,6 +350,9 @@ if(MVX_MONGO_ENABLED)
 endif()
 if(MVX_SQLITE_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxdrv_sqlite)
+endif()
+if(MVX_MYSQL_ENABLED)
+  list(APPEND MVX_INSTALL_DRIVERS mvxdrv_mysql)
 endif()
 install(TARGETS ${MVX_INSTALL_DRIVERS} LIBRARY DESTINATION lib)
 install(FILES ${CMAKE_BINARY_DIR}/lib/mvx_crt.o DESTINATION lib)
