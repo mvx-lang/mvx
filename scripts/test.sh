@@ -2364,6 +2364,52 @@ SQDEOF
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL sqlite push-down plan: $desc" ;;
   esac
+  # MAPPING WITH AN ASSOCIATION -- the multi-table write.  A record's parent
+  # columns go in the base table and each association's values become rows in a
+  # child table, replaced wholesale on every write (DELETE + N INSERTs).  That
+  # sequence is bracketed in a transaction, because half of it applied is worse
+  # than none: the record and its projection disagree and nothing afterwards can
+  # tell.  This exercises the path; the rewrite-with-fewer-values case is the one
+  # that catches a DELETE that did not happen.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DICT ORD' >/dev/null 2>&1
+  cat > "$TESTROOT/sqmapd.b" <<'SQMEOF'
+OPEN "DICT", "ORD" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Cust":@AM:"10L" ON D, "CUST"
+* attribute 6 IS the association name -- any non-empty value makes a child table
+WRITE "D":@AM:"2":@AM:"":@AM:"Qty":@AM:"6R":@AM:"LINES" ON D, "QTY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Price":@AM:"8R":@AM:"LINES" ON D, "PRICE"
+SQMEOF
+  "$MVX" "$TESTROOT/sqmapd.b" -o "$TESTROOT/sqmapd" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqmapd" >/dev/null 2>&1)
+  "$TCL" -a "$SQA" -c 'CREATE-MAP ORD CUST QTY PRICE' >/dev/null 2>&1
+  cat > "$TESTROOT/sqmapw.b" <<'SQWEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+WRITE "C1":@AM:"5":@VM:"6":@VM:"7":@AM:"10":@VM:"20":@VM:"30" ON F, "O1"
+SQWEOF
+  "$MVX" "$TESTROOT/sqmapw.b" -o "$TESTROOT/sqmapw" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqmapw" >/dev/null 2>&1)
+  n3="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD__LINES";' 2>/dev/null)"
+  case "$n3" in
+    3) PASS=$((PASS+1)); echo "  an association writes one child row per value" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite association rows: got '$n3', want 3" ;;
+  esac
+  cat > "$TESTROOT/sqmapw2.b" <<'SQW2EOF'
+OPEN "ORD" TO F ELSE STOP
+WRITE "C1":@AM:"9":@VM:"8":@AM:"90":@VM:"80" ON F, "O1"
+SQW2EOF
+  "$MVX" "$TESTROOT/sqmapw2.b" -o "$TESTROOT/sqmapw2" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqmapw2" >/dev/null 2>&1)
+  n2="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD__LINES";' 2>/dev/null)"
+  stale="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD__LINES" WHERE seq > 2;' 2>/dev/null)"
+  if [ "$n2" = 2 ] && [ "$stale" = 0 ]; then
+    PASS=$((PASS+1)); echo "  a shorter rewrite replaces the rows, leaving none stale"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL sqlite association replace: rows='$n2' stale='$stale'"
+  fi
+  # A transaction left open would keep the write invisible to a second
+  # connection; the sqlite3 CLI above IS a second connection, so the counts
+  # having been readable at all is the evidence that it committed.
 else
   echo "  (sqlite test skipped — driver not built)"
 fi

@@ -301,30 +301,55 @@ static int64_t pg_select_count(mvx_cursor *c) { return c ? c->n : 0; }
    stream in one transaction on the file's connection, so a million-row backfill
    pays a handful of commits, not a million.  A COMMIT of a transaction that has
    already errored performs a ROLLBACK, so the failure path is safe. */
+/* Atomicity for an operation the DRIVER owns end to end -- see the sqlite and
+   mysql drivers for the reasoning; pg_map_child_apply has the same DELETE +
+   N INSERT shape and the same half-applied failure. */
+static int txn_begin(PGconn *c) {
+    if (PQtransactionStatus(c) != PQTRANS_IDLE) return 0;
+    PGresult *r = PQexec(c, "BEGIN");
+    int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
+    if (r) PQclear(r);
+    return ok ? 1 : 0;
+}
+static void txn_end(PGconn *c, int started, int ok) {
+    if (!started) return;
+    PGresult *r = PQexec(c, ok ? "COMMIT" : "ROLLBACK");
+    if (r) PQclear(r);
+}
+
 static int pg_bulk_begin(mvx_file *fh) {
     pg_file *f = (pg_file *)fh;
+    /* Already inside one -- a mapped write bracketing itself during a backfill
+       -- so do nothing and let the outer transaction carry the atomicity.
+       postgres would only warn ("there is already a transaction in progress")
+       and carry on, which is worse: the inner COMMIT would then end the OUTER
+       transaction early and a backfill would lose its batching. */
+    if (PQtransactionStatus(f->conn) != PQTRANS_IDLE) return 0;
     PGresult *r = PQexec(f->conn, "BEGIN");
+    int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
+    if (r) PQclear(r);
+    return ok ? 1 : 0;
+}
+
+/* Discard everything since bulk_begin -- see the sqlite driver. */
+static int pg_rollback(mvx_file *fh) {
+    pg_file *f = (pg_file *)fh;
+    if (PQtransactionStatus(f->conn) == PQTRANS_IDLE) return 1;
+    PGresult *r = PQexec(f->conn, "ROLLBACK");
     int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
     if (r) PQclear(r);
     return ok;
 }
+
 static int pg_bulk_commit(mvx_file *fh) {
     pg_file *f = (pg_file *)fh;
+    if (PQtransactionStatus(f->conn) == PQTRANS_IDLE) return 1;
     PGresult *r = PQexec(f->conn, "COMMIT");
     int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
     if (r) PQclear(r);
     return ok;
 }
 
-/* Whole-mapping backfill push-down (#56): the mapped parent columns live on the
-   base (id, rec) table, so materialising them is one UPDATE over all rows with a
-   per-column expression derived straight from the record blob — no records over
-   the wire.  Expressible only when every field is a parent column (no
-   association child tables here) whose transform is plain extraction or a simple
-   cast: TEXT/NUMERIC with no OCONV, or DATE/TIME (which map the stored internal
-   value, ignoring the display conversion, exactly as map_cell does).  Anything
-   needing a real OCONV, or any association, returns MVX_MAP_NOPUSH so the runtime
-   falls back to the per-record loop. */
 static int64_t pg_map_backfill(mvx_file *fh, const mvx_mapfield *cols,
                                const int64_t *anos, const char **convs,
                                const char **assocs, int nf, char *err,
@@ -547,6 +572,8 @@ static int pg_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     pg_file *f = (pg_file *)fh;
     char qt[640];
     child_qualify(f, assoc, qt, sizeof qt);
+    /* The DELETE and the INSERTs are one replacement, not a sequence. */
+    int started = txn_begin(f->conn);
 
     /* replace: delete the record's rows, then insert the new ones */
     char dsql[720];
@@ -557,7 +584,7 @@ static int pg_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     PGresult *dr = PQexecParams(f->conn, dsql, 1, NULL, dpv, dpl, dpf, 0);
     int ok = dr && PQresultStatus(dr) == PGRES_COMMAND_OK;
     if (dr) PQclear(dr);
-    if (!ok) return 0;
+    if (!ok) { txn_end(f->conn, started, 0); return 0; }
 
     /* column-name list for the INSERT */
     char collist[2048];
@@ -586,7 +613,7 @@ static int pg_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         snprintf(seqbuf, sizeof seqbuf, "%d", r + 1);
         const char *pv[66];
         int pl[66], pf[66];
-        if (ncols > 63) return 0;
+        if (ncols > 63) { txn_end(f->conn, started, 0); return 0; }
         pv[0] = id; pl[0] = (int)idlen; pf[0] = 1;          /* id (binary) */
         pv[1] = seqbuf; pl[1] = 0; pf[1] = 0;               /* seq (text) */
         for (int c = 0; c < ncols; c++) {
@@ -599,8 +626,9 @@ static int pg_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
             PQexecParams(f->conn, isql, ncols + 2, NULL, pv, pl, pf, 0);
         int iok = ir && PQresultStatus(ir) == PGRES_COMMAND_OK;
         if (ir) PQclear(ir);
-        if (!iok) return 0;
+        if (!iok) { txn_end(f->conn, started, 0); return 0; }
     }
+    txn_end(f->conn, started, 1);
     return 1;
 }
 
@@ -1464,6 +1492,7 @@ static const mvx_driver mvx_driver_postgres = {
     pg_bulk_begin, pg_bulk_commit,        /* transactional backfill batching */
     pg_map_backfill,                      /* whole-mapping backfill push-down */
     pg_select_join_order,                 /* co-located TRANS() ORDER BY */
+    pg_rollback,                          /* abort a failed logical write */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

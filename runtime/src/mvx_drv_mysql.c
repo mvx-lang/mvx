@@ -49,6 +49,11 @@
 static struct {
     char loc[1024];
     MYSQL *db;
+    /* Whether a transaction is open on THIS connection.  MySQL exposes no
+       supported call to ask, so it is tracked here -- and here rather than on
+       the file handle because many open files share one pooled connection, and
+       a transaction belongs to the connection. */
+    int in_txn;
 } g_conns[MAX_CONNS];
 static int g_nconns;
 
@@ -194,6 +199,7 @@ static MYSQL *my_connect(const char *loc, char *err, size_t errlen) {
     }
     snprintf(g_conns[g_nconns].loc, sizeof g_conns[0].loc, "%s", loc);
     g_conns[g_nconns].db = db;
+    g_conns[g_nconns].in_txn = 0;
     g_nconns++;
     return db;
 }
@@ -503,11 +509,67 @@ static int my_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     return 1;
 }
 
-static int my_bulk_begin(mvx_file *fh) {
-    return exec_sql(((my_file *)fh)->db, "START TRANSACTION");
+/* The pool slot for a connection, so the transaction flag can be found. */
+static int conn_slot(MYSQL *db) {
+    for (int i = 0; i < g_nconns; i++)
+        if (g_conns[i].db == db) return i;
+    return -1;
 }
+
+/* Atomicity for an operation the DRIVER owns end to end.
+ *
+ * map_child_apply is a DELETE followed by one INSERT per row: interrupted
+ * halfway it leaves an association holding some of its values and not the
+ * rest, which is worse than either extreme because nothing reports it.
+ *
+ * begin() returns whether it actually started one -- inside a backfill one is
+ * already open, and then the outer transaction carries the atomicity and only
+ * its owner may commit.  end() rolls back on failure, which a plain
+ * commit-or-nothing cannot express. */
+static int txn_begin(MYSQL *db) {
+    int i = conn_slot(db);
+    if (i < 0 || g_conns[i].in_txn) return 0;
+    if (!exec_sql(db, "START TRANSACTION")) return 0;
+    g_conns[i].in_txn = 1;
+    return 1;
+}
+static void txn_end(MYSQL *db, int started, int ok) {
+    if (!started) return;
+    int i = conn_slot(db);
+    if (i >= 0) g_conns[i].in_txn = 0;
+    exec_sql(db, ok ? "COMMIT" : "ROLLBACK");
+}
+
+/* Transaction bracketing, for a backfill batch AND for one logical write.
+ *
+ * NESTING IS THE WHOLE DIFFICULTY, and MySQL's version of it is the nastiest
+ * of the three: START TRANSACTION while one is already open does not warn, it
+ * COMMITS the open one first.  So a mapped write bracketing itself inside a
+ * backfill would silently commit half the backfill -- the opposite of what
+ * bracketing is for.  Hence the flag, and hence begin() reporting whether it
+ * actually started one so only that caller commits. */
+static int my_bulk_begin(mvx_file *fh) {
+    MYSQL *db = ((my_file *)fh)->db;
+    int i = conn_slot(db);
+    if (i < 0 || g_conns[i].in_txn) return 0;      /* already inside one */
+    if (!exec_sql(db, "START TRANSACTION")) return 0;
+    g_conns[i].in_txn = 1;
+    return 1;
+}
+/* Discard everything since bulk_begin -- see the sqlite driver. */
+static int my_rollback(mvx_file *fh) {
+    MYSQL *db = ((my_file *)fh)->db;
+    int i = conn_slot(db);
+    if (i < 0 || !g_conns[i].in_txn) return 1;    /* nothing open */
+    g_conns[i].in_txn = 0;
+    return exec_sql(db, "ROLLBACK");
+}
+
 static int my_bulk_commit(mvx_file *fh) {
     MYSQL *db = ((my_file *)fh)->db;
+    int i = conn_slot(db);
+    if (i < 0 || !g_conns[i].in_txn) return 1;     /* nothing open */
+    g_conns[i].in_txn = 0;
     if (exec_sql(db, "COMMIT")) return 1;
     exec_sql(db, "ROLLBACK");
     return 0;
@@ -643,6 +705,8 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     char nm[512], qn[600], dsql[700];
     child_name(f, assoc, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
+    /* The DELETE and the INSERTs are one replacement, not a sequence. */
+    int started = txn_begin(f->db);
     snprintf(dsql, sizeof dsql, "DELETE FROM %s WHERE id = ?", qn);
     MYSQL_STMT *ds = mysql_stmt_init(f->db);
     if (ds && mysql_stmt_prepare(ds, dsql, (unsigned long)strlen(dsql)) == 0) {
@@ -655,7 +719,7 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         mysql_stmt_execute(ds);
     }
     if (ds) mysql_stmt_close(ds);
-    if (nrows < 1) return 1;
+    if (nrows < 1) { txn_end(f->db, started, 1); return 1; }
 
     char sql[8192];
     size_t p = (size_t)snprintf(sql, sizeof sql, "INSERT INTO %s (id, seq", qn);
@@ -663,7 +727,7 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         char qc[300];
         quote_ident(cols[c].name, qc, sizeof qc);
         p += (size_t)snprintf(sql + p, sizeof sql - p, ", %s", qc);
-        if (p >= sizeof sql) return 0;
+        if (p >= sizeof sql) { txn_end(f->db, started, 0); return 0; }
     }
     p += (size_t)snprintf(sql + p, sizeof sql - p, ") VALUES (?, ?");
     for (int c = 0; c < ncols; c++)
@@ -671,9 +735,9 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     snprintf(sql + p, sizeof sql - p, ")");
 
     MYSQL_STMT *st = mysql_stmt_init(f->db);
-    if (!st) return 0;
+    if (!st) { txn_end(f->db, started, 0); return 0; }
     if (mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) != 0) {
-        mysql_stmt_close(st); return 0;
+        mysql_stmt_close(st); txn_end(f->db, started, 0); return 0;
     }
     int ok = 1;
     for (int r = 0; r < nrows && ok; r++) {
@@ -700,6 +764,7 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         ok = mysql_stmt_execute(st) == 0;
     }
     mysql_stmt_close(st);
+    txn_end(f->db, started, ok);
     return ok;
 }
 
@@ -1149,6 +1214,7 @@ static const mvx_driver mvx_driver_mysql = {
                                              per-record loop is correct */
     NULL,                                 /* select_join_order: the verb sorts
                                              the reference itself */
+    my_rollback,                          /* abort a failed logical write */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {
