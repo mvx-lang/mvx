@@ -1612,11 +1612,36 @@ static int map_recompose(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
         mv_clear(&val); mv_clear(&tmp); mv_clear(&code);
         return present;
     }
+    /* ONE FIELD RECONSTRUCTS AN ATTRIBUTE, chosen by how well it can.
+       CREATE-MAP now refuses to map an attribute twice (mvx#158), but a
+       mapping written before that check can still hold two fields on one
+       attribute -- and this loop used to write both, so the LAST one declared
+       won and the other was silently discarded, order deciding which.
+
+       Rank instead of order: an identity field (no conversion) carries the
+       stored value itself; DATE and TIME carry it through a reversible
+       conversion, so map_uncell returns exactly what was there; anything else
+       (MD/MR/ML) has lost the raw digits and can only approximate it.  The
+       best claim wins, and ties keep the first, so the result does not depend
+       on the order fields happen to sit in %MAP%. */
+    int wrote[MAP_MAXF];
+    int rank[MAP_MAXF];
+    int nw = 0;
     for (int k = 0; k < npar; k++) {
         int i = pidx[k];
+        const char *t = m->types[i];
+        int r = 0;                                  /* 2 identity, 1 reversible */
+        if (m->convs[i][0] == '\0') r = 2;
+        else if (strcmp(t, "DATE") == 0 || strcmp(t, "TIME") == 0) r = 1;
+        int seen = -1;
+        for (int w = 0; w < nw; w++)
+            if (m->anos[wrote[w]] == m->anos[i]) { seen = w; break; }
+        if (seen >= 0 && rank[seen] >= r) { free(vals[k]); continue; }
         map_uncell(ctx, m->types[i], m->convs[i], vals[k], lens[k], &val,
                    &tmp, &code);
         mv_replace_fn(rec, rec, m->anos[i], 0, 0, &val);
+        if (seen >= 0) { wrote[seen] = i; rank[seen] = r; }
+        else if (nw < MAP_MAXF) { wrote[nw] = i; rank[nw] = r; nw++; }
         free(vals[k]);
     }
 

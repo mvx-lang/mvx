@@ -2410,6 +2410,80 @@ SQW2EOF
   # A transaction left open would keep the write invisible to a second
   # connection; the sqlite3 CLI above IS a second connection, so the counts
   # having been readable at all is the evidence that it committed.
+
+  # ONE COLUMN PER ATTRIBUTE (#158).  Two dictionary items can name the same
+  # attribute -- PRICE with MD2 and PRICE.RAW with none are one stored value
+  # read two ways.  Mapping both wrote it into two columns with no rule about
+  # which was the truth, and the read-back loop projected each field into its
+  # attribute in turn, so whichever %MAP% listed LAST won: identical data gave
+  # a different answer depending on declaration order.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DUP' >/dev/null 2>&1
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DICT DUP' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdupd.b" <<'SQDDEOF'
+OPEN "DICT", "DUP" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"10L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"MD2":@AM:"Price":@AM:"8R" ON D, "PRICE"
+WRITE "D":@AM:"2":@AM:"":@AM:"PriceRaw":@AM:"8R" ON D, "PRICE.RAW"
+SQDDEOF
+  "$MVX" "$TESTROOT/sqdupd.b" -o "$TESTROOT/sqdupd" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdupd" >/dev/null 2>&1)
+  dm="$("$TCL" -a "$SQA" -c 'CREATE-MAP DUP NAME PRICE PRICE.RAW' 2>&1)"
+  case "$dm" in
+    *"both attribute 2"*)
+      PASS=$((PASS+1)); echo "  CREATE-MAP refuses a second field on one attribute" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite duplicate attribute not refused: $dm" ;;
+  esac
+
+  # A mapping written before that check can still hold two fields on one
+  # attribute, so the read-back has to rank them rather than take the last:
+  # the identity field carries the stored value, MD2 has lost the raw digits.
+  # Both orders must therefore answer with the identity column's 777.
+  dupok=1
+  for ord in A B; do
+    f="DUP$ord"
+    "$TCL" -a "$SQA" -c "CREATE-FILE $f" >/dev/null 2>&1
+    "$TCL" -a "$SQA" -c "CREATE-FILE DICT $f" >/dev/null 2>&1
+    cat > "$TESTROOT/sqdup.b" <<SQDEOF
+OPEN "DICT", "$f" TO D ELSE STOP
+P = "PRICE":@VM:2:@VM:"MD2":@VM:"NUMERIC":@VM:""
+R = "PRICE.RAW":@VM:2:@VM:"":@VM:"TEXT":@VM:""
+SPEC = "NAME":@VM:1:@VM:"":@VM:"TEXT":@VM:""
+IF "$ord" = "A" THEN
+   SPEC<2> = P
+   SPEC<3> = R
+END ELSE
+   SPEC<2> = R
+   SPEC<3> = P
+END
+WRITE SPEC ON D, "%MAP%"
+OPEN "$f" TO F ELSE STOP
+WRITE "widget":@AM:990 ON F, "D1"
+SQDEOF
+    "$MVX" "$TESTROOT/sqdup.b" -o "$TESTROOT/sqdup" || dupok=0
+    (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdup" >/dev/null 2>&1)
+    "$TCL" -a "$SQA" -c "MAP-MODE $f native" >/dev/null 2>&1
+    # an external writer changes both columns; id is a BLOB, so CAST or the
+    # UPDATE silently matches nothing and the test measures the old value
+    sqlite3 "$SQA/acct.sqlite" \
+      "UPDATE \"$f\" SET \"PRICE\"=55.55, \"PRICE.RAW\"='777' \
+       WHERE id=CAST('D1' AS BLOB);" 2>/dev/null
+    ch="$(sqlite3 "$SQA/acct.sqlite" \
+      "SELECT COUNT(*) FROM \"$f\" WHERE \"PRICE.RAW\"='777';" 2>/dev/null)"
+    cat > "$TESTROOT/sqdupr.b" <<SQREOF
+OPEN "$f" TO F ELSE STOP
+READ R FROM F, "D1" THEN PRINT R<2>
+SQREOF
+    "$MVX" "$TESTROOT/sqdupr.b" -o "$TESTROOT/sqdupr" || dupok=0
+    got="$(cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdupr" 2>/dev/null)"
+    if [ "$ch" != 1 ] || [ "$got" != 777 ]; then
+      dupok=0; echo "FAIL sqlite duplicate read-back order $ord: updated='$ch' got='$got' want 777"
+    fi
+  done
+  if [ "$dupok" = 1 ]; then
+    PASS=$((PASS+1)); echo "  read-back takes the identity column whatever the map order"
+  else
+    FAIL=$((FAIL+1))
+  fi
 else
   echo "  (sqlite test skipped — driver not built)"
 fi

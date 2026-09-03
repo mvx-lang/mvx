@@ -69,6 +69,24 @@ FOR I = 1 TO NF
          IF C2 = "MD" OR C2 = "MR" OR C2 = "ML" THEN T = "NUMERIC"
          IF C2 = "MT" THEN T = "TIME"
          IF CONV[1, 1] = "D" THEN T = "DATE"
+         * ONE COLUMN PER ATTRIBUTE.  Several dictionary items may name the
+         * same attribute -- PRICE with MD2 and PRICE.RAW with none are the
+         * same value read two ways -- and mapping both stored the value
+         * twice with no rule about which was the truth.  The read-back loop
+         * wrote every mapped field into its attribute in turn, so the LAST
+         * one declared won and the other was silently discarded, order
+         * deciding which (mvx#158).  Refusing the second is what removes the
+         * ambiguity: the other item is still usable, derived from the one
+         * column rather than stored beside it.
+         DUP = 0
+         FOR J = 1 TO NS
+            IF SPEC<J, 2> = DI<2> THEN DUP = J
+         NEXT J
+         IF DUP THEN
+            PRINT FLD:" and ":SPEC<DUP, 1>:" are both attribute ":DI<2>
+            PRINT "an attribute can be mapped once; map one and derive the other"
+            STOP
+         END
          NS = NS + 1
          SPEC<NS> = FLD:@VM:DI<2>:@VM:CONV:@VM:T:@VM:DI<6>
       END ELSE
