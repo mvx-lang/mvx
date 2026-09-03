@@ -36,6 +36,18 @@
 
 #include <mysql.h>
 #include <stdio.h>
+
+/* my_bool WAS REMOVED IN MySQL 8.0, where MYSQL_BIND's is_null/error fields
+   became plain bool.  MariaDB Connector/C still defines it, so a driver
+   written against MariaDB builds locally and fails on a MySQL 8 client --
+   which is exactly how this was found.  One byte either way; the typedef
+   just gives both a name this file can use.  MARIADB_BASE_VERSION /
+   MARIADB_PACKAGE_VERSION are defined only by the MariaDB headers. */
+#if !defined(MARIADB_BASE_VERSION) && !defined(MARIADB_PACKAGE_VERSION)
+#include <stdbool.h>
+typedef bool my_bool;
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
