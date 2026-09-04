@@ -296,6 +296,48 @@ check tcl-query "$(printf '%s\n' \
   'LIST DICT PARTS' \
   'CT DICT PARTS PRICE' | tclrun)"
 
+# PHRASES (mvx#164).  A PH item is not a column: its attribute 2 is a list of
+# column NAMES, and resolving one as a D item read that list as an attribute
+# number and stopped the runtime.  Named, a phrase now expands to the columns
+# it stands for; named nothing, the file's own %PH% applies -- the furniture
+# record beside %FILE%, hidden from a DICT listing by the same leading-% rule.
+cat > "$TESTROOT/ph.b" <<'PHEOF'
+OPEN "DICT", "PARTS" TO D ELSE STOP
+WRITE "PH":@AM:"NAME PRICE" ON D, "SHORT"
+WRITE "PH":@AM:"NAME COLOR PRICE" ON D, "%PH%"
+PHEOF
+"$MVX" "$TESTROOT/ph.b" -o "$TESTROOT/phbin" 2>/dev/null
+(cd "$ACCT" && MVXACCOUNT=. "$TESTROOT/phbin")
+phn="$("$TCL" -a "$ACCT" -c 'LIST PARTS SHORT' 2>&1)"
+case "$phn" in
+  *Name*Price*) PASS=$((PASS+1)); echo "  a named phrase expands to its columns" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL phrase not expanded: $phn" ;;
+esac
+# and it must not have become a column in its own right
+case "$phn" in
+  *SHORT*) FAIL=$((FAIL+1)); echo "FAIL the phrase name leaked as a column: $phn" ;;
+  *) PASS=$((PASS+1)); echo "  the phrase itself is not a column" ;;
+esac
+phd="$("$TCL" -a "$ACCT" -c 'LIST PARTS' 2>&1)"
+case "$phd" in
+  *Name*Colour*Price*) PASS=$((PASS+1)); echo "  %PH% supplies the default columns" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL %PH% default not applied: $phd" ;;
+esac
+# A file with no %PH% keeps the old behaviour -- id only.  Without this the
+# default could be coming from anywhere.
+"$TCL" -a "$ACCT" -c 'CREATE-FILE NOPH' >/dev/null 2>&1
+nph="$("$TCL" -a "$ACCT" -c 'LIST NOPH' 2>&1)"
+case "$nph" in
+  *Name*|*Colour*) FAIL=$((FAIL+1)); echo "FAIL a file without %PH% got columns: $nph" ;;
+  *) PASS=$((PASS+1)); echo "  a file with no %PH% still lists the id alone" ;;
+esac
+# SORT shares the resolution, and had the same gap
+sph="$("$TCL" -a "$ACCT" -c 'SORT PARTS SHORT' 2>&1)"
+case "$sph" in
+  *Name*Price*) PASS=$((PASS+1)); echo "  SORT expands phrases too" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL SORT did not expand the phrase: $sph" ;;
+esac
+
 # SORT (LIST sorted by id by default, or BY key) and SSELECT (a sorted
 # select list feeding the next command)
 check tcl-sort "$(printf '%s\n' \
@@ -1037,6 +1079,45 @@ RGEOF
     ( cd "$MGSUB/acct" && "$ROOT/build/bin/mvx-git" log --oneline 2>&1 \
         | sed -E 's/[0-9a-f]{7,40}/HASH/g' ))"
 
+  # `mvx-git adopt` — what it ASKS about the open form (mv_git#124).
+  #
+  # Three rules, one engine decision shared with udt-git and uv-git, and the
+  # wording matters as much as the trigger:
+  #   open form, flag off  -> ask to ENABLE (the data is already portable; the
+  #                           flag is what is missing, and it does not travel
+  #                           with a clone).  Asking to "convert" something that
+  #                           already IS open reads as nonsense.
+  #   native to ANOTHER MV -> ask to CONVERT; it is being converted either way.
+  #   native to THIS MV    -> say nothing; there is nothing to convert.
+  #
+  # Untested until now on MVX: the logic lived in the U2 CLIs and in one
+  # person's hand-checking, which is how `mvx-git adopt` came to print "account
+  # rebuild failed" and exit 0.
+  MGASK="$TESTROOT/mgask"
+  mgask() { # <dir> <descriptor-name>
+    rm -rf "$MGASK/$1"; mkdir -p "$MGASK/$1/CUST"
+    printf 'x
+' > "$MGASK/$1/CUST/C1"
+    printf '# descriptor
+name = t
+version = 1
+' > "$MGASK/$1/$2"
+    ( cd "$MGASK/$1" && git init -q . && git add -A >/dev/null 2>&1 &&       git -c user.email=t@t -c user.name=t commit -qm x >/dev/null 2>&1 )
+  }
+  mgask open .mv-account ; mgask foreign .udt ; mgask own .mvx
+  # The adopt itself may fail here (mvx-git-adopt need not be on PATH in a bare
+  # test tree); what is asserted is the QUESTION, decided before anything is built.
+  mgasked() {
+    out=$( cd "$MGASK/$1" && MVXGIT_OPEN_ACCOUNT=0 MVXCONVERT="$CONV" \
+             "$ROOT/build/bin/mvx-git" adopt 2>&1 || true )
+    case "$out" in
+      *"already in the open account format"*) echo "$1: asks to enable" ;;
+      *"will be converted to an MVX one"*)    echo "$1: asks to convert" ;;
+      *)                                       echo "$1: asks nothing" ;;
+    esac
+  }
+  check tcl-mvxgit-adopt-asks "$(mgasked open; mgasked foreign; mgasked own)"
+
   # open account format, commit side (mvx#73): with mvx.openaccount set, `add`
   # normalises the staged git objects to the open form - %FILE% becomes DIR/hash,
   # .mvx is stored at .mv-account, and the binary lmdb store is never tracked -
@@ -1241,8 +1322,9 @@ GSEOF
 check tcl-gitnative "$( \
   printf "LINK-PKG $ROOT/packages/git\nGIT INIT\nGIT ADD CUST\nGIT STATUS\nGIT COMMIT -m initial\nGIT LOG\n" | \
     "$TCL" -a "$GACCT" 2>&1 \
+      | normalise \
       | sed -E -e 's/[0-9a-f]{7,40}/HASH/g' \
-               -e 's/^Author:.*/Author: A/' -e 's/^Date:.*/Date: D/' | normalise; \
+               -e 's/^Author:.*/Author: A/' -e 's/^Date:.*/Date: D/'; \
   printf 'DELETE CUST C1\nWRITE-C2\n' > /dev/null; \
   (cd "$GACCT" && MVXACCOUNT=. "$MVX" /dev/stdin -o "$TESTROOT/gmod" <<'GMEOF' >/dev/null 2>&1
 OPEN "CUST" TO F ELSE STOP
@@ -2297,6 +2379,287 @@ else
   echo "  (postgres test skipped — set MVX_PG to run)"
 fi
 
+# sqlite backend.  UNCONDITIONAL, unlike postgres/mongo: an embedded backend
+# needs no server, which is the whole reason it exists — so if it is built, it
+# is tested on every run rather than behind an env var nobody sets.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== sqlite backend"
+  SQA="$TESTROOT/sqacct"; mkdir -p "$SQA"
+  printf '# MVX account descriptor\nname=sqacct\nversion=1\n' > "$SQA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$SQA" > "$SQA/BINDINGS"
+  "$TCL" -a "$SQA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/sqseed.b" <<'SQEOF'
+OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
+WRITE "Ada":@AM:"London":@AM:"42" ON F, "C1"
+WRITE "Grace":@AM:"York":@AM:"7" ON F, "C2"
+WRITE "Alan":@AM:"Cambridge":@AM:"115" ON F, "C3"
+READ R FROM F, "C2" THEN
+   PRINT "rt=":R<1>:"/":R<3>
+END ELSE PRINT "rt=LOST"
+DELETE F, "C3"
+N = 0
+SELECT F
+D = 0
+LOOP UNTIL D DO
+   READNEXT ID ELSE D = 1
+   IF NOT(D) THEN N += 1
+REPEAT
+PRINT "n=":N
+SQEOF
+  "$MVX" "$TESTROOT/sqseed.b" -o "$TESTROOT/sqseed" >/dev/null 2>&1
+  sqout="$(cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqseed" 2>&1)"
+  # a record survives the round trip with its marks, and DELETE really deletes
+  case "$sqout" in
+    *"rt=Grace/7"*) PASS=$((PASS+1)); echo "  record round-trips byte-exact" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite round-trip: $sqout" ;;
+  esac
+  case "$sqout" in
+    *"n=2"*) PASS=$((PASS+1)); echo "  select sees the delete" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite select/delete: $sqout" ;;
+  esac
+  # LISTF names the file AND its driver -- the cross-file listing this
+  # backend exists for, and the path that used to work only for postgres
+  lf="$("$TCL" -a "$SQA" -c 'LISTF' 2>&1)"
+  case "$lf" in
+    *"CUST"*"sqlite"*) PASS=$((PASS+1)); echo "  LISTF enumerates via the driver" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite LISTF: $lf" ;;
+  esac
+  # COUNT and a WITH filter run IN the backend, not by streaming ids to the
+  # verb: DESCRIBE shows the statement, so this asserts the push-down happened
+  # rather than merely that the answer was right.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DICT CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdict.b" <<'SQDEOF'
+OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L":@AM:"S" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+SQDEOF
+  "$MVX" "$TESTROOT/sqdict.b" -o "$TESTROOT/sqdict" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdict" >/dev/null 2>&1)
+  cnt="$("$TCL" -a "$SQA" -c 'COUNT CUST WITH CITY = "London"' 2>&1)"
+  case "$cnt" in
+    *"1 record"*) PASS=$((PASS+1)); echo "  filtered COUNT is correct" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite COUNT: $cnt" ;;
+  esac
+  desc="$("$TCL" -a "$SQA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
+  case "$desc" in
+    *"SELECT id FROM"*"mvx_attr"*) PASS=$((PASS+1))
+      echo "  WITH is pushed into SQL, not scanned in the verb" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite push-down plan: $desc" ;;
+  esac
+  # MAPPING WITH AN ASSOCIATION -- the multi-table write.  A record's parent
+  # columns go in the base table and each association's values become rows in a
+  # child table, replaced wholesale on every write (DELETE + N INSERTs).  That
+  # sequence is bracketed in a transaction, because half of it applied is worse
+  # than none: the record and its projection disagree and nothing afterwards can
+  # tell.  This exercises the path; the rewrite-with-fewer-values case is the one
+  # that catches a DELETE that did not happen.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DICT ORD' >/dev/null 2>&1
+  cat > "$TESTROOT/sqmapd.b" <<'SQMEOF'
+OPEN "DICT", "ORD" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Cust":@AM:"10L" ON D, "CUST"
+* attribute 6 IS the association name -- any non-empty value makes a child table
+WRITE "D":@AM:"2":@AM:"":@AM:"Qty":@AM:"6R":@AM:"LINES" ON D, "QTY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Price":@AM:"8R":@AM:"LINES" ON D, "PRICE"
+SQMEOF
+  "$MVX" "$TESTROOT/sqmapd.b" -o "$TESTROOT/sqmapd" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqmapd" >/dev/null 2>&1)
+  "$TCL" -a "$SQA" -c 'CREATE-MAP ORD CUST QTY PRICE' >/dev/null 2>&1
+  cat > "$TESTROOT/sqmapw.b" <<'SQWEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+WRITE "C1":@AM:"5":@VM:"6":@VM:"7":@AM:"10":@VM:"20":@VM:"30" ON F, "O1"
+SQWEOF
+  "$MVX" "$TESTROOT/sqmapw.b" -o "$TESTROOT/sqmapw" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqmapw" >/dev/null 2>&1)
+  n3="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD__LINES";' 2>/dev/null)"
+  case "$n3" in
+    3) PASS=$((PASS+1)); echo "  an association writes one child row per value" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite association rows: got '$n3', want 3" ;;
+  esac
+  cat > "$TESTROOT/sqmapw2.b" <<'SQW2EOF'
+OPEN "ORD" TO F ELSE STOP
+WRITE "C1":@AM:"9":@VM:"8":@AM:"90":@VM:"80" ON F, "O1"
+SQW2EOF
+  "$MVX" "$TESTROOT/sqmapw2.b" -o "$TESTROOT/sqmapw2" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqmapw2" >/dev/null 2>&1)
+  n2="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD__LINES";' 2>/dev/null)"
+  stale="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD__LINES" WHERE seq > 2;' 2>/dev/null)"
+  if [ "$n2" = 2 ] && [ "$stale" = 0 ]; then
+    PASS=$((PASS+1)); echo "  a shorter rewrite replaces the rows, leaving none stale"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL sqlite association replace: rows='$n2' stale='$stale'"
+  fi
+  # A transaction left open would keep the write invisible to a second
+  # connection; the sqlite3 CLI above IS a second connection, so the counts
+  # having been readable at all is the evidence that it committed.
+
+  # TWO FIELDS ON ONE ATTRIBUTE (#158).  Two dictionary items may name the same
+  # attribute -- PRICE with MD2 and PRICE.RAW with no conversion are one stored
+  # value read two ways.  Mirroring both is the point of mirror mode: every
+  # column is a projection of the record, so a secondary version of a field
+  # costs a column and needs no cast to query it.  CREATE-MAP must allow it.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DUP' >/dev/null 2>&1
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DICT DUP' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdupd.b" <<'SQDDEOF'
+OPEN "DICT", "DUP" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"10L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"MD2":@AM:"Price":@AM:"8R" ON D, "PRICE"
+WRITE "D":@AM:"2":@AM:"":@AM:"PriceRaw":@AM:"8R" ON D, "PriceRaw"
+OPEN "DUP" TO F ELSE STOP
+WRITE "widget":@AM:990 ON F, "D1"
+SQDDEOF
+  sed -i.bak 's/"PriceRaw"$/"PRICE.RAW"/' "$TESTROOT/sqdupd.b" && rm -f "$TESTROOT/sqdupd.b.bak"
+  "$MVX" "$TESTROOT/sqdupd.b" -o "$TESTROOT/sqdupd" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdupd" >/dev/null 2>&1)
+  dm="$("$TCL" -a "$SQA" -c 'CREATE-MAP DUP NAME PRICE PRICE.RAW' 2>&1)"
+  cols="$(sqlite3 "$SQA/acct.sqlite" \
+    "SELECT COUNT(*) FROM pragma_table_info('DUP') \
+     WHERE name IN ('PRICE','PRICE.RAW');" 2>/dev/null)"
+  if [ "$cols" = 2 ]; then
+    PASS=$((PASS+1)); echo "  a second field on one attribute projects its own column"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL sqlite second field not projected: cols='$cols' ($dm)"
+  fi
+  # Native has no record to project from -- the columns ARE the record -- so
+  # there it takes one mapping per attribute, and the switch is refused.
+  # ...and refusing is only half an answer, so it names the one to keep: the
+  # identity field, which rebuilds the attribute exactly where MD2 cannot.
+  nm="$("$TCL" -a "$SQA" -c 'MAP-MODE DUP native' 2>&1)"
+  case "$nm" in
+    *"attribute 2 is mapped by"*"for native keep PRICE.RAW"*"still mirror"*)
+      PASS=$((PASS+1))
+      echo "  native refuses a second mapping, naming the one to keep" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite native duplicate advice: $nm" ;;
+  esac
+
+  # Which is what makes the read-back rank the fields rather than take the
+  # last: the identity field carries the stored value, MD2 has lost the raw
+  # digits.  Native mode reads from the columns, so both %MAP% orders must
+  # still answer with the identity column's 777 -- that determinism is what
+  # lets the SQL backends allow this at all.
+  dupok=1
+  for ord in A B; do
+    f="DUP$ord"
+    "$TCL" -a "$SQA" -c "CREATE-FILE $f" >/dev/null 2>&1
+    "$TCL" -a "$SQA" -c "CREATE-FILE DICT $f" >/dev/null 2>&1
+    cat > "$TESTROOT/sqdup.b" <<SQDEOF
+OPEN "DICT", "$f" TO D ELSE STOP
+P = "PRICE":@VM:2:@VM:"MD2":@VM:"NUMERIC":@VM:""
+R = "PRICE.RAW":@VM:2:@VM:"":@VM:"TEXT":@VM:""
+SPEC = "NAME":@VM:1:@VM:"":@VM:"TEXT":@VM:""
+IF "$ord" = "A" THEN
+   SPEC<2> = P
+   SPEC<3> = R
+END ELSE
+   SPEC<2> = R
+   SPEC<3> = P
+END
+WRITE SPEC ON D, "%MAP%"
+* a mapping that predates the check: native, with two fields on attribute 2
+WRITE "native" ON D, "%MAPMODE%"
+OPEN "$f" TO F ELSE STOP
+WRITE "widget":@AM:990 ON F, "D1"
+SQDEOF
+    "$MVX" "$TESTROOT/sqdup.b" -o "$TESTROOT/sqdup" || dupok=0
+    (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdup" >/dev/null 2>&1)
+    # an external writer changes both columns; id is a BLOB, so CAST or the
+    # UPDATE silently matches nothing and the test measures the old value
+    sqlite3 "$SQA/acct.sqlite" \
+      "UPDATE \"$f\" SET \"PRICE\"=55.55, \"PRICE.RAW\"='777' \
+       WHERE id=CAST('D1' AS BLOB);" 2>/dev/null
+    ch="$(sqlite3 "$SQA/acct.sqlite" \
+      "SELECT COUNT(*) FROM \"$f\" WHERE \"PRICE.RAW\"='777';" 2>/dev/null)"
+    cat > "$TESTROOT/sqdupr.b" <<SQREOF
+OPEN "$f" TO F ELSE STOP
+READ R FROM F, "D1" THEN PRINT R<2>
+SQREOF
+    "$MVX" "$TESTROOT/sqdupr.b" -o "$TESTROOT/sqdupr" || dupok=0
+    got="$(cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdupr" 2>/dev/null)"
+    if [ "$ch" != 1 ] || [ "$got" != 777 ]; then
+      dupok=0; echo "FAIL sqlite duplicate read-back order $ord: updated='$ch' got='$got' want 777"
+    fi
+  done
+  if [ "$dupok" = 1 ]; then
+    PASS=$((PASS+1)); echo "  read-back takes the identity column whatever the map order"
+  else
+    FAIL=$((FAIL+1))
+  fi
+else
+  echo "  (sqlite test skipped — driver not built)"
+fi
+
+# mysql/mariadb backend — only when MVX_MYSQL names a reachable server, e.g.
+#   MVX_MYSQL='host=127.0.0.1 port=3306 user=root password=secret dbname=mvxtest'
+# Gated like postgres and mongo: it needs a server, unlike the embedded sqlite.
+if [ -n "${MVX_MYSQL:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 2>&1; then
+  echo "== mysql backend"
+  MYA="$TESTROOT/myacct"; mkdir -p "$MYA"
+  printf '# MVX account descriptor\nname=myacct\nversion=1\n' > "$MYA/.mvx"
+  printf '* mysql %s\n' "$MVX_MYSQL" > "$MYA/BINDINGS"
+  "$TCL" -a "$MYA" -c 'DELETE-FILE CUST' >/dev/null 2>&1
+  "$TCL" -a "$MYA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/myseed.b" <<'MYEOF'
+OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
+WRITE "Ada":@AM:"London":@AM:"42" ON F, "C1"
+WRITE "Grace":@AM:"York":@AM:"7" ON F, "C2"
+WRITE "Alan":@AM:"Cambridge":@AM:"115" ON F, "C3"
+WRITE "Solo" ON F, "C9"
+READ R FROM F, "C2" THEN
+   PRINT "rt=":R<1>:"/":R<3>
+END ELSE PRINT "rt=LOST"
+DELETE F, "C3"
+N = 0
+SELECT F
+D = 0
+LOOP UNTIL D DO
+   READNEXT ID ELSE D = 1
+   IF NOT(D) THEN N += 1
+REPEAT
+PRINT "n=":N
+MYEOF
+  "$MVX" "$TESTROOT/myseed.b" -o "$TESTROOT/myseed" >/dev/null 2>&1
+  myout="$(cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myseed" 2>&1)"
+  case "$myout" in
+    *"rt=Grace/7"*) PASS=$((PASS+1)); echo "  record round-trips byte-exact" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql round-trip: $myout" ;;
+  esac
+  case "$myout" in
+    *"n=3"*) PASS=$((PASS+1)); echo "  select sees the delete" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql select/delete: $myout" ;;
+  esac
+  lf="$("$TCL" -a "$MYA" -c 'LISTF' 2>&1)"
+  case "$lf" in
+    *"CUST"*"mysql"*) PASS=$((PASS+1)); echo "  LISTF enumerates via the driver" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql LISTF: $lf" ;;
+  esac
+  "$TCL" -a "$MYA" -c 'CREATE-FILE DICT CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/mydict.b" <<'MYDEOF'
+OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"6R":@AM:"S" ON D, "QTY"
+MYDEOF
+  "$MVX" "$TESTROOT/mydict.b" -o "$TESTROOT/mydict" >/dev/null 2>&1
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/mydict" >/dev/null 2>&1)
+  cnt="$("$TCL" -a "$MYA" -c 'COUNT CUST WITH CITY = "London"' 2>&1)"
+  case "$cnt" in
+    *"1 record"*) PASS=$((PASS+1)); echo "  filtered COUNT is correct" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql COUNT: $cnt" ;;
+  esac
+  cnt2="$("$TCL" -a "$MYA" -c 'COUNT CUST WITH QTY = ""' 2>&1)"
+  case "$cnt2" in
+    *"1 record"*) PASS=$((PASS+1)); echo "  attribute past the end reads as empty" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql short-record attr: $cnt2" ;;
+  esac
+  desc="$("$TCL" -a "$MYA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
+  case "$desc" in
+    *"SELECT id FROM"*"SUBSTRING_INDEX"*) PASS=$((PASS+1))
+      echo "  WITH is pushed into SQL, not scanned in the verb" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql push-down plan: $desc" ;;
+  esac
+else
+  echo "  (mysql test skipped — set MVX_MYSQL to run)"
+fi
+
 # mongo backend — only when MVX_MONGO names a reachable MongoDB, e.g.
 #   MVX_MONGO='address=localhost:27017 namespace=mvxtest'
 if [ -n "${MVX_MONGO:-}" ]; then
@@ -2418,6 +2781,29 @@ if [ "$QUICK" = 0 ]; then
   else
     FAIL=$((FAIL + 1)); echo "FAIL install: cmake --install failed"
   fi
+fi
+
+# ---- the byte representation has one door -----------------------------------
+#
+# An mv_string is its bytes today, and is meant to stop being that: a dynamic
+# array becomes an element structure with the flat bytes as a cache
+# (DESIGN-DYNAMIC-ARRAYS.md).  On that day every ->data read behind the
+# runtime's back returns STALE BYTES -- silently, and only for values that were
+# edited by subscript first.
+#
+# The accessors went in while both sides were still `st->data`, which is the
+# only moment that change is provably behaviour-neutral.  This is what keeps
+# them in: a rule nothing checks is a rule that decays, and this one has to hold
+# across six files that have no other reason to agree with each other.
+echo "== byte accessor discipline"
+stray=$(grep -rn -- '->data' "$ROOT"/runtime/src/*.c 2>/dev/null \
+        | grep -v '^.*mv_str\.c:' || true)
+if [ -n "$stray" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL ->data outside mv_str.c -- use mv_str_bytes()/mv_str_wbytes():"
+  echo "$stray" | sed 's|^|    |'
+else
+  PASS=$((PASS + 1)); echo "  no raw ->data outside mv_str.c"
 fi
 
 echo "== $PASS passed, $FAIL failed"

@@ -252,7 +252,13 @@ typedef struct mvx_driver {
        pays one commit per batch instead of one per record.  The runtime calls
        bulk_begin, streams writes, and bulk_commit periodically and at the end
        (a commit on an already-failed transaction simply rolls it back).  NULL =
-       the backend has no transactional batching (writes autocommit). */
+       the backend has no transactional batching (writes autocommit).
+
+       bulk_begin RETURNS WHETHER IT STARTED ONE: 0 means a transaction was
+       already open and this bracket is nested inside it, so the outer one
+       carries the atomicity and only its owner may end it.  A driver that
+       ignores this and issues an unconditional BEGIN corrupts the outer
+       batch -- MySQL's START TRANSACTION silently COMMITS the open one. */
     int (*bulk_begin)(mvx_file *f);
     int (*bulk_commit)(mvx_file *f);
     /* Optional whole-mapping backfill (may be NULL): materialise a mapping in
@@ -284,6 +290,23 @@ typedef struct mvx_driver {
                                      const char *src_keycol, mvx_file *tgt,
                                      int64_t tgt_attr, const char *tgt_col,
                                      char ctl, int otext, int64_t limit);
+    /* Optional transaction abort (may be NULL): discard everything written
+       since bulk_begin.  Without it a bracket can only ever COMMIT, so a
+       write that fails half way -- the record stored but its mapping not, or
+       an association holding some of its rows and not the rest -- would be
+       committed in that state.  That is mapping drift, the same failure the
+       index guarantee above forbids, and there is no way to detect it after
+       the fact: the record and its projection simply disagree.
+
+       A driver offering bulk_begin/bulk_commit SHOULD offer this too.  The
+       runtime brackets one logical WRITE (record + parent columns + a child
+       table per association) and calls rollback when any part of it fails.
+
+       NESTING: bulk_begin returns whether it actually STARTED a transaction
+       (0 = one was already open, e.g. a backfill batch surrounding this
+       write).  Only the caller that started one may commit or roll it back;
+       an inner bracket that returned 0 must do neither. */
+    int (*rollback)(mvx_file *f);
 } mvx_driver;
 
 /* map_backfill sentinel: the transform is not expressible in this backend, so
@@ -308,7 +331,7 @@ typedef struct mvx_file_base {
    It must return NULL if `abi` is not an ABI version it supports,
    otherwise its driver vtable.  The search path is $MVXDRIVERS
    (colon-separated), then the runtime's built-in driver directory. */
-#define MVX_DRIVER_ABI 10
+#define MVX_DRIVER_ABI 11
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

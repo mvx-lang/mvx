@@ -1,0 +1,116 @@
+# mvx — nightly dev build.
+# Copyright (C) 2026 Gordon Heydon.  GPL-2.0-only (see LICENSE).
+#
+# A dev build of DEVELOP, once a night, and only when there is a reason for one:
+# something new to build, and a CI run that says it works.
+#
+# It does not build anything itself.  It decides, moves ONE tag, and asks
+# release.yml to build it -- so a dev build is the same artifacts by the same
+# steps as a release.  A dev build assembled by a second, slightly different
+# pipeline would be testing that pipeline rather than the product.
+#
+# ONE TAG, NOT ONE A NIGHT.  `dev` is moved to develop's HEAD, so there is never
+# more than one dev tag and the release keeps its identity: same URL, same asset
+# names, updated in place.
+#
+# WHICH ALSO MAKES "has anything changed" EXACT.  The tag's current target IS
+# the last hash that was built -- not a note about it that can drift out of step
+# with what was actually published.  A nightly that rebuilds the same commit
+# every night teaches everyone to ignore it, and buries the night something did
+# change.
+name: nightly
+
+on:
+  schedule:
+    # 16:00 UTC — early morning in Australia/Sydney, so a night's work is
+    # waiting rather than landing mid-afternoon.
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write     # to move the dev tag
+  # WRITE, not read.  Reading the ci run for the commit needs read; DISPATCHING
+  # release.yml on the tag needs write, and without it the tag lands and the
+  # dispatch is refused with "403: Resource not accessible by integration" --
+  # leaving exactly the symptom this workflow exists to avoid, a dev tag with no
+  # build against it.
+  actions: write
+
+jobs:
+  decide:
+    name: anything new, and is it green?
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: develop
+          fetch-depth: 0        # tags, and enough history to compare
+
+      - name: Decide, and tag if there is a reason to
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          echo "develop is at $SHA"
+
+          # --- is there anything new? ---------------------------------------
+          LAST="$(git rev-parse -q --verify 'refs/tags/dev^{commit}' || true)"
+          if [ -n "$LAST" ]; then
+            echo "last dev build was $LAST"
+          else
+            echo "no dev tag yet — this is the first dev build"
+          fi
+          if [ "$LAST" = "$SHA" ]; then
+            echo "nothing new since the last dev build — stopping."
+            exit 0
+          fi
+
+          # --- is it green? -------------------------------------------------
+          # release.yml gates on this too, and thoroughly.  Asking here is so a
+          # commit that was never going to build does not get a tag anyway: a
+          # dev tag on a red commit is a lie that outlives the run.
+          run="$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+                   --jq '.workflow_runs | sort_by(.run_started_at) | last // empty')"
+          if [ -z "$run" ]; then
+            echo "no ci run for $SHA — nothing to build on. Stopping."
+            exit 0
+          fi
+
+          status="$(printf '%s' "$run" | jq -r .status)"
+          concl="$(printf '%s'  "$run" | jq -r .conclusion)"
+          url="$(printf '%s'    "$run" | jq -r .html_url)"
+          id="$(printf '%s'     "$run" | jq -r .id)"
+
+          if [ "$status" != completed ] || [ "$concl" != success ]; then
+            echo "ci for $SHA is '$status'/'$concl' ($url) — not building."
+            exit 0
+          fi
+
+          jobs="$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+                    --jq '[.jobs[] | select(.conclusion == "success") | .name]')"
+          printf '%s' "$jobs" | jq -e 'index("build-test")' >/dev/null || {
+            echo "ci run $url has no successful 'build-test' job — not building."
+            exit 0
+          }
+          echo "ci is green: $url"
+
+          # --- move the tag, and start the build ----------------------------
+          # -f and --force, because the whole point is that `dev` MOVES.  An
+          # annotated tag carries the date and the commit it was made from, so
+          # what a given dev build was is still answerable after the tag has
+          # moved on -- by the release, which keeps its own record.
+          TAG=dev
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -f -a "$TAG" -m "nightly dev build of develop at $SHA" "$SHA"
+          git push --force origin "$TAG"
+
+          # Pushing the tag is not enough: GitHub will not let a push made with
+          # the default GITHUB_TOKEN trigger another workflow, which is how it
+          # stops a workflow feeding itself for ever.  The tag lands, release.yml
+          # never wakes up, and the only symptom is a tag with no release.
+          gh workflow run release.yml --ref "$TAG" -f tag="$TAG"
+          echo "moved $TAG to $SHA and dispatched release.yml on it."
+          echo "### nightly: \`$TAG\` now at \`$(git rev-parse --short=7 "$SHA")\`, build started" >> "$GITHUB_STEP_SUMMARY"

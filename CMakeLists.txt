@@ -39,6 +39,12 @@ set_property(CACHE MVX_WITH_POSTGRES PROPERTY STRINGS AUTO ON OFF)
 set(MVX_WITH_MONGO "${_mvx_pg_default}" CACHE STRING
   "MongoDB driver: AUTO (build if libmongoc present), ON (require it), OFF")
 set_property(CACHE MVX_WITH_MONGO PROPERTY STRINGS AUTO ON OFF)
+set(MVX_WITH_SQLITE "${_mvx_pg_default}" CACHE STRING
+  "SQLite driver: AUTO (build if sqlite3 present), ON (require it), OFF")
+set_property(CACHE MVX_WITH_SQLITE PROPERTY STRINGS AUTO ON OFF)
+set(MVX_WITH_MYSQL "${_mvx_pg_default}" CACHE STRING
+  "MySQL/MariaDB driver: AUTO (build if a client library is present), ON, OFF")
+set_property(CACHE MVX_WITH_MYSQL PROPERTY STRINGS AUTO ON OFF)
 option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
   ${_mvx_daemon_default})
 # Packages built into the system account at build time (#54): always available
@@ -134,6 +140,67 @@ if(MVX_POSTGRES_ENABLED)
   mvx_driver(postgres runtime/src/mvx_drv_postgres.c)
   target_include_directories(mvxdrv_postgres PRIVATE ${LIBPQ_INCLUDE_DIR})
   target_link_libraries(mvxdrv_postgres PRIVATE ${LIBPQ_LIBRARY})
+endif()
+
+# sqlite driver — an embedded SQL backend with the full push-down set.
+# Unlike postgres it needs no server, and because an account's files are all
+# tables in ONE database file, cross-file JOIN/ORDER BY are always available.
+set(MVX_SQLITE_ENABLED OFF)
+if(NOT MVX_WITH_SQLITE STREQUAL "OFF")
+  find_path(SQLITE3_INCLUDE_DIR sqlite3.h
+            HINTS /opt/homebrew/opt/sqlite/include /usr/local/opt/sqlite/include)
+  find_library(SQLITE3_LIBRARY NAMES sqlite3
+               HINTS /opt/homebrew/opt/sqlite/lib /usr/local/opt/sqlite/lib)
+  if(SQLITE3_INCLUDE_DIR AND SQLITE3_LIBRARY)
+    set(MVX_SQLITE_ENABLED ON)
+    message(STATUS "Building sqlite driver against ${SQLITE3_LIBRARY}")
+    mvx_driver(sqlite runtime/src/mvx_drv_sqlite.c)
+    target_include_directories(mvxdrv_sqlite PRIVATE ${SQLITE3_INCLUDE_DIR})
+    target_link_libraries(mvxdrv_sqlite PRIVATE ${SQLITE3_LIBRARY})
+  else()
+    message(STATUS "sqlite driver: sqlite3 not found, skipping")
+  endif()
+endif()
+
+# mysql/mariadb driver — built against the MariaDB Connector/C, which speaks the
+# MySQL wire protocol, so it serves BOTH servers at run time.  It is found
+# specifically, never libmysqlclient: MySQL 8 dropped my_bool (still used by
+# MYSQL_BIND on MariaDB), so accepting either client library means a conditional
+# typedef and two build paths that are never tested against each other.  On a
+# GitHub runner MySQL's headers are present by default, so a loose search finds
+# THOSE -- which is how that break was discovered rather than designed around.
+#
+# Debian/Ubuntu: libmariadb-dev.  Homebrew: mariadb-connector-c.
+set(MVX_MYSQL_ENABLED OFF)
+if(NOT MVX_WITH_MYSQL STREQUAL "OFF")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(MARIADB QUIET IMPORTED_TARGET libmariadb)
+  endif()
+  if(NOT MARIADB_FOUND)
+    find_path(MARIADB_INCLUDE_DIR mysql.h
+              HINTS /opt/homebrew/opt/mariadb-connector-c/include/mariadb
+                    /usr/local/opt/mariadb-connector-c/include/mariadb
+                    /usr/include/mariadb
+              NO_DEFAULT_PATH)
+    find_library(MARIADB_LIBRARY NAMES mariadb
+                 HINTS /opt/homebrew/opt/mariadb-connector-c/lib
+                       /usr/local/opt/mariadb-connector-c/lib)
+  endif()
+  if(MARIADB_FOUND)
+    set(MVX_MYSQL_ENABLED ON)
+    message(STATUS "Building mysql driver against MariaDB Connector/C (pkg-config)")
+    mvx_driver(mysql runtime/src/mvx_drv_mysql.c)
+    target_link_libraries(mvxdrv_mysql PRIVATE PkgConfig::MARIADB)
+  elseif(MARIADB_INCLUDE_DIR AND MARIADB_LIBRARY)
+    set(MVX_MYSQL_ENABLED ON)
+    message(STATUS "Building mysql driver against ${MARIADB_LIBRARY}")
+    mvx_driver(mysql runtime/src/mvx_drv_mysql.c)
+    target_include_directories(mvxdrv_mysql PRIVATE ${MARIADB_INCLUDE_DIR})
+    target_link_libraries(mvxdrv_mysql PRIVATE ${MARIADB_LIBRARY})
+  else()
+    message(STATUS "mysql driver: MariaDB Connector/C not found, skipping")
+  endif()
 endif()
 
 # mongo driver — gated by MVX_WITH_MONGO.  The mongo-c-driver ships pkg-config
@@ -297,6 +364,12 @@ if(MVX_POSTGRES_ENABLED)
 endif()
 if(MVX_MONGO_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxdrv_mongo)
+endif()
+if(MVX_SQLITE_ENABLED)
+  list(APPEND MVX_INSTALL_DRIVERS mvxdrv_sqlite)
+endif()
+if(MVX_MYSQL_ENABLED)
+  list(APPEND MVX_INSTALL_DRIVERS mvxdrv_mysql)
 endif()
 install(TARGETS ${MVX_INSTALL_DRIVERS} LIBRARY DESTINATION lib)
 install(FILES ${CMAKE_BINARY_DIR}/lib/mvx_crt.o DESTINATION lib)

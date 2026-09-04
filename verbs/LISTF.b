@@ -19,18 +19,10 @@ FOR I = 1 TO N
    E = L<I>
    NM = E<1, 1>
    TY = E<1, 2>
-   BEGIN CASE
-   CASE TY = "D"
-      TYX = "directory"
-   CASE TY = "L"
-      TYX = "lmdb"
-   CASE TY = "P"
-      TYX = "postgres"
-   CASE TY = "N"
-      TYX = "lmdbnet"
-   CASE 1
-      TYX = TY
-   END CASE
-   PRINT FMT(NM, "L#24"):" ":TYX
+   * The type IS the driver's name, sent by the runtime.  There was a CASE
+   * ladder here mapping one-letter codes to names, which meant every new
+   * backend needed an edit in this verb as well as in the runtime -- and if
+   * you forgot, the letter leaked out to the user.
+   PRINT FMT(NM, "L#24"):" ":TY
 NEXT I
 PRINT N:" file(s)"

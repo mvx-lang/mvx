@@ -22,6 +22,16 @@ inputs:
   package:
     description: 'Package name, e.g. "mvx-lang/git". The artifact base is this with "/" -> "_".'
     required: true
+  artifact:
+    description: |
+      Artifact base name, when the file should not be named after the package.
+      Defaults to the package with "/" -> "_".  The three build actions
+      (udt-build, uv-build, jbase-build) already take this; without it here a
+      package could rename its BINARIES and not its source tar, which is worse
+      than either name alone -- the registry keys every asset of a release off
+      the same base.
+    required: false
+    default: ''
   title:
     description: 'Release display-name prefix; the release is named "<title> <tag>".'
     required: true
@@ -49,12 +59,17 @@ runs:
       shell: bash
       env:
         PACKAGE: ${{ inputs.package }}
+        ARTIFACT: ${{ inputs.artifact }}
         EXTRA_EXCLUDE: ${{ inputs.extra-exclude }}
       run: |
         set -euo pipefail
         VER="${GITHUB_REF_NAME}"
-        # base = package name '/'->'_'; the registry maps <base>-<ver>-source.tar.gz.
-        BASE="$(printf '%s' "$PACKAGE" | tr '/' '_')-$VER-source"
+        # base = $ARTIFACT when the package declares one, else the package name
+        # '/'->'_'.  The registry keys EVERY asset of a release off one base, so
+        # this must agree with what the binary jobs use and with "artifact" in
+        # mvpkg.json -- a mismatch is not an error, it is an asset the registry
+        # silently does not recognise (mv_git#201).
+        BASE="${ARTIFACT:-$(printf '%s' "$PACKAGE" | tr '/' '_')}-$VER-source"
         # A clean checkout has only tracked files (build artifacts are git-ignored);
         # drop the repo/CI metadata, plus any caller-named paths (e.g. a docs submodule).
         EX="--exclude=./.git --exclude=./.github"

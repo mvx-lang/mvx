@@ -20,6 +20,7 @@
  */
 #include "mvx_driver.h"
 #include "mvx_map.h"
+#include "mv_bytes.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -1126,6 +1127,19 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
         mv_init(&old);
         had_old = b->driver->read(f, ip, idlen, &old);
     }
+    /* ONE LOGICAL WRITE, ONE TRANSACTION.  With a mapping this is not one
+       statement but several across several tables: the record, then the parent
+       columns, then a DELETE + N INSERTs for every association that changed.
+       Half of that is worse than none of it -- the record and its projection
+       disagree, and nothing afterwards can tell, because each part succeeded.
+       So the whole sequence is bracketed and rolled back as a unit.
+       bulk_begin returns 0 when a transaction is ALREADY open (a backfill
+       batch around this write); then the outer one owns the atomicity and
+       this bracket must neither commit nor roll back. */
+    int txn = 0;
+    if (o && o->map.nf > 0 && b->driver->bulk_begin && b->driver->bulk_commit)
+        txn = b->driver->bulk_begin(f);
+
     if (o && o->ix.n > 0 && b->driver->write_ix) {
         mvx_ixop ops[IX_MAX_ITEMS * IX_MAX_VALS * 2];
         static ixvals pool[IX_MAX_ITEMS * 2];
@@ -1135,6 +1149,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
         ok = b->driver->write(f, ip, idlen, rec);
     }
     if (!ok) {
+        if (txn && b->driver->rollback) b->driver->rollback(f);
         if (need_old) mv_clear(&old);
         if (onerr) return -2;
         mvx_fatal("WRITE failed on %s id %.*s", b->spec, (int)idlen, ip);
@@ -1143,9 +1158,19 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
        diff against the prior record and write only the columns/child rows
        that changed; a new record projects in full.  Native mode already
        validated above; mirror mode is best-effort (mismatch -> NULL). */
+    int mok = 1;
     if (o && o->map.nf > 0)
-        map_project(ctx, f, &o->map, ip, idlen, rec, had_old ? &old : NULL);
+        mok = map_project(ctx, f, &o->map, ip, idlen, rec,
+                          had_old ? &old : NULL);
+    if (txn) {
+        /* The record went in; if its projection did not, take the record back
+           out with it rather than leave the two disagreeing. */
+        if (mok) b->driver->bulk_commit(f);
+        else if (b->driver->rollback) b->driver->rollback(f);
+        else b->driver->bulk_commit(f);   /* no rollback offered: best effort */
+    }
     if (need_old) mv_clear(&old);
+    if (!mok && onerr) return -2;
     if (!keep_lock) {                   /* WRITE releases; WRITEU keeps */
         char *key = lock_key(f, ip, idlen);
         lock_drop(st, key);
@@ -1587,11 +1612,36 @@ static int map_recompose(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
         mv_clear(&val); mv_clear(&tmp); mv_clear(&code);
         return present;
     }
+    /* ONE FIELD RECONSTRUCTS AN ATTRIBUTE, chosen by how well it can.
+       CREATE-MAP now refuses to map an attribute twice (mvx#158), but a
+       mapping written before that check can still hold two fields on one
+       attribute -- and this loop used to write both, so the LAST one declared
+       won and the other was silently discarded, order deciding which.
+
+       Rank instead of order: an identity field (no conversion) carries the
+       stored value itself; DATE and TIME carry it through a reversible
+       conversion, so map_uncell returns exactly what was there; anything else
+       (MD/MR/ML) has lost the raw digits and can only approximate it.  The
+       best claim wins, and ties keep the first, so the result does not depend
+       on the order fields happen to sit in %MAP%. */
+    int wrote[MAP_MAXF];
+    int rank[MAP_MAXF];
+    int nw = 0;
     for (int k = 0; k < npar; k++) {
         int i = pidx[k];
+        const char *t = m->types[i];
+        int r = 0;                                  /* 2 identity, 1 reversible */
+        if (m->convs[i][0] == '\0') r = 2;
+        else if (strcmp(t, "DATE") == 0 || strcmp(t, "TIME") == 0) r = 1;
+        int seen = -1;
+        for (int w = 0; w < nw; w++)
+            if (m->anos[wrote[w]] == m->anos[i]) { seen = w; break; }
+        if (seen >= 0 && rank[seen] >= r) { free(vals[k]); continue; }
         map_uncell(ctx, m->types[i], m->convs[i], vals[k], lens[k], &val,
                    &tmp, &code);
         mv_replace_fn(rec, rec, m->anos[i], 0, 0, &val);
+        if (seen >= 0) { wrote[seen] = i; rank[seen] = r; }
+        else if (nw < MAP_MAXF) { wrote[nw] = i; rank[nw] = r; nw++; }
         free(vals[k]);
     }
 
@@ -1763,8 +1813,11 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
     if (progress) clock_gettime(CLOCK_MONOTONIC, &t0);
     /* Batch the per-record writes in one transaction, committing every 10k rows,
        so a large backfill pays a handful of commits instead of one per record. */
-    int bulk = b->driver->bulk_begin && b->driver->bulk_commit;
-    if (bulk) b->driver->bulk_begin(f);
+    /* Own the batch only if we actually STARTED it: bulk_begin returns 0 when
+       a transaction was already open, and committing one we did not open would
+       end somebody else's. */
+    int bulk = b->driver->bulk_begin && b->driver->bulk_commit
+               && b->driver->bulk_begin(f);
     int64_t count = 0, rc = 0;
     mv_value rid, rec;
     mv_init(&rid); mv_init(&rec);
@@ -1777,7 +1830,7 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
         count++;
         if (bulk && count % 10000 == 0) {
             b->driver->bulk_commit(f);
-            b->driver->bulk_begin(f);
+            bulk = b->driver->bulk_begin(f);   /* re-arm, honouring the return */
         }
         if (progress && count % 1000 == 0) mapbuild_progress(count, total, &t0);
     }
@@ -2688,6 +2741,16 @@ int64_t mvx_readnext(mvx_ctx *ctx, mv_value *id) {
     return 1;
 }
 
+/* Furniture the account owns but a file listing should not show: a file's
+   dictionary and its index tables.  The driver contract says drivers hand
+   these up and the RUNTIME filters them, so the rule lives here once rather
+   than being restated (and diverging) per enumeration source — which is how
+   an index table came to be visible through one path and not another. */
+static int fl_internal(const char *p, size_t n) {
+    return (n > 5 && memcmp(p, "DICT.", 5) == 0) ||
+           memmem(p, n, ".IDX.", 5) != NULL;
+}
+
 /* FILELIST(): every MV file in the account — subdirectories (directory
    driver) plus LMDB named DBs, as "name @VM type" attributes.  DICT
    stores and infrastructure directories are filtered out. */
@@ -2696,9 +2759,15 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
     char *buf = NULL;
     size_t len = 0, cap = 0;
 
-#define FL_PUT(p, n, ty)                                                  \
+/* Each entry is "name" @VM "driver".  The type is the DRIVER'S OWN NAME,
+   never a code assigned here: a letter per backend has to be invented in
+   this file and then decoded again in the LISTF verb, so the two drift and
+   every new driver needs an edit in both.  The name travels intact and the
+   verb prints what it is given. */
+#define FL_PUTS(p, n, tystr)                                              \
     do {                                                                  \
-        size_t need = (n) + 3;                                            \
+        size_t tl = strlen(tystr);                                        \
+        size_t need = (n) + tl + 2;                                       \
         if (len + need > cap) {                                           \
             cap = cap ? cap * 2 : 256;                                    \
             while (cap < len + need) cap *= 2;                            \
@@ -2710,7 +2779,8 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
         memcpy(buf + len, (p), (n));                                      \
         len += (n);                                                       \
         buf[len++] = (char)0xFD;                                          \
-        buf[len++] = (ty);                                                \
+        memcpy(buf + len, (tystr), tl);                                   \
+        len += tl;                                                        \
     } while (0)
 
     const char *acct = getenv("MVXACCOUNT");
@@ -2727,7 +2797,7 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             snprintf(p, sizeof p, "%s/%s", acct, nm);
             struct stat sb;
             if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode))
-                FL_PUT(nm, strlen(nm), 'D');
+                FL_PUTS(nm, strlen(nm), "dir");
         }
         free(ents[i]);
     }
@@ -2740,13 +2810,11 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
         char err[256] = "";
         if (lmdb->names(NULL, &names, err, sizeof err) &&
             names.tag == MV_STR && names.s->len > 0) {
-            const char *p = names.s->data, *end = p + names.s->len;
+            const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
             while (p < end) {
                 const char *am = memchr(p, '\xFE', (size_t)(end - p));
                 size_t n = (am ? am : end) - p;
-                int internal = (n > 5 && memcmp(p, "DICT.", 5) == 0) ||
-                               memmem(p, n, ".IDX.", 5) != NULL;
-                if (n > 0 && !internal) FL_PUT(p, n, 'L');
+                if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, "lmdb");
                 p = am ? am + 1 : end;
             }
         }
@@ -2805,27 +2873,28 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             fclose(rf);
         }
     }
-    /* Whole-account Postgres binding (`* @conn` resolving to driver=postgres):
-       per-file BINDINGS lines list nothing here, so enumerate the schema's
-       record tables via the driver.  The empty spec matches only the `*`
-       policy (never an exact file), giving the star driver and its @conn. */
+    /* Whole-account binding to a driver that can enumerate itself: the
+       per-file BINDINGS lines list nothing, so ask the driver.  ANY driver
+       offering names() qualifies — this used to test for postgres BY NAME,
+       which meant a new backend silently listed no files at all however
+       complete its names() was.  The empty spec matches only the `*` policy
+       (never an exact file), giving the star driver and its params. */
     {
         char bdrv[64] = "", bparm[512] = "";
         if (binding_for("", bdrv, sizeof bdrv, bparm, sizeof bparm) &&
-            strcmp(bdrv, "postgres") == 0) {
-            const mvx_driver *pg = driver_load("postgres");
-            if (pg->names) {
+            bdrv[0] && mvx_driver_available(bdrv)) {
+            const mvx_driver *bd = driver_load(bdrv);
+            if (bd->names) {
                 mv_value names;
                 mv_init(&names);
                 char err[256] = "";
-                if (pg->names(bparm, &names, err, sizeof err) &&
+                if (bd->names(bparm, &names, err, sizeof err) &&
                     names.tag == MV_STR && names.s->len > 0) {
-                    const char *p = names.s->data, *end = p + names.s->len;
+                    const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
                     while (p < end) {
                         const char *am = memchr(p, '\xFE', (size_t)(end - p));
                         size_t n = (am ? am : end) - p;
-                        int internal = n > 5 && memcmp(p, "DICT.", 5) == 0;
-                        if (n > 0 && !internal) FL_PUT(p, n, 'P');
+                        if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, bdrv);
                         p = am ? am + 1 : end;
                     }
                 }
@@ -2833,32 +2902,10 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             }
         }
     }
-    const char *dmn = getenv("MVXDAEMON");
-    if (!listed_bound && dmn && dmn[0]) {
-        const mvx_driver *net = driver_load("lmdbnet");
-        if (net->names) {
-            mv_value names;
-            mv_init(&names);
-            char err[256] = "";
-            if (net->names(NULL, &names, err, sizeof err) &&
-                names.tag == MV_STR && names.s->len > 0) {
-                const char *p = names.s->data;
-                const char *end = p + names.s->len;
-                while (p < end) {
-                    const char *am = memchr(p, '\xFE',
-                                            (size_t)(end - p));
-                    size_t n = (am ? am : end) - p;
-                    int internal =
-                        (n > 5 && memcmp(p, "DICT.", 5) == 0) ||
-                        memmem(p, n, ".IDX.", 5) != NULL;
-                    if (n > 0 && !internal) FL_PUT(p, n, 'N');
-                    p = am ? am + 1 : end;
-                }
-            }
-            mv_clear(&names);
-        }
-    }
-#undef FL_PUT
+    /* The bare-$MVXDAEMON case used to be enumerated by a third block that
+       loaded "lmdbnet" by name.  It is gone: binding_for() already resolves a
+       daemon with no BINDINGS record to that driver, so the block above covers
+       it — and running both listed every file twice. */
 
     mv_set_str(dst, buf ? buf : "", (int64_t)len);
     free(buf);
