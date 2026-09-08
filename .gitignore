@@ -6,7 +6,9 @@ CLAUDE.md
 packages/*/CATALOG/
 packages/*/LIB/
 packages/*/bin/
-packages/git/LIB/
+
+# Pinned package releases the LINK-PKG tests fetch and build (#169).
+.pkgcache/
 
 # LMDB hash-file stores are binary and account-local: never commit them.
 # An account is version-controlled in its legible directory form and
@@ -18,5 +20,3 @@ tt/
 # descriptor left by running mvx here (real accounts still track
 # their own .mvx).
 /.mvx
-packages/json/CATALOG/
-packages/json/LIB/

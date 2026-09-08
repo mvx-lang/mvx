@@ -49,10 +49,13 @@ option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
   ${_mvx_daemon_default})
 # Packages built into the system account at build time (#54): always available
 # to every compile and process (their EXPORTS + verbs + extension libraries),
-# with no LINK-PKG.  Defaults to `json` (the JSON codec is now a package —
-# JSONENCODE/JSONDECODE come from packages/json).  Set to "" to exclude it, or
-# add more (semicolon-separated) to bundle them into a distribution.
-set(MVX_PACKAGES "json;http" CACHE STRING "Packages built into the system account")
+# with no LINK-PKG.  Set to "" to exclude them, or add more (semicolon-
+# separated) to bundle them into a distribution.
+#
+# json used to be listed here, which meant JSONENCODE/JSONDECODE existed only
+# because the packages/json submodule happened to be checked out.  The codec is
+# built into libmvxrt now (#169), so it needs no package and no configuration.
+set(MVX_PACKAGES "http" CACHE STRING "Packages built into the system account")
 
 # --- runtime -----------------------------------------------------------
 # A SHARED library so its code is mapped once and shared across every mvx
@@ -67,6 +70,7 @@ add_library(mvxrt SHARED
   runtime/src/mv_conv.c
   runtime/src/mvx_ctx.c
   runtime/src/mvx_map.c
+  runtime/src/mvx_json.c
   runtime/src/mvx_ext.c
   runtime/src/mvx_store.c
   runtime/src/mvx_exec.c

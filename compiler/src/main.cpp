@@ -102,8 +102,16 @@ void readExports(const fs::path &exportsFile, std::set<std::string> &out) {
 // system-installed packages (aggregated <system>/EXPORTS) plus, when compiling
 // in an account, that account's linked packages (PACKAGES -> each <pkg>/EXPORTS).
 // No per-compile flag: inclusion is configuration.
+// Built into libmvxrt, so they are callable with no package installed and
+// nothing to link (#169).  Seeded here rather than read from <system>/EXPORTS
+// because a built-in must not depend on a system account existing: `mvx-basic`
+// run against a bare tree still has to compile JSONENCODE.  Keep in step with
+// register_builtins() in runtime/src/mvx_ext.c.
+static const char *const kBuiltinExtFuncs[] = {"JSONENCODE", "JSONDECODE"};
+
 std::set<std::string> loadExtFuncs() {
     std::set<std::string> out;
+    for (const char *n : kBuiltinExtFuncs) out.insert(n);
     fs::path sys;
     if (const char *s = getenv("MVXSYSTEM"); s && *s) sys = s;
     else sys = exeDir().parent_path() / "system";

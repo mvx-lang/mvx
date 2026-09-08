@@ -103,11 +103,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # THE PACKAGES ARE SUBMODULES, and the build installs them into the
-          # system account — without this they check out empty and the build
-          # stops at "packages/json has neither a BP source directory nor a
-          # NATIVE manifest".  ci.yml has always done this; release.yml never
-          # did, and got away with it until the package set grew.
+          # docs (the wiki) and demo.  The released packages stopped being
+          # submodules in #169 — the JSON codec that used to arrive that way is
+          # built into libmvxrt now, so a shallow checkout no longer silently
+          # produces a runtime with no JSONENCODE.
           submodules: true
 
       - name: Install toolchain
