@@ -694,70 +694,38 @@ static int mongo_index_drop(mvx_file *fh, const char *item) {
 }
 
 /* Server-side WITH push-down: the ids whose mapped column satisfies "="/"#". */
-/* A predicate on a RAW attribute of the document — the push-down this driver
- * has never had, because there was no server-side way to split a blob (#157).
+/* A predicate on a RAW attribute of the document.
  *
- * MONGO MATCHES ARRAY ELEMENTS NATIVELY, and that is the trap here.  A
- * multivalued attribute is a JSON array, so the obvious {"doc.3": "6"} matches
- * a record whose attribute 3 is ["5","6"] — while sqlite and postgres, which
- * compare the whole attribute, do not.  Letting that through would make WITH
- * mean something different on mongo than everywhere else, which is exactly the
- * backend-specific behaviour non-negotiable 6 rules out.
+ * ANY VALUE MATCHES, which mongo does NATURALLY: {"doc.3": "6"} matches a
+ * record whose attribute 3 is ["5","6"] as well as one where it is "6".  That
+ * is the semantics the index path has always had and the verb now has
+ * (ARCHITECTURE.md 5.2, mvx#173) — so the right thing here is the plain
+ * filter, with nothing added.
  *
- * So an equality is constrained to a SCALAR attribute, and a not-equal admits
- * arrays (a multivalued attribute is indeed not equal to a single value).  The
- * result agrees with the other backends value for value.
+ * #157 briefly CONSTRAINED this to scalars so mongo would agree with three SQL
+ * backends that compared the whole attribute.  Those were the ones out of
+ * step; the constraint is gone.
  *
- * When the any-value question is settled (it is a real improvement mongo could
- * offer for free), all four backends change together — not this one alone. */
-static void build_attr_pred(bson_t *filter, int64_t attr, const char *op,
-                            const char *val, int64_t vlen) {
+ * `#` is NOT pushed.  "some value differs" is not mongo's $ne, which on an
+ * array means "no element equals" — the opposite for a record whose values are
+ * London]York.  It is expressible with $expr and $anyElementTrue, but a wrong
+ * push-down is worse than none, so the verb answers it. */
+static void build_attr_pred(bson_t *filter, int64_t attr, const char *val,
+                            int64_t vlen) {
     char path[32];
     snprintf(path, sizeof path, "doc.%lld", (long long)attr);
-    if (op[0] == '=') {
-        bson_t arr, eqd, notd, typd;
-        bson_append_array_begin(filter, "$and", 4, &arr);
-        bson_append_document_begin(&arr, "0", 1, &eqd);
-        bson_append_utf8(&eqd, path, -1, val, (int)vlen);
-        bson_append_document_end(&arr, &eqd);
-        bson_append_document_begin(&arr, "1", 1, &notd);
-        bson_t fieldd, notinner;
-        bson_append_document_begin(&notd, path, -1, &fieldd);
-        bson_append_document_begin(&fieldd, "$not", 4, &notinner);
-        bson_append_utf8(&notinner, "$type", 5, "array", 5);
-        bson_append_document_end(&fieldd, &notinner);
-        bson_append_document_end(&notd, &fieldd);
-        bson_append_document_end(&arr, &notd);
-        bson_append_array_end(filter, &arr);
-        (void)typd;
-    } else {                              /* '#' — not equal */
-        bson_t arr, isarr, ned;
-        bson_append_array_begin(filter, "$or", 3, &arr);
-        bson_append_document_begin(&arr, "0", 1, &isarr);
-        bson_t f1;
-        bson_append_document_begin(&isarr, path, -1, &f1);
-        bson_append_utf8(&f1, "$type", 5, "array", 5);
-        bson_append_document_end(&isarr, &f1);
-        bson_append_document_end(&arr, &isarr);
-        bson_append_document_begin(&arr, "1", 1, &ned);
-        bson_t f2;
-        bson_append_document_begin(&ned, path, -1, &f2);
-        bson_append_utf8(&f2, "$ne", 3, val, (int)vlen);
-        bson_append_document_end(&ned, &f2);
-        bson_append_document_end(&arr, &ned);
-        bson_append_array_end(filter, &arr);
-    }
+    bson_append_utf8(filter, path, -1, val, (int)vlen);
 }
 
 /* WITH on an un-mapped attribute, in the backend. */
 static mvx_cursor *mongo_select_attr(mvx_file *fh, int64_t attr, const char *op,
                                      const char *val, int64_t vlen) {
-    if (!op || !((op[0] == '=' || op[0] == '#') && !op[1])) return NULL;
+    if (!op || op[0] != '=' || op[1]) return NULL;   /* '#': the verb answers */
     if (attr < 1) return NULL;
     mongo_file *f = (mongo_file *)fh;
     bson_t filter;
     bson_init(&filter);
-    build_attr_pred(&filter, attr, op, val, vlen);
+    build_attr_pred(&filter, attr, val, vlen);
     mvx_cursor *c = query_ids(f, &filter);
     bson_destroy(&filter);
     return c;
@@ -791,7 +759,8 @@ static int64_t mongo_count_where(mvx_file *fh, const char *col, int64_t attr,
             return -1;
         }
         if (col && col[0]) build_pred(&filter, col, op, val, vlen);
-        else if (attr >= 1) build_attr_pred(&filter, attr, op, val, vlen);
+        else if (attr >= 1 && op[0] == '=' && !op[1])
+            build_attr_pred(&filter, attr, val, vlen);
         else { bson_destroy(&filter); return -1; }
     }
     mongoc_collection_t *coll = coll_of(f);

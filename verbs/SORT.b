@@ -365,7 +365,10 @@ IF SYSTEM(11) = 0 THEN
          IF WANOS<1> = -1 AND WSPECS<1>[1, 6] = "TRANS(" THEN
             IXUSED = TRANSSELECT(F, WSPECS<1>, WOPS<1>, WVS<1>)
          END
-         IF IXUSED = 0 AND WOPS<1> = "=" AND WANOS<1> > 0 THEN
+         * NOT for an EMPTY search value -- an index holds one entry per VALUE
+         * and an empty attribute has none, so the index would find nothing
+         * where the scan matches (mvx#173).
+         IF IXUSED = 0 AND WOPS<1> = "=" AND WANOS<1> > 0 AND WVS<1> # "" THEN
             IXUSED = INDEXSELECT(F, WIS<1>, WVS<1>)
          END
       END
@@ -399,20 +402,34 @@ UNTIL DONE DO
          WOP = WOPS<K>
          WV = WVS<K>
          CK = 0
-         BEGIN CASE
-         CASE WOP = "="
-            IF RV = WV THEN CK = 1
-         CASE WOP = "#"
-            IF RV # WV THEN CK = 1
-         CASE WOP = ">"
-            IF RV > WV THEN CK = 1
-         CASE WOP = "<"
-            IF RV < WV THEN CK = 1
-         CASE WOP = ">="
-            IF RV >= WV THEN CK = 1
-         CASE WOP = "<="
-            IF RV <= WV THEN CK = 1
-         END CASE
+         * ANY VALUE MATCHES.  A multivalued attribute is compared VALUE BY
+         * VALUE, not as one string, so WITH CITY = "London" matches a record
+         * whose CITY is London]York.  The INDEX path has always done this
+         * (ARCHITECTURE.md 5.2, and classic Pick), so before this the same
+         * query answered differently depending on whether an index happened
+         * to exist -- CREATE-INDEX changed results (mvx#173).
+         * DCOUNT of an empty attribute is 0, but MV reads it as ONE empty
+         * value: without the clamp a record with an empty CITY would stop
+         * matching WITH CITY # "London", which it must.
+         WNV = DCOUNT(RV, @VM)
+         IF WNV = 0 THEN WNV = 1
+         FOR WI = 1 TO WNV
+            WVAL = RV<1, WI>
+            BEGIN CASE
+            CASE WOP = "="
+               IF WVAL = WV THEN CK = 1
+            CASE WOP = "#"
+               IF WVAL # WV THEN CK = 1
+            CASE WOP = ">"
+               IF WVAL > WV THEN CK = 1
+            CASE WOP = "<"
+               IF WVAL < WV THEN CK = 1
+            CASE WOP = ">="
+               IF WVAL >= WV THEN CK = 1
+            CASE WOP = "<="
+               IF WVAL <= WV THEN CK = 1
+            END CASE
+         NEXT WI
          IF CK = 0 THEN OK = 0
       END
    NEXT K

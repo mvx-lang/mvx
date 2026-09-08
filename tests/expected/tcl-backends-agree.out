@@ -1,5 +1,7 @@
-verb (reference)  =London:1 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
-sqlite            =London:1 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
-postgres          =London:1 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
-mongo             =London:1 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
-mysql             =London:1 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
+verb (reference)  =London:2 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
+sqlite            =London:2 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
+postgres          =London:2 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
+mongo             =London:2 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
+mysql             =London:2 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
+unindexed         =London:2 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2
+indexed           =London:2 #London:4 =empty:1 byQTY:C1C2C3C5C4 byCITY:C4C1C3C5C2

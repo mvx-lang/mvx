@@ -230,6 +230,49 @@ static int pg_is_pre157(PGconn *c, const char *schema, const char *table) {
     return old;
 }
 
+/* A complete WITH predicate, placeholder included.
+ *
+ * ANY VALUE MATCHES: a multivalued attribute is compared value by value, not
+ * as one string.  `= 'London'` matches a record whose attribute is
+ * London]York; `# 'London'` does not match one whose every value is London.
+ * The index path has always done this (ARCHITECTURE.md 5.2) and the verb now
+ * does; a whole-attribute push-down made CREATE-INDEX change results (#173).
+ *
+ * The CASE wraps a scalar — and an ABSENT attribute — into a one-element
+ * array, because jsonb_array_elements_text yields nothing for a missing key
+ * while MV reads a short record's attribute as one EMPTY value, which must
+ * still satisfy `# 'London'`.
+ *
+ * The numeric form keeps the guard: a value that is not a number is skipped
+ * rather than failing the whole query, which postgres would otherwise do. */
+static void pg_pred(const char *col, int64_t attr, const char *op,
+                    const char *ph, int numeric, PGconn *c,
+                    char *out, size_t cap) {
+    if (col && col[0]) {
+        char *qc = PQescapeIdentifier(c, col, strlen(col));
+        if (numeric)
+            snprintf(out, cap, "NULLIF(%s,'')::numeric %s %s::numeric",
+                     qc ? qc : "\"\"", op, ph);
+        else
+            snprintf(out, cap, "%s %s %s", qc ? qc : "\"\"", op, ph);
+        if (qc) PQfreemem(qc);
+        return;
+    }
+    char vals[420];
+    snprintf(vals, sizeof vals,
+             "jsonb_array_elements_text(CASE WHEN jsonb_typeof(doc->'%lld') = 'array' "
+             "THEN doc->'%lld' ELSE jsonb_build_array(COALESCE(doc->>'%lld','')) END)",
+             (long long)attr, (long long)attr, (long long)attr);
+    if (numeric)
+        snprintf(out, cap,
+                 "EXISTS (SELECT 1 FROM %s mv WHERE "
+                 "mv ~ '^-?[0-9]+(\\.[0-9]+)?$' AND mv::numeric %s %s::numeric)",
+                 vals, op, ph);
+    else
+        snprintf(out, cap, "EXISTS (SELECT 1 FROM %s mv WHERE mv %s %s)",
+                 vals, op, ph);
+}
+
 static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
     char loc[1024];
     const char *rspec = split_spec(spec, loc, sizeof loc);
@@ -1002,19 +1045,12 @@ static mvx_cursor *pg_select_attr(mvx_file *fh, int64_t attr, const char *op,
     if (attr < 1) return NULL;
     char qt[512];
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
-    char sql[900], ax[400];
-    if (isrange) {
-        /* Compare numerically, matching MV's numeric compare — through the
-           GUARDED cast, so one non-numeric value yields NULL and drops out
-           instead of failing the whole query. */
-        pg_num_expr(attr, ax, sizeof ax);
-        snprintf(sql, sizeof sql,
-                 "SELECT id FROM %s WHERE %s %s $1::numeric", qt, ax, sqlop);
-    } else {
-        pg_attr_expr(attr, NULL, ax, sizeof ax);
-        snprintf(sql, sizeof sql,
-                 "SELECT id FROM %s WHERE %s %s $1", qt, ax, sqlop);
-    }
+    char sql[1400], ax[900];
+    /* Numeric where MV compares numerically; the per-value guard is inside
+       pg_pred, so one non-numeric value is skipped rather than failing the
+       whole query. */
+    pg_pred(NULL, attr, sqlop, "$1", isrange, f->conn, ax, sizeof ax);
+    snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE %s", qt, ax);
     const char *pv[1] = {val};
     int pl[1] = {(int)vlen}, pf[1] = {0};   /* text value */
     PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 1);
@@ -1196,16 +1232,10 @@ static int64_t pg_count_where(mvx_file *fh, const char *col, int64_t attr,
         if (op[0] == '=' && !op[1]) sqlop = "=";
         else if (op[0] == '#' && !op[1]) sqlop = col ? "IS DISTINCT FROM" : "<>";
         else return -1;
-        char expr[400];
-        if (col && col[0]) {
-            char *qc = PQescapeIdentifier(f->conn, col, strlen(col));
-            snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
-            if (qc) PQfreemem(qc);
-        } else {
-            pg_attr_expr(attr, NULL, expr, sizeof expr);
-        }
-        snprintf(sql, sizeof sql, "SELECT count(*) FROM %s WHERE %s %s $1",
-                 qt, expr, sqlop);
+        char expr[900];
+        pg_pred(col, attr, sqlop, "$1", 0, f->conn, expr, sizeof expr);
+        snprintf(sql, sizeof sql, "SELECT count(*) FROM %s WHERE %s",
+                 qt, expr);
         nparam = 1;
     }
     PGresult *r = PQexecParams(f->conn, sql, nparam, NULL, pv, pl, pf, 0);
@@ -1239,15 +1269,9 @@ static int pg_sum_where(mvx_file *fh, const char *sumcol, const char *fcol,
         if (fop[0] == '=' && !fop[1]) sqlop = "=";
         else if (fop[0] == '#' && !fop[1]) sqlop = fcol ? "IS DISTINCT FROM" : "<>";
         else return 0;
-        char expr[400];
-        if (fcol && fcol[0]) {
-            char *qc = PQescapeIdentifier(f->conn, fcol, strlen(fcol));
-            snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
-            if (qc) PQfreemem(qc);
-        } else {
-            pg_attr_expr(fattr, NULL, expr, sizeof expr);
-        }
-        snprintf(sql + p, sizeof sql - p, " WHERE %s %s $1", expr, sqlop);
+        char expr[900];
+        pg_pred(fcol, fattr, sqlop, "$1", 0, f->conn, expr, sizeof expr);
+        snprintf(sql + p, sizeof sql - p, " WHERE %s", expr);
         nparam = 1;
     }
     PGresult *r = PQexecParams(f->conn, sql, nparam, NULL, pv, pl, pf, 0);
@@ -1320,16 +1344,9 @@ static mvx_cursor *pg_select_order(mvx_file *fh, const char *fcol,
         if (fop[0] == '=' && !fop[1]) sqlop = "=";
         else if (fop[0] == '#' && !fop[1]) sqlop = fcol ? "IS DISTINCT FROM" : "<>";
         else { return NULL; }
-        char expr[400];
-        if (fcol && fcol[0]) {
-            char *qc = PQescapeIdentifier(f->conn, fcol, strlen(fcol));
-            snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
-            if (qc) PQfreemem(qc);
-        } else {
-            pg_attr_expr(fattr, NULL, expr, sizeof expr);
-        }
-        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s %s $1",
-                              expr, sqlop);
+        char expr[900];
+        pg_pred(fcol, fattr, sqlop, "$1", 0, f->conn, expr, sizeof expr);
+        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s", expr);
         nparam = 1;
     }
     p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", ordbuf);
@@ -1376,18 +1393,12 @@ static mvx_cursor *pg_select_multi(mvx_file *fh, const mvx_pred *preds,
                  strcmp(q->op, ">=") == 0 || strcmp(q->op, "<=") == 0)
             sqlop = q->op;
         else return NULL;
-        char expr[400];
-        if (q->col && q->col[0]) {
-            char *qc = PQescapeIdentifier(f->conn, q->col, strlen(q->col));
-            snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
-            if (qc) PQfreemem(qc);
-        } else {
-            if (q->numeric) pg_num_expr(q->attr, expr, sizeof expr);
-            else            pg_attr_expr(q->attr, NULL, expr, sizeof expr);
-        }
-        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s $%d%s",
-                              i ? " AND " : "", expr, sqlop, i + 1,
-                              q->numeric ? "::numeric" : "");
+        char expr[900], phn[16];
+        snprintf(phn, sizeof phn, "$%d", i + 1);
+        pg_pred(q->col, q->attr, sqlop, phn, q->numeric, f->conn,
+                expr, sizeof expr);
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : "", expr);
         pv[i] = q->val;
         pl[i] = (int)q->vlen;
         pf[i] = 0;
@@ -1435,19 +1446,15 @@ static int pg_explain(mvx_file *fh, const mvx_pred *preds, int npred,
                  strcmp(q->op, ">=") == 0 || strcmp(q->op, "<=") == 0)
             sqlop = q->op;
         else return 0;
-        char expr[400];
-        if (q->col && q->col[0]) {
-            char *qc = PQescapeIdentifier(f->conn, q->col, strlen(q->col));
-            snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
-            if (qc) PQfreemem(qc);
-        } else {
-            if (q->numeric) pg_num_expr(q->attr, expr, sizeof expr);
-            else            pg_attr_expr(q->attr, NULL, expr, sizeof expr);
-        }
+        /* DESCRIBE renders the same predicate the query would run, with a
+           literal where the query binds a parameter — so the plan shown is
+           the plan used, per-value form included. */
         char *lit = PQescapeLiteral(f->conn, q->val, (size_t)q->vlen);
-        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s %s%s",
-                              i ? " AND " : " WHERE ", expr, sqlop,
-                              lit ? lit : "''", q->numeric ? "::numeric" : "");
+        char expr[900];
+        pg_pred(q->col, q->attr, sqlop, lit ? lit : "''", q->numeric, f->conn,
+                expr, sizeof expr);
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : " WHERE ", expr);
         if (lit) PQfreemem(lit);
     }
     if (ocol && ocol[0]) {

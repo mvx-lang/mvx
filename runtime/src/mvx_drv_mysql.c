@@ -134,6 +134,63 @@ static void field_expr(const char *col, int64_t attr, const char *tbl_alias,
     }
 }
 
+/* A complete WITH predicate, placeholder included.  Returns 0 when this
+ * backend cannot express it, so the caller falls back to the verb.
+ *
+ * ANY VALUE MATCHES: a multivalued attribute is compared value by value, not
+ * as one string (ARCHITECTURE.md 5.2, and what the index path has always
+ * done).  A whole-attribute push-down made CREATE-INDEX change results (#173).
+ *
+ *   =   JSON_CONTAINS(attr, value)         — true if any value equals it,
+ *                                            and for a scalar attribute too
+ *   #   NOT JSON_CONTAINS([value], attr)   — "some value differs" is the
+ *                                            negation of "every value is it",
+ *                                            i.e. the attribute's values are
+ *                                            not all contained in {value}
+ *
+ * RANGES ARE NOT PUSHED for a raw attribute.  The per-value form needs
+ * JSON_TABLE, and JSON_TABLE does not correlate to an outer table from inside
+ * an EXISTS — measured: it silently matched nothing for `=` and everything for
+ * `#`.  A wrong push-down is worse than none, so those return 0.
+ *
+ * The CASE coerces a scalar — and an ABSENT attribute — to a one-element
+ * array, because MV reads a short record's attribute as one EMPTY value, which
+ * must still satisfy `# 'London'`. */
+static int my_pred(const char *col, int64_t attr, const char *op,
+                   const char *ph, int numeric, char *out, size_t cap) {
+    if (col && col[0]) {
+        char qc[300];
+        quote_ident(col, qc, sizeof qc);
+        if (numeric)
+            snprintf(out, cap, "CAST(%s AS DECIMAL(38,10)) %s "
+                     "CAST(%s AS DECIMAL(38,10))", qc, op, ph);
+        else
+            snprintf(out, cap, "%s %s %s", qc, op, ph);
+        return 1;
+    }
+    char ext[200], arr[420];
+    snprintf(ext, sizeof ext, "JSON_EXTRACT(doc, '$.\"%lld\"')", (long long)attr);
+    snprintf(arr, sizeof arr,
+             "CASE WHEN JSON_TYPE(%s) = 'ARRAY' THEN %s "
+             "ELSE JSON_ARRAY(COALESCE(JSON_UNQUOTE(%s),'')) END", ext, ext, ext);
+    /* CAST(... AS CHAR) around the value.  The driver binds it as BLOB, and a
+       binary string does not become a JSON string — JSON_ARRAY of it is
+       ["base64:type15:TG9uZG9u"], so the containment never matches and `#`
+       matched EVERY record.  Hand-written SQL hid this because a literal is
+       already text; it only shows through the bound parameter. */
+    if (strcmp(op, "=") == 0) {
+        snprintf(out, cap, "JSON_CONTAINS(%s, JSON_QUOTE(CAST(%s AS CHAR)))",
+                 ext, ph);
+        return 1;
+    }
+    if (strcmp(op, "<>") == 0 || strcmp(op, "!=") == 0) {
+        snprintf(out, cap, "NOT JSON_CONTAINS(JSON_ARRAY(CAST(%s AS CHAR)), %s)",
+                 ph, arr);
+        return 1;
+    }
+    return 0;                             /* a range: the verb answers it */
+}
+
 static const char *sql_op(const char *op) {
     if (!op || !op[0]) return NULL;
     if (op[0] == '=' && !op[1]) return "=";
@@ -939,13 +996,6 @@ static void index_name(my_file *f, const char *item, char *out, size_t cap) {
    than depend on a version or silently build something different on each,
    the raw-attribute case declines and the caller scans.  A dictionary field
    worth indexing is worth mapping. */
-/* The generated column carrying a raw attribute, so it can be indexed.  Named
-   from the attribute, not the dict item, because two items on one attribute are
-   one stored value read two ways (#158) and should share the column. */
-static void gen_col_name(int64_t attr, char *out, size_t cap) {
-    snprintf(out, cap, "mvxa%lld", (long long)attr);
-}
-
 static int my_index_create(mvx_file *fh, const char *item, const char *col,
                            int64_t attr) {
     my_file *f = (my_file *)fh;
@@ -955,31 +1005,20 @@ static int my_index_create(mvx_file *fh, const char *item, const char *col,
     quote_ident(nm, qn, sizeof qn);
 
     if (!col || !col[0]) {
-        /* AN UN-MAPPED ATTRIBUTE.  MySQL refuses a functional index on an
-           expression returning TEXT ("ERROR 3757: Cannot create a functional
-           index on an expression that returns a BLOB or TEXT"), which is why
-           raw attributes were not indexable here at all — the driver returned
-           -1 and the runtime built its own index instead.
-           A STORED GENERATED COLUMN carrying the same expression, with a PREFIX
-           index on it, gets there without changing what anything means: the
-           push-down query is untouched, and MySQL matches the expression to the
-           generated column and uses the index (measured: `key: ix`, ref access).
-           A prefix index is transparent — MySQL rechecks the full value — so
-           unlike a bounded CAST it does not make two long values compare equal.
-           The expression must be BYTE-IDENTICAL to the push-down's, so it comes
-           from field_expr, the same place. */
+        /* AN UN-MAPPED ATTRIBUTE gets a MULTI-VALUED index (8.0.17+), which is
+           the one kind JSON_CONTAINS can use — and JSON_CONTAINS is what the
+           any-value `=` push-down emits (#173).  An earlier version indexed a
+           STORED generated column carrying the whole-attribute expression;
+           that served a whole-attribute compare, which is the semantics #173
+           removed, so it would now sit unused.  Measured with this one:
+           `key: mvix`, range access.
+           MySQL refuses a plain functional index here — "ERROR 3757: Cannot
+           create a functional index on an expression that returns a BLOB or
+           TEXT" — which is why raw attributes were not indexable at all. */
         if (attr < 1) return -1;
-        char gen[64], qg[80], ex[700];
-        gen_col_name(attr, gen, sizeof gen);
-        quote_ident(gen, qg, sizeof qg);
-        field_expr(NULL, attr, NULL, ex, sizeof ex);
         snprintf(sql, sizeof sql,
-                 "ALTER TABLE %s ADD COLUMN %s TEXT AS (%s) STORED", qt, qg, ex);
-        /* 1060 = ER_DUP_FIELDNAME: the column is already there, which is what
-           makes a second CREATE-INDEX on the same attribute idempotent. */
-        if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1060) return -1;
-        snprintf(sql, sizeof sql, "CREATE INDEX %s ON %s (%s(255))",
-                 qn, qt, qg);
+                 "CREATE INDEX %s ON %s ((CAST(doc->'$.\"%lld\"' "
+                 "AS CHAR(255) ARRAY)))", qn, qt, (long long)attr);
         if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1061) return -1;
         char csql2[400];
         snprintf(csql2, sizeof csql2, "SELECT COUNT(*) FROM %s", qt);
@@ -1042,32 +1081,8 @@ static int my_index_drop(mvx_file *fh, const char *item) {
     quote_ident(f->table, qt, sizeof qt);
     index_name(f, item, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
-    /* Which column it covers, before dropping it: a raw-attribute index has a
-       generated column behind it (mvxa<n>) that would otherwise be left
-       orphaned on the table, still costing a write on every WRITE. */
-    char et[520], en[520], q[900], gen[256] = "";
-    mysql_real_escape_string(f->db, et, f->table, (unsigned long)strlen(f->table));
-    mysql_real_escape_string(f->db, en, nm, (unsigned long)strlen(nm));
-    snprintf(q, sizeof q,
-             "SELECT column_name FROM information_schema.statistics "
-             "WHERE table_schema = DATABASE() AND table_name = '%s' "
-             "AND index_name = '%s' ORDER BY seq_in_index LIMIT 1", et, en);
-    if (exec_sql(f->db, q)) {
-        MYSQL_RES *r = mysql_store_result(f->db);
-        MYSQL_ROW row = r ? mysql_fetch_row(r) : NULL;
-        if (row && row[0] && strncmp(row[0], "mvxa", 4) == 0)
-            snprintf(gen, sizeof gen, "%s", row[0]);
-        if (r) mysql_free_result(r);
-    }
     snprintf(sql, sizeof sql, "DROP INDEX %s ON %s", qn, qt);
-    int ok = exec_sql(f->db, sql) || mysql_errno(f->db) == 1091;  /* absent = done */
-    if (ok && gen[0]) {
-        char qg[300];
-        quote_ident(gen, qg, sizeof qg);
-        snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN %s", qt, qg);
-        exec_sql(f->db, sql);            /* best effort: the index is gone */
-    }
-    return ok;
+    return exec_sql(f->db, sql) || mysql_errno(f->db) == 1091;  /* absent = done */
 }
 
 /* ----------------------------------------------------- WITH push-down */
@@ -1092,8 +1107,9 @@ static mvx_cursor *my_select_attr(mvx_file *fh, int64_t attr, const char *op,
     if (!o || attr < 1) return NULL;
     char qt[300], ex[400], sql[1200];
     quote_ident(f->table, qt, sizeof qt);
-    field_expr(NULL, attr, NULL, ex, sizeof ex);
-    snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE %s %s ?", qt, ex, o);
+    char pex[900];
+    if (!my_pred(NULL, attr, o, "?", 0, pex, sizeof pex)) return NULL;
+    snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE %s", qt, pex);
     return run_ids(f->db, sql, &val, &vlen, 1);
 }
 
@@ -1109,19 +1125,16 @@ static mvx_cursor *my_select_multi(mvx_file *fh, const mvx_pred *preds,
     for (int i = 0; i < npred; i++) {
         const char *o = sql_op(preds[i].op);
         if (!o) return NULL;
-        char ex[600];
-        field_expr(preds[i].col, preds[i].attr, NULL, ex, sizeof ex);
         /* A numeric comparison casts both sides, so 9 < 10 rather than
            "10" < "9" -- the distinction MV draws between a numeric and a
-           text field. */
-        if (preds[i].numeric)
-            p += (size_t)snprintf(sql + p, sizeof sql - p,
-                                  "%sCAST(%s AS DECIMAL(38,10)) %s "
-                                  "CAST(? AS DECIMAL(38,10))",
-                                  i ? " AND " : "", ex, o);
-        else
-            p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s ?",
-                                  i ? " AND " : "", ex, o);
+           text field.  my_pred returns 0 for a raw-attribute RANGE, which it
+           cannot express here, and the whole multi-predicate push is then
+           abandoned so the verb answers all of it consistently. */
+        char ex[900];
+        if (!my_pred(preds[i].col, preds[i].attr, o, "?", preds[i].numeric,
+                     ex, sizeof ex)) return NULL;
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : "", ex);
         if (p >= sizeof sql) return NULL;
         vals[i] = preds[i].val;
         lens[i] = preds[i].vlen;
@@ -1177,9 +1190,9 @@ static mvx_cursor *my_select_order(mvx_file *fh, const char *fcol,
     if (fop && fop[0]) {
         const char *o = sql_op(fop);
         if (!o) return NULL;
-        char ex[600];
-        field_expr(fcol, fattr, NULL, ex, sizeof ex);
-        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?", ex, o);
+        char ex[900];
+        if (!my_pred(fcol, fattr, o, "?", 0, ex, sizeof ex)) return NULL;
+        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
         nb = 1;
     }
     p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", qo);
@@ -1200,9 +1213,9 @@ static int64_t my_count_where(mvx_file *fh, const char *col, int64_t attr,
     if (op && op[0]) {
         const char *o = sql_op(op);
         if (!o) return -1;
-        char ex[600];
-        field_expr(col, attr, NULL, ex, sizeof ex);
-        snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?", ex, o);
+        char ex[900];
+        if (!my_pred(col, attr, o, "?", 0, ex, sizeof ex)) return -1;
+        snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
         nb = 1;
     }
     MYSQL_STMT *st = mysql_stmt_init(f->db);
@@ -1246,10 +1259,11 @@ static int my_sum_where(mvx_file *fh, const char *sumcol, const char *fcol,
     if (fop && fop[0]) {
         const char *o = sql_op(fop);
         if (!o) return 0;
-        char ex[600];
-        field_expr(fcol, fattr, NULL, ex, sizeof ex);
+        char ex[900], lit[600];
         mysql_real_escape_string(f->db, esc, fval, (unsigned long)fvlen);
-        snprintf(sql + p, sizeof sql - p, " WHERE %s %s '%s'", ex, o, esc);
+        snprintf(lit, sizeof lit, "'%s'", esc);
+        if (!my_pred(fcol, fattr, o, lit, 0, ex, sizeof ex)) return 0;
+        snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
     }
     if (!exec_sql(f->db, sql)) return 0;
     MYSQL_RES *r = mysql_store_result(f->db);
@@ -1322,16 +1336,12 @@ static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
     for (int i = 0; i < npred; i++) {
         const char *o = sql_op(preds[i].op);
         if (!o) return 0;
-        char ex[600];
-        field_expr(preds[i].col, preds[i].attr, NULL, ex, sizeof ex);
-        if (preds[i].numeric)
-            p += (size_t)snprintf(sql + p, sizeof sql - p,
-                                  "%sCAST(%s AS DECIMAL(38,10)) %s "
-                                  "CAST(? AS DECIMAL(38,10))",
-                                  i ? " AND " : " WHERE ", ex, o);
-        else
-            p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s ?",
-                                  i ? " AND " : " WHERE ", ex, o);
+        /* The plan shown must be the plan run, per-value form included. */
+        char ex[900];
+        if (!my_pred(preds[i].col, preds[i].attr, o, "?", preds[i].numeric,
+                     ex, sizeof ex)) return 0;
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : " WHERE ", ex);
         if (p >= sizeof sql) return 0;
     }
     if (ocol && ocol[0]) {

@@ -3039,6 +3039,19 @@ if [ -n "${MVX_MYSQL:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 
   AGOUT="$AGOUT
 mysql             $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
 fi
+# AND THE INDEX MUST NOT CHANGE THE ANSWER.  This is the axis the comparison
+# above cannot see: the scan and all four push-downs agreed with each other
+# while all disagreeing with the INDEX path, which is the one implementing the
+# documented semantics (ARCHITECTURE.md 5.2).  Building an index changed query
+# results (mvx#173) and nothing noticed.
+AG_BIND="" ag_seed "$AGACC/ix"
+IXBEFORE=$(ag_answers "$AGACC/ix")
+"$TCL" -a "$AGACC/ix" -c 'CREATE-INDEX CUST CITY' >/dev/null 2>&1
+"$TCL" -a "$AGACC/ix" -c 'CREATE-INDEX CUST QTY' >/dev/null 2>&1
+IXAFTER=$(ag_answers "$AGACC/ix")
+AGOUT="$AGOUT
+unindexed         $IXBEFORE
+indexed           $IXAFTER$([ "$IXAFTER" = "$IXBEFORE" ] || echo '   <-- INDEX CHANGED THE ANSWER')"
 check tcl-backends-agree "$AGOUT"
 
 echo "== byte accessor discipline"

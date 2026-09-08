@@ -886,6 +886,50 @@ static void field_expr(const char *col, int64_t attr, char *out, size_t cap) {
              (long long)attr);
 }
 
+/* A complete WITH predicate, placeholder included.
+ *
+ * ANY VALUE MATCHES.  A multivalued attribute is compared value by value, not
+ * as one string, so `= 'London'` matches a record whose attribute is
+ * London]York, and `# 'London'` does NOT match one whose every value is
+ * London.  That is what the index path has always done (ARCHITECTURE.md 5.2)
+ * and what the verb does; a push-down that compared the whole attribute made
+ * CREATE-INDEX change query results (mvx#173).
+ *
+ * json_each over the attribute gives one row per value.  The CASE wraps a
+ * scalar — and an ABSENT attribute — into a one-element array, because
+ * json_each yields nothing for a missing key while MV reads a short record's
+ * attribute as one EMPTY value, which must still satisfy `# 'London'`.
+ *
+ * A mapped column is a single stored value and keeps the direct comparison. */
+static void sq_pred(const char *col, int64_t attr, const char *op,
+                    const char *ph, int numeric, char *out, size_t cap) {
+    if (col && col[0]) {
+        char qc[300];
+        quote_ident(col, qc, sizeof qc);
+        if (numeric)
+            snprintf(out, cap, "CAST(%s AS REAL) %s CAST(%s AS REAL)", qc, op, ph);
+        else
+            snprintf(out, cap, "%s %s %s", qc, op, ph);
+        return;
+    }
+    char path[64];
+    snprintf(path, sizeof path, "'$.\"%lld\"'", (long long)attr);
+    if (numeric)
+        snprintf(out, cap,
+                 "EXISTS (SELECT 1 FROM json_each("
+                 "CASE WHEN json_type(doc,%s) = 'array' THEN json_extract(doc,%s) "
+                 "ELSE json_array(COALESCE(json_extract(doc,%s),'')) END) mv "
+                 "WHERE CAST(mv.value AS REAL) %s CAST(%s AS REAL))",
+                 path, path, path, op, ph);
+    else
+        snprintf(out, cap,
+                 "EXISTS (SELECT 1 FROM json_each("
+                 "CASE WHEN json_type(doc,%s) = 'array' THEN json_extract(doc,%s) "
+                 "ELSE json_array(COALESCE(json_extract(doc,%s),'')) END) mv "
+                 "WHERE mv.value %s %s)",
+                 path, path, path, op, ph);
+}
+
 static const char *sql_op(const char *op) {
     if (!op || !op[0]) return NULL;
     if (op[0] == '=' && !op[1]) return "=";
@@ -928,8 +972,8 @@ static mvx_cursor *sq_select_attr(mvx_file *fh, int64_t attr, const char *op,
     if (!o || attr < 1) return NULL;
     char qt[300], ex[400], sql[900];
     quote_ident(f->table, qt, sizeof qt);
-    field_expr(NULL, attr, ex, sizeof ex);
-    snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE %s %s ?1", qt, ex, o);
+    sq_pred(NULL, attr, o, "?1", 0, ex, sizeof ex);
+    snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE %s", qt, ex);
     return run_ids(f->db, sql, &val, &vlen, 1);
 }
 
@@ -947,18 +991,16 @@ static mvx_cursor *sq_select_multi(mvx_file *fh, const mvx_pred *preds,
     for (int i = 0; i < npred; i++) {
         const char *o = sql_op(preds[i].op);
         if (!o) return NULL;
-        char ex[400];
-        field_expr(preds[i].col, preds[i].attr, ex, sizeof ex);
+        char ex[900], ph[16];
+        snprintf(ph, sizeof ph, "?%d", i + 1);
         /* A numeric comparison casts both sides, so 9 < 10 rather than
            "10" < "9" — the same distinction MV draws between a numeric
-           and a text field. */
-        if (preds[i].numeric)
-            p += (size_t)snprintf(sql + p, sizeof sql - p,
-                                  "%sCAST(%s AS REAL) %s CAST(?%d AS REAL)",
-                                  i ? " AND " : "", ex, o, i + 1);
-        else
-            p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s ?%d",
-                                  i ? " AND " : "", ex, o, i + 1);
+           and a text field.  sq_pred puts the cast inside the per-value
+           test for a raw attribute. */
+        sq_pred(preds[i].col, preds[i].attr, o, ph, preds[i].numeric,
+                ex, sizeof ex);
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : "", ex);
         if (p >= sizeof sql) return NULL;
         vals[i] = preds[i].val;
         lens[i] = preds[i].vlen;
@@ -1028,8 +1070,8 @@ static mvx_cursor *sq_select_order(mvx_file *fh, const char *fcol,
         const char *o = sql_op(fop);
         if (!o) return NULL;
         char ex[400];
-        field_expr(fcol, fattr, ex, sizeof ex);
-        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?1", ex, o);
+        sq_pred(fcol, fattr, o, "?1", 0, ex, sizeof ex);
+        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
         nb = 1;
     }
     p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", qo);
@@ -1051,8 +1093,8 @@ static int64_t sq_count_where(mvx_file *fh, const char *col, int64_t attr,
         const char *o = sql_op(op);
         if (!o) return -1;
         char ex[400];
-        field_expr(col, attr, ex, sizeof ex);
-        snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?1", ex, o);
+        sq_pred(col, attr, o, "?1", 0, ex, sizeof ex);
+        snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
         nb = 1;
     }
     sqlite3_stmt *st = NULL;
@@ -1079,8 +1121,8 @@ static int sq_sum_where(mvx_file *fh, const char *sumcol, const char *fcol,
         const char *o = sql_op(fop);
         if (!o) return 0;
         char ex[400];
-        field_expr(fcol, fattr, ex, sizeof ex);
-        snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?1", ex, o);
+        sq_pred(fcol, fattr, o, "?1", 0, ex, sizeof ex);
+        snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
         nb = 1;
     }
     sqlite3_stmt *st = NULL;
