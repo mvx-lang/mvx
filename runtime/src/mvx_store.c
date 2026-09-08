@@ -2450,9 +2450,17 @@ int64_t mvx_orderselect(mvx_ctx *ctx, const mv_value *fvar,
     if (!o) return 0;
 
     int otext = 0;
-    const char *ocol = map_order_col(o, mv_get_int(oattr_v),
-                                     (int)mv_get_int(onum_v), &otext);
-    if (!ocol) return 0;                  /* order field not a matching column */
+    int64_t oattr = mv_get_int(oattr_v);
+    int onum = (int)mv_get_int(onum_v);
+    /* A mapped column of the right type sorts natively; otherwise the driver
+       sorts the raw attribute out of the document (#157).  This used to give
+       up here, which is why every BY on an un-mapped field was sorted in the
+       verb after streaming every id. */
+    const char *ocol = map_order_col(o, oattr, onum, &otext);
+    if (!ocol) {
+        if (oattr < 1) return 0;          /* @ID / I-type: nothing to push */
+        otext = !onum;
+    }
 
     /* optional filter, pushable like the others */
     const char *fcol = NULL, *fop = "", *fval = NULL;
@@ -2479,7 +2487,8 @@ int64_t mvx_orderselect(mvx_ctx *ctx, const mv_value *fvar,
     }
 
     mvx_cursor *c = b->driver->select_order(f, fcol, fattr, fop, fval, fvl,
-                                            ocol, otext, mv_get_int(limit_v));
+                                            ocol, oattr, onum, otext,
+                                            mv_get_int(limit_v));
     if (!c) return 0;
     store_state *st = state(ctx);
     clear_select(st);

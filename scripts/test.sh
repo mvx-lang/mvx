@@ -2936,10 +2936,12 @@ OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
 OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
 WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L":@AM:"S" ON D, "NAME"
 WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
-WRITE "Ada":@AM:"London" ON F, "C1"
-WRITE "Grace":@AM:"York" ON F, "C2"
-WRITE "Alan":@AM:"London":@VM:"York" ON F, "C3"
-WRITE "Edsger":@AM:"" ON F, "C4"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"6R":@AM:"S" ON D, "QTY"
+WRITE "Ada":@AM:"London":@AM:"9" ON F, "C1"
+WRITE "Grace":@AM:"York":@AM:"10" ON F, "C2"
+WRITE "Alan":@AM:"London":@VM:"York":@AM:"100" ON F, "C3"
+WRITE "Edsger":@AM:"":@AM:"abc" ON F, "C4"
+WRITE "Barbara":@AM:"Perth":@AM:"7":@VM:"8" ON F, "C5"
 AGEOF
 "$MVX" "$TESTROOT/agseed.b" -o "$TESTROOT/agseedbin" >/dev/null 2>&1
 
@@ -2949,7 +2951,14 @@ ag_answers() {
   n1=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
   n2=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY # "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
   n3=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = ""' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
-  printf '=London:%s #London:%s =empty:%s' "${n1:-?}" "${n2:-?}" "${n3:-?}"
+  # ORDER BY a RAW attribute, both ways.  QTY is right-justified, so BY QTY is
+  # MV's NUMERIC sort (9 before 10 before 100) while BY CITY is its byte sort —
+  # and a pushed-down ORDER has to produce what the verb produces, including
+  # where a multivalued and an empty attribute land.
+  o1=$("$TCL" -a "$a" -c 'SORT CUST BY QTY @ID' 2>&1 | sed -n 's/^\(C[0-9]\) .*/\1/p' | tr -d '\n')
+  o2=$("$TCL" -a "$a" -c 'SORT CUST BY CITY @ID' 2>&1 | sed -n 's/^\(C[0-9]\) .*/\1/p' | tr -d '\n')
+  printf '=London:%s #London:%s =empty:%s byQTY:%s byCITY:%s' \
+         "${n1:-?}" "${n2:-?}" "${n3:-?}" "${o1:-?}" "${o2:-?}"
 }
 ag_seed() { # ag_seed <dir> [create-args]
   d="$1"; shift

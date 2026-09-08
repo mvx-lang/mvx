@@ -221,11 +221,24 @@ typedef struct mvx_driver {
        mapped column `ocol` (text ordered COLLATE "C" to match MV's byte sort
        when `otext`, else natural order), limited to `limit` rows (0 = all),
        optionally filtered like the other push-downs.  So a "top-N by field"
-       fetches N ids server-side.  NULL result = cannot push (caller sorts). */
+       fetches N ids server-side.  NULL result = cannot push (caller sorts).
+
+       When `ocol` is NULL the sort field is the RAW attribute `oattr`, taken
+       from the document (#157) — mapped columns still exist and are still
+       typed, so they keep the `ocol` path; this is the case that used to fall
+       back to the verb because there was no column to name.  `onum` says the
+       dictionary calls it numeric, which is the same flag MV's own sort uses.
+
+       A NUMERIC sort of a raw attribute MUST be cast in the GUARDED form:
+       postgres and mongo fail the whole query on one un-castable value, while
+       sqlite and mysql silently read it as 0.  And the order MV produces is
+       numbers ascending FIRST, then the values that are not numbers — NOT the
+       other way round, whatever #157's prose says; it was measured against the
+       verb, which is the only authority on what a push-down has to reproduce. */
     mvx_cursor *(*select_order)(mvx_file *f, const char *fcol, int64_t fattr,
                                 const char *fop, const char *fval,
-                                int64_t fvlen, const char *ocol, int otext,
-                                int64_t limit);
+                                int64_t fvlen, const char *ocol, int64_t oattr,
+                                int onum, int otext, int64_t limit);
     /* Optional multi-condition WITH push-down (may be NULL): the ids matching
        every predicate (AND).  Each `mvx_pred` names a mapped column `col` or
        the raw record attribute `attr`, an op ("=","#",">","<",">=","<="), and
@@ -341,7 +354,7 @@ typedef struct mvx_file_base {
    It must return NULL if `abi` is not an ABI version it supports,
    otherwise its driver vtable.  The search path is $MVXDRIVERS
    (colon-separated), then the runtime's built-in driver directory. */
-#define MVX_DRIVER_ABI 12
+#define MVX_DRIVER_ABI 13
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

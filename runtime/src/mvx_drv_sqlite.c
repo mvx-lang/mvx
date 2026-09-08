@@ -970,16 +970,58 @@ static mvx_cursor *sq_select_multi(mvx_file *fh, const mvx_pred *preds,
    collation is exactly that, so `otext` needs no special collation the
    way postgres needs COLLATE "C" — the note is here because the absence
    of a COLLATE clause otherwise looks like an oversight. */
+/* The ORDER BY expression for a RAW attribute, reproducing MV's own sort.
+ *
+ * A numeric sort is the value CAST — guarded, because sqlite quietly reads a
+ * non-numeric as 0 and would then interleave it among the numbers.  The order
+ * MV produces is the numbers ascending FIRST and the non-numbers after, so the
+ * guard sorts on "is this not a number" before the number itself.  (#157's
+ * prose says non-numerics come first; the verb says otherwise, and the verb is
+ * what a push-down has to reproduce.)
+ *
+ * A text sort is the value itself, byte-ordered. */
+static void sq_order_expr(int64_t attr, int onum, char *out, size_t cap) {
+    char v[400];
+    field_expr(NULL, attr, v, sizeof v);
+    if (onum)
+        snprintf(out, cap,
+                 "CASE WHEN %s GLOB '-[0-9]*' OR %s GLOB '[0-9]*' "
+                 "THEN 0 ELSE 1 END, "
+                 "CASE WHEN %s GLOB '-[0-9]*' OR %s GLOB '[0-9]*' "
+                 "THEN CAST(%s AS REAL) END, %s",
+                 v, v, v, v, v, v);
+    else
+        snprintf(out, cap, "%s COLLATE BINARY", v);
+}
+
 static mvx_cursor *sq_select_order(mvx_file *fh, const char *fcol,
                                    int64_t fattr, const char *fop,
                                    const char *fval, int64_t fvlen,
-                                   const char *ocol, int otext,
-                                   int64_t limit) {
+                                   const char *ocol, int64_t oattr, int onum,
+                                   int otext, int64_t limit) {
     sq_file *f = (sq_file *)fh;
-    if (!ocol || !ocol[0]) return NULL;
-    char qt[300], qo[300], sql[1400];
+    /* RAW attribute: only a NUMERIC sort is pushed.
+       A text sort of a raw attribute would have to reproduce MV's byte order
+       over the whole attribute, and a multivalued one is a JSON ARRAY whose
+       text begins with '[' — so it collates after 'York' where MV puts
+       "London<VM>York" between "London" and "York".  Measured against the
+       verb.  Rebuilding MV's text (json_each + group_concat, or the postgres
+       equivalent) would fix the order but is not indexable and is unlikely to
+       beat sorting in the verb, which is what happens when this returns NULL.
+       The numeric case has no such problem: the cast is exact, and it is the
+       one that makes a top-N worth pushing. */
+    if (!ocol || !ocol[0]) {
+        if (oattr < 1 || !onum) return NULL;
+    }
+    char qt[300], qo[1600], sql[2600];
     quote_ident(f->table, qt, sizeof qt);
-    quote_ident(ocol, qo, sizeof qo);
+    if (ocol && ocol[0]) {
+        char qc[300];
+        quote_ident(ocol, qc, sizeof qc);
+        snprintf(qo, sizeof qo, "%s%s", qc, otext ? " COLLATE BINARY" : "");
+    } else {
+        sq_order_expr(oattr, onum, qo, sizeof qo);
+    }
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT id FROM %s", qt);
     int nb = 0;
     if (fop && fop[0]) {
@@ -990,8 +1032,7 @@ static mvx_cursor *sq_select_order(mvx_file *fh, const char *fcol,
         p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?1", ex, o);
         nb = 1;
     }
-    p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s%s",
-                          qo, otext ? " COLLATE BINARY" : "");
+    p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", qo);
     if (limit > 0)
         snprintf(sql + p, sizeof sql - p, " LIMIT %lld", (long long)limit);
     return run_ids(f->db, sql, &fval, &fvlen, nb);

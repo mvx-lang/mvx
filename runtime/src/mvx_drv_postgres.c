@@ -1263,16 +1263,54 @@ static int pg_sum_where(mvx_file *fh, const char *sumcol, const char *fcol,
 /* ORDER BY / LIMIT push-down (optionally filtered): the ids ordered by a
    mapped column — COLLATE "C" for text to match MV's byte sort — and limited
    server-side, so a top-N fetches N ids instead of the whole file. */
+/* The ORDER BY expression for a RAW attribute, reproducing MV's own sort.
+   Numbers ascending FIRST, then everything that is not a number — measured
+   against the verb, which contradicts #157's prose.  The cast is guarded
+   because postgres fails the ENTIRE query on one un-castable value. */
+static void pg_order_expr(int64_t attr, int onum, char *out, size_t cap) {
+    char v[400];
+    pg_attr_expr(attr, NULL, v, sizeof v);
+    if (onum)
+        snprintf(out, cap,
+                 "(%s ~ '^-?[0-9]+(\\.[0-9]+)?$') DESC, "
+                 "CASE WHEN %s ~ '^-?[0-9]+(\\.[0-9]+)?$' "
+                 "THEN %s::numeric END, %s COLLATE \"C\"",
+                 v, v, v, v);
+    else
+        snprintf(out, cap, "%s COLLATE \"C\"", v);
+}
+
 static mvx_cursor *pg_select_order(mvx_file *fh, const char *fcol,
                                    int64_t fattr, const char *fop,
                                    const char *fval, int64_t fvlen,
-                                   const char *ocol, int otext,
-                                   int64_t limit) {
+                                   const char *ocol, int64_t oattr, int onum,
+                                   int otext, int64_t limit) {
     pg_file *f = (pg_file *)fh;
+    /* RAW attribute: only a NUMERIC sort is pushed.
+       A text sort of a raw attribute would have to reproduce MV's byte order
+       over the whole attribute, and a multivalued one is a JSON ARRAY whose
+       text begins with '[' — so it collates after 'York' where MV puts
+       "London<VM>York" between "London" and "York".  Measured against the
+       verb.  Rebuilding MV's text (json_each + group_concat, or the postgres
+       equivalent) would fix the order but is not indexable and is unlikely to
+       beat sorting in the verb, which is what happens when this returns NULL.
+       The numeric case has no such problem: the cast is exact, and it is the
+       one that makes a top-N worth pushing. */
+    if (!ocol || !ocol[0]) {
+        if (oattr < 1 || !onum) return NULL;
+    }
     char qt[512];
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
-    char *qo = PQescapeIdentifier(f->conn, ocol, strlen(ocol));
-    char sql[1200];
+    char ordbuf[1800];
+    if (ocol && ocol[0]) {
+        char *qc = PQescapeIdentifier(f->conn, ocol, strlen(ocol));
+        snprintf(ordbuf, sizeof ordbuf, "%s%s", qc ? qc : "\"\"",
+                 otext ? " COLLATE \"C\"" : "");
+        if (qc) PQfreemem(qc);
+    } else {
+        pg_order_expr(oattr, onum, ordbuf, sizeof ordbuf);
+    }
+    char sql[3000];
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT id FROM %s", qt);
     const char *pv[1] = {fval};
     int pl[1] = {(int)fvlen}, pf[1] = {0};
@@ -1281,7 +1319,7 @@ static mvx_cursor *pg_select_order(mvx_file *fh, const char *fcol,
         const char *sqlop;
         if (fop[0] == '=' && !fop[1]) sqlop = "=";
         else if (fop[0] == '#' && !fop[1]) sqlop = fcol ? "IS DISTINCT FROM" : "<>";
-        else { if (qo) PQfreemem(qo); return NULL; }
+        else { return NULL; }
         char expr[400];
         if (fcol && fcol[0]) {
             char *qc = PQescapeIdentifier(f->conn, fcol, strlen(fcol));
@@ -1294,11 +1332,9 @@ static mvx_cursor *pg_select_order(mvx_file *fh, const char *fcol,
                               expr, sqlop);
         nparam = 1;
     }
-    p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s%s",
-                          qo ? qo : "\"\"", otext ? " COLLATE \"C\"" : "");
+    p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", ordbuf);
     if (limit > 0)
         snprintf(sql + p, sizeof sql - p, " LIMIT %lld", (long long)limit);
-    if (qo) PQfreemem(qo);
     PGresult *r = PQexecParams(f->conn, sql, nparam, NULL, pv, pl, pf, 1);
     if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
         if (r) PQclear(r);

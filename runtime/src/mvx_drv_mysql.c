@@ -1062,17 +1062,47 @@ static mvx_cursor *my_select_multi(mvx_file *fh, const mvx_pred *preds,
 
 /* ORDER BY / LIMIT.  No COLLATE clause: the columns are VARBINARY, which
    already orders by bytes -- which is what MV's sort is. */
+/* The ORDER BY expression for a RAW attribute, reproducing MV's own sort.
+   Numbers ascending FIRST, then everything that is not a number — measured
+   against the verb.  The cast is guarded: mysql reads a non-numeric as 0
+   without complaint, which would interleave it among the numbers. */
+static void my_order_expr(int64_t attr, int onum, char *out, size_t cap) {
+    char v[600];
+    field_expr(NULL, attr, NULL, v, sizeof v);
+    if (onum)
+        snprintf(out, cap,
+                 "(%s REGEXP '^-?[0-9]+([.][0-9]+)?$') DESC, "
+                 "CASE WHEN %s REGEXP '^-?[0-9]+([.][0-9]+)?$' "
+                 "THEN CAST(%s AS DECIMAL(38,10)) END, %s",
+                 v, v, v, v);
+    else
+        snprintf(out, cap, "%s", v);
+}
+
 static mvx_cursor *my_select_order(mvx_file *fh, const char *fcol,
                                    int64_t fattr, const char *fop,
                                    const char *fval, int64_t fvlen,
-                                   const char *ocol, int otext,
-                                   int64_t limit) {
+                                   const char *ocol, int64_t oattr, int onum,
+                                   int otext, int64_t limit) {
     my_file *f = (my_file *)fh;
     (void)otext;
-    if (!ocol || !ocol[0]) return NULL;
-    char qt[300], qo[300], sql[1600];
+    /* RAW attribute: only a NUMERIC sort is pushed.
+       A text sort of a raw attribute would have to reproduce MV's byte order
+       over the whole attribute, and a multivalued one is a JSON ARRAY whose
+       text begins with '[' — so it collates after 'York' where MV puts
+       "London<VM>York" between "London" and "York".  Measured against the
+       verb.  Rebuilding MV's text (json_each + group_concat, or the postgres
+       equivalent) would fix the order but is not indexable and is unlikely to
+       beat sorting in the verb, which is what happens when this returns NULL.
+       The numeric case has no such problem: the cast is exact, and it is the
+       one that makes a top-N worth pushing. */
+    if (!ocol || !ocol[0]) {
+        if (oattr < 1 || !onum) return NULL;
+    }
+    char qt[300], qo[2600], sql[4000];
     quote_ident(f->table, qt, sizeof qt);
-    quote_ident(ocol, qo, sizeof qo);
+    if (ocol && ocol[0]) quote_ident(ocol, qo, sizeof qo);
+    else my_order_expr(oattr, onum, qo, sizeof qo);
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT id FROM %s", qt);
     int nb = 0;
     if (fop && fop[0]) {
