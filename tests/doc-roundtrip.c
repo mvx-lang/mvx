@@ -195,37 +195,41 @@ static void mapped(void) {
        "C1" AM "5" AM "10" AM "a" VM "b", &spec);
     mv_clear(&spec);
 
-    printf("doc-roundtrip: numbers are carried only when they survive it\n");
+    printf("doc-roundtrip: every value is a string, whatever the type says\n");
+    /* The document is the only copy, so a value has to come back as written.
+       A JSON number cannot promise that (007 -> 7, -0 -> 0, and 9.90 -> 9.9 on
+       a backend whose JSON numbers are doubles), so nothing is stored as one.
+       Ordering moves to the query, where the value is cast — always guarded. */
     mv_value ns;
     mv_init(&ns); mv_set_str(&ns, "", 0);
     spec_add(&ns, "N", 1, "", "NUMERIC", "");
-    MD("a plain integer is a number",   "990",   &ns, "{\"N\":990}");
-    MD("a scale-preserving decimal",    "9.90",  &ns, "{\"N\":9.90}");
-    MD("a leading zero stays text",     "007",   &ns, "{\"N\":\"007\"}");
-    MD("minus zero stays text",         "-0",    &ns, "{\"N\":\"-0\"}");
-    /* 1e3, +5 and N/A never reach the guard: map_cell coerces a value to the
-       DECLARED type before the codec sees it, and for NUMERIC it hands over
-       13, 5 and (for N/A) nothing at all.  Pinned here so a change in that
-       coercion shows up as a failure in the layer that depends on it — see the
-       note on #157, because "N/A" becoming empty is a value the blob keeps
-       today and a document that replaces the blob would not. */
-    MD("an exponent is coerced upstream", "1e3", &ns, "{\"N\":13}");
-    MD("so is a leading plus",            "+5",  &ns, "{\"N\":5}");
-    MD("a non-number does not fit at all","N/A", &ns, "{\"N\":\"\"}");
+    MD("a plain integer is still text",  "990",  &ns, "{\"N\":\"990\"}");
+    MD("and a decimal keeps its scale",  "9.90", &ns, "{\"N\":\"9.90\"}");
+    MD("a leading zero survives",        "007",  &ns, "{\"N\":\"007\"}");
+    MD("so does minus zero",             "-0",   &ns, "{\"N\":\"-0\"}");
+    /* These three used to be mangled or lost by the coercion to the declared
+       type — 1e3 became 13, +5 became 5, and N/A did not fit at all and
+       arrived EMPTY.  With no blob behind the document that last one was a
+       value gone for good, which is why nothing is coerced on the way in. */
+    MD("an exponent is not rewritten",   "1e3",  &ns, "{\"N\":\"1e3\"}");
+    MD("nor a leading plus",             "+5",   &ns, "{\"N\":\"+5\"}");
+    MD("a non-number is KEPT, not lost", "N/A",  &ns, "{\"N\":\"N/A\"}");
     MT("990 round-trips",  "990",  &ns);
     MT("9.90 round-trips", "9.90", &ns);
     MT("007 round-trips",  "007",  &ns);
     MT("-0 round-trips",   "-0",   &ns);
+    MT("1e3 round-trips",  "1e3",  &ns);
+    MT("+5 round-trips",   "+5",   &ns);
+    MT("N/A round-trips",  "N/A",  &ns);
     mv_clear(&ns);
 
-    /* The same values under a TEXT field, where nothing coerces them: the
-       guard is not consulted and they stay exactly as written. */
+    /* A TEXT field stores exactly the same thing, which is the point: the
+       declared type no longer changes what is stored, only how it is read. */
     mv_value ts;
     mv_init(&ts); mv_set_str(&ts, "", 0);
-    spec_add(&ts, "T", 1, "", "TEXT", "");
-    MD("text leaves an exponent alone", "1e3", &ts, "{\"T\":\"1e3\"}");
-    MT("and it round-trips",            "1e3", &ts);
-    MT("so does a non-number",          "N/A", &ts);
+    spec_add(&ts, "N", 1, "", "TEXT", "");
+    MD("TEXT stores the same bytes",     "9.90", &ts, "{\"N\":\"9.90\"}");
+    MD("and the same for a non-number",  "N/A",  &ts, "{\"N\":\"N/A\"}");
     mv_clear(&ts);
 }
 

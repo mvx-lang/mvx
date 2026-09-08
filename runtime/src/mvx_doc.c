@@ -454,61 +454,26 @@ void mvx_doc_decode(mv_value *dst, const mv_value *doc) {
 
 /* ---------------------------------------------------------- mapped form */
 
-/* Is s..n a number this representation may store AS a number?
+/* One mapped cell as a JSON value.
  *
- * The rule from #157 is that a value is carried as a number only when
- * formatting it back yields the identical string — the declaration says what
- * the field IS, and this decides whether THIS value can be carried as one
- * without changing it.  So the grammar is deliberately narrower than JSON's:
+ * ALWAYS A STRING.  The document is the only copy of the record, so a value
+ * has to come back as it was written, and a JSON number cannot promise that:
+ * 007 returns as 7, -0 as 0, and on a backend whose JSON numbers are doubles
+ * 9.90 as 9.9.  Storing the text instead makes the round trip unconditional
+ * rather than something each value has to qualify for, and it removes the
+ * per-backend divergence in what "a number" preserves.
  *
- *   007      rejected — comes back 7
- *   -0       rejected — comes back 0
- *   1e3      rejected — comes back 1000
- *   +5, " 5" rejected — not JSON numbers at all
- *   9.90     ACCEPTED — the trailing zero is part of the text and survives it
+ * Ordering and ranges are not given up with it — they move to the query, where
+ * the value is CAST, always in the guarded form (#157): postgres and mongo fail
+ * an entire query on one un-castable value, and sqlite and mysql silently turn
+ * it into 0, so the guard is not optional on any of them.  That also matches
+ * what MV already does with non-numeric data in a numeric sort.
  *
- * 9.90 is the case worth keeping: MV money is the stored digits, and a decimal
- * carrier that preserves scale (postgres numeric, mongo Decimal128) round-trips
- * it exactly.  A backend whose JSON numbers are doubles will return 9.9 and
- * must tighten this further; that is a backend's guard to add, not a reason to
- * reject the value here. */
-static int doc_number(const char *s, int64_t n) {
-    if (n <= 0) return 0;
-    int64_t i = 0;
-    int neg = 0;
-    if (s[i] == '-') { neg = 1; i++; }
-    if (i >= n) return 0;
-    int64_t ds = i;
-    if (s[i] == '0') {
-        i++;
-        if (i < n && s[i] >= '0' && s[i] <= '9') return 0;   /* 007 */
-    } else {
-        if (s[i] < '1' || s[i] > '9') return 0;
-        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
-    }
-    int allzero = 1;
-    for (int64_t k = ds; k < i; k++) if (s[k] != '0') { allzero = 0; break; }
-    if (i < n && s[i] == '.') {
-        i++;
-        if (i >= n || s[i] < '0' || s[i] > '9') return 0;    /* "1." */
-        while (i < n && s[i] >= '0' && s[i] <= '9') {
-            if (s[i] != '0') allzero = 0;
-            i++;
-        }
-    }
-    if (i != n) return 0;                     /* exponents, trailing junk */
-    if (neg && allzero) return 0;             /* -0, -0.0 come back unsigned */
-    return 1;
-}
-
-/* One mapped cell as a JSON value.  Empty is "" — the shape #157's ragged
-   association example uses for the positions a short member does not reach. */
-static void db_cell(dbuf *b, const char *type, const char *cell, int64_t cl) {
+ * Empty is "" — the shape #157's ragged association example uses for the
+ * positions a short member does not reach. */
+static void db_cell(dbuf *b, const char *cell, int64_t cl) {
     if (cl <= 0) { db_raw(b, "\"\"", 2); return; }
-    if (strcmp(type, "NUMERIC") == 0 && doc_number(cell, cl))
-        db_raw(b, cell, (size_t)cl);
-    else
-        db_leaf(b, cell, (size_t)cl);
+    db_leaf(b, cell, (size_t)cl);
 }
 
 /* Does any mapped field cover attribute `ano`? */
@@ -543,9 +508,15 @@ void mvx_doc_encode_mapped(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
         first = 0;
         db_str(&b, m.names[i], strlen(m.names[i]));
         db_raw(&b, ":", 1);
-        int64_t cl = map_cell(ctx, rec, m.anos[i], 0, m.convs[i], m.types[i],
+        /* TEXT, not m.types[i].  Coercing to the declared type here is what
+           loses data: a value that does not satisfy its type does not merely
+           fail to convert, it arrives EMPTY (map_cell returns -1 for "N/A" in
+           a NUMERIC field), and with no blob behind the document that value is
+           simply gone.  The declaration says how to READ the field, and that
+           is applied by the cast at query time. */
+        int64_t cl = map_cell(ctx, rec, m.anos[i], 0, m.convs[i], "TEXT",
                               &av, &ov, &code, cell, sizeof cell);
-        db_cell(&b, m.types[i], cell, cl);
+        db_cell(&b, cell, cl);
     }
 
     char *an[MAP_MAXA];
@@ -572,9 +543,9 @@ void mvx_doc_encode_mapped(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
                 db_str(&b, m.names[i], strlen(m.names[i]));
                 db_raw(&b, ":", 1);
                 int64_t cl = map_cell(ctx, rec, m.anos[i], seq, m.convs[i],
-                                      m.types[i], &av, &ov, &code, cell,
+                                      "TEXT", &av, &ov, &code, cell,
                                       sizeof cell);
-                db_cell(&b, m.types[i], cell, cl);
+                db_cell(&b, cell, cl);
             }
             db_raw(&b, "}", 1);
         }
@@ -640,7 +611,8 @@ static void put_cell(mvx_ctx *ctx, mv_value *rec, const mapmeta *m, int fi,
                      int64_t seq, dbuf *cell) {
     mv_value val, tmp, code;
     mv_init(&val); mv_init(&tmp); mv_init(&code);
-    map_uncell(ctx, m->types[fi], m->convs[fi], cell->p ? cell->p : "",
+    /* TEXT here too — the inverse of how it was stored. */
+    map_uncell(ctx, "TEXT", m->convs[fi], cell->p ? cell->p : "",
                (int64_t)cell->len, &val, &tmp, &code);
     /* An EMPTY cell is not written.  A ragged association pads its short
        members to the row count, so writing those pads back would append a

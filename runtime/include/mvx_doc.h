@@ -90,10 +90,23 @@ void mvx_doc_decode(mv_value *dst, const mv_value *doc);
  * than restated: taking the minimum, or zipping until the first field runs
  * out, silently drops a line item and leaves a well-formed record behind.
  *
- * Round-trip exactness holds for identity fields.  A converted field is only
- * as reversible as its conversion — MD/MR/ML have dropped the raw digits by
- * the time they are stored — which is why #158 makes native mode take one
- * mapping per attribute and name the one to keep.
+ * EVERY VALUE IS A STRING, whatever type the dictionary declares.  The document
+ * is the only copy of the record, so a value must come back as it was written,
+ * and neither a JSON number nor a coercion to the declared type can promise
+ * that: 007 returns as 7, and a value that does not satisfy its type does not
+ * merely fail to convert but arrives EMPTY (map_cell returns -1 for "N/A" in a
+ * NUMERIC field).  With no blob behind the document that value would be gone.
+ *
+ * So nothing is converted on the way in.  The declaration says how to READ a
+ * field, and that is applied at query time by a CAST — always the guarded form,
+ * because postgres and mongo fail an entire query on one un-castable value
+ * while sqlite and mysql silently turn it into 0.  The guarded order is
+ * "", non-numerics, then numbers, which is what MV does anyway.
+ *
+ * Round-trip exactness therefore holds for the stored text unconditionally.  A
+ * field's CONVERSION is still only as reversible as the conversion itself —
+ * MD/MR/ML have dropped the raw digits — which is why #158 makes native mode
+ * take one mapping per attribute and name the one to keep.
  */
 void mvx_doc_encode_mapped(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
                            const mv_value *spec);
