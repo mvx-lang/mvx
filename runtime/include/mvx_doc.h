@@ -69,6 +69,37 @@ void mvx_doc_encode(mv_value *dst, const mv_value *rec);
    well-formed yields an empty record rather than a partial one. */
 void mvx_doc_decode(mv_value *dst, const mv_value *doc);
 
+/* The MAPPED form, driven by a %MAP% spec: the dictionary supplies names, and
+ * an association becomes an array of objects rather than parallel arrays —
+ * the same information the relational child table holds, in the shape a
+ * document store wants.
+ *
+ *     { "CUST": "C1",
+ *       "LINE_ITEMS": [ { "QTY": "5", "PRICE": "10" },
+ *                       { "QTY": "6", "PRICE": "20" } ] }
+ *
+ * ATTRIBUTES THE MAPPING DOES NOT COVER KEEP THEIR ORDINAL KEYS, so the
+ * document carries the whole record.  That is what lets native mode drop the
+ * blob: the blob's remaining job today is exactly to hold the un-mapped
+ * attributes (mvx_store.c, map_recompose), and a document that carries them
+ * has no such job left.
+ *
+ * A ragged association has as many rows as its LONGEST member, with shorter
+ * members contributing "" for the positions they do not reach.  That is
+ * map_child_apply's rule (max map_vcount across the members), reused rather
+ * than restated: taking the minimum, or zipping until the first field runs
+ * out, silently drops a line item and leaves a well-formed record behind.
+ *
+ * Round-trip exactness holds for identity fields.  A converted field is only
+ * as reversible as its conversion — MD/MR/ML have dropped the raw digits by
+ * the time they are stored — which is why #158 makes native mode take one
+ * mapping per attribute and name the one to keep.
+ */
+void mvx_doc_encode_mapped(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
+                           const mv_value *spec);
+void mvx_doc_decode_mapped(mvx_ctx *ctx, mv_value *dst, const mv_value *doc,
+                           const mv_value *spec);
+
 #ifdef __cplusplus
 }
 #endif

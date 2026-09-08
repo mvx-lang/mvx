@@ -14,6 +14,7 @@
    for the shape and why it is that shape. */
 
 #include "mvx_doc.h"
+#include "mvx_map.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -449,4 +450,333 @@ void mvx_doc_decode(mv_value *dst, const mv_value *doc) {
     free(rec.p);
     for (int i = 0; i < cap; i++) free(slot[i].p);
     free(slot);
+}
+
+/* ---------------------------------------------------------- mapped form */
+
+/* Is s..n a number this representation may store AS a number?
+ *
+ * The rule from #157 is that a value is carried as a number only when
+ * formatting it back yields the identical string — the declaration says what
+ * the field IS, and this decides whether THIS value can be carried as one
+ * without changing it.  So the grammar is deliberately narrower than JSON's:
+ *
+ *   007      rejected — comes back 7
+ *   -0       rejected — comes back 0
+ *   1e3      rejected — comes back 1000
+ *   +5, " 5" rejected — not JSON numbers at all
+ *   9.90     ACCEPTED — the trailing zero is part of the text and survives it
+ *
+ * 9.90 is the case worth keeping: MV money is the stored digits, and a decimal
+ * carrier that preserves scale (postgres numeric, mongo Decimal128) round-trips
+ * it exactly.  A backend whose JSON numbers are doubles will return 9.9 and
+ * must tighten this further; that is a backend's guard to add, not a reason to
+ * reject the value here. */
+static int doc_number(const char *s, int64_t n) {
+    if (n <= 0) return 0;
+    int64_t i = 0;
+    int neg = 0;
+    if (s[i] == '-') { neg = 1; i++; }
+    if (i >= n) return 0;
+    int64_t ds = i;
+    if (s[i] == '0') {
+        i++;
+        if (i < n && s[i] >= '0' && s[i] <= '9') return 0;   /* 007 */
+    } else {
+        if (s[i] < '1' || s[i] > '9') return 0;
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+    }
+    int allzero = 1;
+    for (int64_t k = ds; k < i; k++) if (s[k] != '0') { allzero = 0; break; }
+    if (i < n && s[i] == '.') {
+        i++;
+        if (i >= n || s[i] < '0' || s[i] > '9') return 0;    /* "1." */
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            if (s[i] != '0') allzero = 0;
+            i++;
+        }
+    }
+    if (i != n) return 0;                     /* exponents, trailing junk */
+    if (neg && allzero) return 0;             /* -0, -0.0 come back unsigned */
+    return 1;
+}
+
+/* One mapped cell as a JSON value.  Empty is "" — the shape #157's ragged
+   association example uses for the positions a short member does not reach. */
+static void db_cell(dbuf *b, const char *type, const char *cell, int64_t cl) {
+    if (cl <= 0) { db_raw(b, "\"\"", 2); return; }
+    if (strcmp(type, "NUMERIC") == 0 && doc_number(cell, cl))
+        db_raw(b, cell, (size_t)cl);
+    else
+        db_leaf(b, cell, (size_t)cl);
+}
+
+/* Does any mapped field cover attribute `ano`? */
+static int mapped_attr(const mapmeta *m, int64_t ano) {
+    for (int i = 0; i < m->nf; i++) if (m->anos[i] == ano) return 1;
+    return 0;
+}
+
+void mvx_doc_encode_mapped(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
+                           const mv_value *spec) {
+    char sb[64];
+    const char *sp;
+    int64_t sl = mv_val_chars(spec, sb, sizeof sb, &sp);
+    mapmeta m;
+    memset(&m, 0, sizeof m);
+    if (sl > 0) map_parse(sp, sl, &m);
+
+    mv_value av, ov, code;
+    mv_init(&av); mv_init(&ov); mv_init(&code);
+    static char cell[8192];
+
+    dbuf b = {0};
+    db_raw(&b, "{", 1);
+    int first = 1;
+
+    /* Names verbatim, not lowercased.  JSONENCODE lowercases because it is
+       producing JSON for a reader; this is storage, and a name the mapping
+       declared is the key the backend indexes and the decoder matches. */
+    for (int i = 0; i < m.nf; i++) {
+        if (m.assocs[i][0] != '\0') continue;
+        if (!first) db_raw(&b, ",", 1);
+        first = 0;
+        db_str(&b, m.names[i], strlen(m.names[i]));
+        db_raw(&b, ":", 1);
+        int64_t cl = map_cell(ctx, rec, m.anos[i], 0, m.convs[i], m.types[i],
+                              &av, &ov, &code, cell, sizeof cell);
+        db_cell(&b, m.types[i], cell, cl);
+    }
+
+    char *an[MAP_MAXA];
+    int am[MAP_MAXA][MAP_MAXF], anm[MAP_MAXA];
+    int na = map_group_assoc(&m, an, am, anm);
+    for (int a = 0; a < na; a++) {
+        if (!first) db_raw(&b, ",", 1);
+        first = 0;
+        db_str(&b, an[a], strlen(an[a]));
+        db_raw(&b, ":[", 2);
+        /* The MAXIMUM across the members — map_child_apply's rule.  A short
+           member pads; it does not truncate the association. */
+        int nv = 0;
+        for (int k = 0; k < anm[a]; k++) {
+            int vc = map_vcount(rec, m.anos[am[a][k]], &av);
+            if (vc > nv) nv = vc;
+        }
+        for (int seq = 1; seq <= nv; seq++) {
+            if (seq > 1) db_raw(&b, ",", 1);
+            db_raw(&b, "{", 1);
+            for (int k = 0; k < anm[a]; k++) {
+                int i = am[a][k];
+                if (k) db_raw(&b, ",", 1);
+                db_str(&b, m.names[i], strlen(m.names[i]));
+                db_raw(&b, ":", 1);
+                int64_t cl = map_cell(ctx, rec, m.anos[i], seq, m.convs[i],
+                                      m.types[i], &av, &ov, &code, cell,
+                                      sizeof cell);
+                db_cell(&b, m.types[i], cell, cl);
+            }
+            db_raw(&b, "}", 1);
+        }
+        db_raw(&b, "]", 1);
+    }
+
+    /* Everything the mapping does not name keeps its ordinal key, so the
+       document is the whole record and nothing needs a blob behind it. */
+    char nb[64];
+    const char *p;
+    int64_t n = mv_val_chars(rec, nb, sizeof nb, &p);
+    if (n > 0) {
+        int64_t mm = trim_trailing(p, n, AM);
+        int64_t start = 0, i;
+        int ano = 1;
+        for (i = 0; i <= mm; i++) {
+            if (i == mm || p[i] == AM) {
+                int64_t len = i - start;
+                if (len > 0 && !mapped_attr(&m, ano)) {
+                    char key[24];
+                    int kl = snprintf(key, sizeof key, "%d", ano);
+                    if (!first) db_raw(&b, ",", 1);
+                    first = 0;
+                    db_str(&b, key, (size_t)kl);
+                    db_raw(&b, ":", 1);
+                    enc_attr(&b, p + start, len);
+                }
+                start = i + 1;
+                ano++;
+            }
+        }
+    }
+
+    db_raw(&b, "}", 1);
+    mv_set_str(dst, b.p ? b.p : "{}", (int64_t)(b.p ? b.len : 2));
+    free(b.p);
+    free(m.buf);
+    mv_clear(&av); mv_clear(&ov); mv_clear(&code);
+}
+
+/* A mapped scalar: a string, the {"$b64":...} wrapper, a bare number, or null.
+   Numbers arrive as their own text, which is the point of storing them as
+   numbers — the digits are the value. */
+static int d_scalar(drd *r, dbuf *out) {
+    d_ws(r);
+    if (r->p >= r->e) { d_fail(r); return 0; }
+    if (*r->p == '"' || *r->p == '{') return d_leaf(r, out);
+    if (r->e - r->p >= 4 && memcmp(r->p, "null", 4) == 0) {
+        r->p += 4;                       /* empty, same as "" in MV */
+        return 1;
+    }
+    const char *s = r->p;
+    while (r->p < r->e && (*r->p == '-' || *r->p == '+' || *r->p == '.' ||
+                           *r->p == 'e' || *r->p == 'E' ||
+                           (*r->p >= '0' && *r->p <= '9'))) r->p++;
+    if (r->p == s) { d_fail(r); return 0; }
+    db_raw(out, s, (size_t)(r->p - s));
+    return 1;
+}
+
+/* Put one decoded cell into the record at (ano, seq). */
+static void put_cell(mvx_ctx *ctx, mv_value *rec, const mapmeta *m, int fi,
+                     int64_t seq, dbuf *cell) {
+    mv_value val, tmp, code;
+    mv_init(&val); mv_init(&tmp); mv_init(&code);
+    map_uncell(ctx, m->types[fi], m->convs[fi], cell->p ? cell->p : "",
+               (int64_t)cell->len, &val, &tmp, &code);
+    /* An EMPTY cell is not written.  A ragged association pads its short
+       members to the row count, so writing those pads back would append a
+       trailing empty value the record never had — `10 VM 20` returning as
+       `10 VM 20 VM`.  Skipping them costs nothing at interior positions
+       either: mv_replace_fn pads up to `seq` when the next non-empty value
+       arrives, so `5 VM VM 7` still rebuilds with its gap intact.  The result
+       is the canonical record rather than one with trailing empties that MV
+       treats as barely there. */
+    char nb[64];
+    const char *vp;
+    if (mv_val_chars(&val, nb, sizeof nb, &vp) > 0)
+        mv_replace_fn(rec, rec, m->anos[fi], seq, 0, &val);
+    mv_clear(&val); mv_clear(&tmp); mv_clear(&code);
+}
+
+static int field_named(const mapmeta *m, const char *s, size_t n, int assoc) {
+    for (int i = 0; i < m->nf; i++) {
+        int isa = m->assocs[i][0] != '\0';
+        if (assoc != isa) continue;
+        if (strlen(m->names[i]) == n && memcmp(m->names[i], s, n) == 0) return i;
+    }
+    return -1;
+}
+
+static int assoc_named(const mapmeta *m, const char *s, size_t n) {
+    for (int i = 0; i < m->nf; i++)
+        if (m->assocs[i][0] != '\0' && strlen(m->assocs[i]) == n &&
+            memcmp(m->assocs[i], s, n) == 0) return 1;
+    return 0;
+}
+
+void mvx_doc_decode_mapped(mvx_ctx *ctx, mv_value *dst, const mv_value *doc,
+                           const mv_value *spec) {
+    char sb[64];
+    const char *sp;
+    int64_t sl = mv_val_chars(spec, sb, sizeof sb, &sp);
+    mapmeta m;
+    memset(&m, 0, sizeof m);
+    if (sl > 0) map_parse(sp, sl, &m);
+
+    char nb[64];
+    const char *p;
+    int64_t n = mv_val_chars(doc, nb, sizeof nb, &p);
+    drd r = { p, p + (n > 0 ? n : 0), 1 };
+
+    mv_value rec;
+    mv_init(&rec);
+    mv_set_str(&rec, "", 0);
+
+    if (d_eat(&r, '{')) {
+        d_ws(&r);
+        if (r.p < r.e && *r.p == '}') r.p++;
+        else for (;;) {
+            dbuf key = {0};
+            if (!d_string(&r, &key) || !d_eat(&r, ':')) { free(key.p); r.ok = 0; }
+            if (!r.ok) { free(key.p); break; }
+            const char *ks = key.p ? key.p : "";
+            size_t kl = key.len;
+
+            int fi = field_named(&m, ks, kl, 0);
+            if (fi >= 0) {                          /* a plain mapped field */
+                dbuf cell = {0};
+                if (d_scalar(&r, &cell)) put_cell(ctx, &rec, &m, fi, 0, &cell);
+                free(cell.p);
+            } else if (assoc_named(&m, ks, kl)) {   /* an association */
+                if (!d_eat(&r, '[')) r.ok = 0;
+                else {
+                    d_ws(&r);
+                    if (r.p < r.e && *r.p == ']') r.p++;
+                    else {
+                        int64_t seq = 1;
+                        for (;;) {
+                            if (!d_eat(&r, '{')) { r.ok = 0; break; }
+                            d_ws(&r);
+                            if (r.p < r.e && *r.p == '}') r.p++;
+                            else for (;;) {
+                                dbuf mk = {0};
+                                if (!d_string(&r, &mk) || !d_eat(&r, ':')) {
+                                    free(mk.p); r.ok = 0; break;
+                                }
+                                int mi = field_named(&m, mk.p ? mk.p : "",
+                                                     mk.len, 1);
+                                dbuf cell = {0};
+                                int got = d_scalar(&r, &cell);
+                                if (got && mi >= 0)
+                                    put_cell(ctx, &rec, &m, mi, seq, &cell);
+                                free(cell.p); free(mk.p);
+                                if (!r.ok) break;
+                                if (d_eat(&r, ',')) continue;
+                                if (d_eat(&r, '}')) break;
+                                r.ok = 0; break;
+                            }
+                            if (!r.ok) break;
+                            seq++;
+                            if (d_eat(&r, ',')) continue;
+                            if (d_eat(&r, ']')) break;
+                            r.ok = 0; break;
+                        }
+                    }
+                }
+            } else {                                /* an ordinal attribute */
+                long ano = 0;
+                int good = kl > 0;
+                for (size_t i = 0; i < kl; i++) {
+                    if (ks[i] < '0' || ks[i] > '9') { good = 0; break; }
+                    ano = ano * 10 + (ks[i] - '0');
+                }
+                if (!good || ano < 1) { free(key.p); r.ok = 0; break; }
+                dbuf raw = {0};
+                d_level(&r, &raw, 0);
+                if (r.ok) {
+                    mv_value val;
+                    mv_init(&val);
+                    mv_set_str(&val, raw.p ? raw.p : "", (int64_t)raw.len);
+                    mv_replace_fn(&rec, &rec, ano, 0, 0, &val);
+                    mv_clear(&val);
+                }
+                free(raw.p);
+            }
+            free(key.p);
+            if (!r.ok) break;
+            if (d_eat(&r, ',')) continue;
+            if (d_eat(&r, '}')) break;
+            r.ok = 0;
+            break;
+        }
+    }
+
+    if (!r.ok) mv_set_str(dst, "", 0);
+    else {
+        char rb[64];
+        const char *rp;
+        int64_t rl = mv_val_chars(&rec, rb, sizeof rb, &rp);
+        mv_set_str(dst, rl > 0 ? rp : "", rl > 0 ? rl : 0);
+    }
+    mv_clear(&rec);
+    free(m.buf);
 }
