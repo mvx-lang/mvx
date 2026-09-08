@@ -2839,14 +2839,19 @@ WRITE "D":@AM:"5":@AM:"MD0":@AM:"Qty":@AM:"5R":@AM:"LINES" ON D, "QTY"
 MMEOF
   "$MVX" "$TESTROOT/mgmap.b" -o "$TESTROOT/mgmapbin" 2>/dev/null
   (cd "$MGACCT" && MVXACCOUNT=. "$TESTROOT/mgmapbin")
-  check tcl-mongomap "$( \
+  # libmongoc writes "Falling back to malloc for counters" to stderr when it
+  # cannot map its shared-counter segment — intermittently, and depending on
+  # the container.  It is not output of ours; drop it, or whether the suite
+  # passes depends on whether the run that blessed it happened to see it.
+  nomgwarn() { grep -v 'WARNING:.*mongoc' || true; }
+  check tcl-mongomap "$( { \
     "$TCL" -a "$MGACCT" -c 'CREATE-MAP MORD NAME STATE PRICE PRODUCT QTY' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD WITH STATE = "NSW"' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD WITH NAME = "Bolt"' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH STATE = "NSW" BY @ID' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'CREATE-INDEX MORD NAME' 2>&1; \
-    "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH NAME = "Bolt"' 2>&1)"
+    "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH NAME = "Bolt"' 2>&1; } | nomgwarn)"
 else
   echo "  (mongo test skipped — set MVX_MONGO to run)"
 fi
@@ -2946,6 +2951,41 @@ if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/doc-roundtrip.c" \
 else
   echo "FAIL doc-roundtrip: did not compile"; sed 's/^/    /' "$TESTROOT/dcerr" | head -10
   FAIL=$((FAIL + 1))
+fi
+
+# A LONG MAPPED VALUE SURVIVES NATIVE MODE.
+#
+# In native mode a mapped attribute is read back from its COLUMN, so anything
+# the column cannot hold is lost — and it was: the runtime projected through a
+# fixed 256-byte cell, so every mapped value over 255 bytes was silently cut,
+# and the check meant to refuse an unfittable record used the same buffer and
+# so could not see it (mvx#174).  300 bytes is the shape that failed.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a long mapped value in native mode"
+  NVA="$TESTROOT/nvacct"; mkdir -p "$NVA"
+  printf '# MVX account descriptor\nname=nv\nversion=1\n' > "$NVA/.mvx"
+  printf '* sqlite %s/nv.sqlite\n' "$NVA" > "$NVA/BINDINGS"
+  "$TCL" -a "$NVA" -c 'CREATE-FILE ITM' >/dev/null 2>&1
+  cat > "$TESTROOT/nv.b" <<'NVEOF'
+OPEN "ITM" TO F ELSE STOP
+OPEN "DICT", "ITM" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE STR("A", 300) ON F, "L1"
+NVEOF
+  "$MVX" "$TESTROOT/nv.b" -o "$TESTROOT/nvbin" 2>/dev/null
+  (cd "$NVA" && MVXACCOUNT=. "$TESTROOT/nvbin")
+  "$TCL" -a "$NVA" -c 'CREATE-MAP ITM NAME' >/dev/null 2>&1
+  printf 'y\n' | "$TCL" -a "$NVA" -c 'MAP-MODE ITM native' >/dev/null 2>&1
+  cat > "$TESTROOT/nvr.b" <<'NVREOF'
+OPEN "ITM" TO F ELSE STOP
+READ R FROM F, "L1" THEN
+   PRINT "native read-back length = " : LEN(R<1>)
+END ELSE PRINT "L1 NOT FOUND"
+NVREOF
+  "$MVX" "$TESTROOT/nvr.b" -o "$TESTROOT/nvrbin" 2>/dev/null
+  check tcl-native-longvalue "$( \
+    "$TCL" -a "$NVA" -c 'MAP-MODE ITM' 2>&1; \
+    (cd "$NVA" && MVXACCOUNT=. "$TESTROOT/nvrbin"))"
 fi
 
 # ---------------------------------------------------------------------------

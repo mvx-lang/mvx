@@ -330,6 +330,16 @@ typedef struct mvx_driver {
        Returns the number of files converted, or -1 with `err` set.  Idempotent:
        a file already in the document form is skipped, not rewritten. */
     int (*migrate_docs)(const char *loc, char *err, size_t errlen);
+
+    /* Bytes a mapped TEXT column can hold, or 0 for "no practical limit"
+       (may be NULL, meaning the same).  Native mode reads a mapped attribute
+       back from its COLUMN, so a value the column cannot hold is a value the
+       record loses — and the runtime cannot know the width without asking:
+       mysql bounds its mapped columns at InnoDB's index key limit, while
+       postgres and sqlite do not bound them at all.  map_validate_one uses
+       this to refuse MAP-MODE native rather than let the switch quietly
+       shorten, or drop, a record (mvx#174). */
+    int64_t (*map_text_cap)(mvx_file *f);
 } mvx_driver;
 
 /* map_backfill sentinel: the transform is not expressible in this backend, so

@@ -689,12 +689,19 @@ static const char *my_sqltype(const char *t) {
        binary float would make SUM disagree with the verb's own arithmetic
        in the last place.  VARBINARY for everything else, so comparison and
        ORDER BY are byte-wise like MV -- and bounded, because MySQL cannot
-       index a full-length blob.  A mapped field longer than this is
-       truncated IN THE COLUMN ONLY; the record blob keeps the whole value,
-       and native reads come back from the column, so keep mapped fields
-       inside it. */
+       index a full-length blob.
+       3072, not 255: that is InnoDB's index key limit on a DYNAMIC row, so
+       it is the widest a fully-indexed column can be.  At 255 a mapped value
+       longer than that was silently cut, and in NATIVE mode -- where the
+       column IS the read -- the record came back short (mvx#174).  The old
+       comment said "the record blob keeps the whole value"; the document does
+       keep it, but a native read never looks there, so the value was lost in
+       practice.
+       A value longer than 3072 still does not fit.  That is a real backend
+       limit rather than a buffer, and it is why map_validate_one has to
+       measure the whole value before MAP-MODE native is allowed. */
     if (t && strcmp(t, "NUMERIC") == 0) return "DECIMAL(38,10)";
-    return "VARBINARY(255)";
+    return "VARBINARY(3072)";
 }
 
 /* 1060 = ER_DUP_FIELDNAME: adding a column that is already there is what
@@ -1475,6 +1482,10 @@ static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
     return done;
 }
 
+/* InnoDB's index key limit on a DYNAMIC row, which is how wide my_sqltype
+   makes a mapped text column.  A longer value cannot round-trip through it. */
+static int64_t my_map_text_cap(mvx_file *fh) { (void)fh; return 3072; }
+
 static const mvx_driver mvx_driver_mysql = {
     "mysql",
     my_open, my_close,
@@ -1507,6 +1518,7 @@ static const mvx_driver mvx_driver_mysql = {
                                              the reference itself */
     my_rollback,                          /* abort a failed logical write */
     my_migrate_docs,                      /* pre-#157 blob -> document */
+    my_map_text_cap,                      /* mapped columns are bounded here */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

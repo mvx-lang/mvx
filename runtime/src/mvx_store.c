@@ -211,7 +211,8 @@ static int map_project_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
 static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
                        int64_t idlen, const mv_value *rec,
                        const mv_value *old);
-static int map_validate_one(mvx_ctx *ctx, mapmeta *m, const mv_value *rec);
+static int map_validate_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
+                            const mv_value *rec);
 static int map_recompose(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
                          const char *id, int64_t idlen, mv_value *rec);
 static const char *map_identity_col(open_file *o, int64_t attr);
@@ -1112,7 +1113,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
     if (o) {
         map_load(o);
         if (o->map.nf > 0 && o->map.native &&
-            !map_validate_one(ctx, &o->map, rec)) {
+            !map_validate_one(ctx, f, &o->map, rec)) {
             if (onerr) return -2;
             mvx_fatal("WRITE rejected by native map on %s id %.*s",
                       b->spec, (int)idlen, ip);
@@ -1407,25 +1408,72 @@ int64_t mvx_index_build(mvx_ctx *ctx, const mv_value *fvar,
    driver materialises columns / child tables and persists.  Returns the
    record count, -1 on error, or -2 when the backend has no mapping. */
 
+/* map_cell into a buffer that GROWS to fit.
+ *
+ * map_cell truncates silently at `cap` and returns the truncated length, so a
+ * caller with a fixed cell cannot tell a 255-byte value from a 300-byte one
+ * cut short.  Both places that projected or validated a mapped value used a
+ * 256-byte cell, so every mapped value over 255 bytes was quietly shortened —
+ * and in NATIVE mode, where the column is the read, the record came back
+ * short (mvx#174).
+ *
+ * Detect the truncation by its symptom: map_cell filled the buffer exactly.
+ * A value that genuinely ends at cap-1 costs one extra call and the same
+ * answer.  The buffer is the caller's to free. */
+static int64_t map_cell_grow(mvx_ctx *ctx, const mv_value *rec, int64_t ano,
+                             int64_t seq, const char *conv, const char *type,
+                             mv_value *av, mv_value *ov, mv_value *code,
+                             char **buf, size_t *cap) {
+    if (!*buf) {
+        *cap = 256;
+        *buf = malloc(*cap);
+        if (!*buf) mvx_fatal("out of memory projecting a mapped value");
+    }
+    for (;;) {
+        int64_t n = map_cell(ctx, rec, ano, seq, conv, type, av, ov, code,
+                             *buf, *cap);
+        if (n < 0 || (size_t)n < *cap - 1) return n;
+        if (*cap >= (size_t)16 << 20) return n;    /* absurd: take what fits */
+        size_t nc = *cap * 4;
+        char *nb = realloc(*buf, nc);
+        if (!nb) mvx_fatal("out of memory projecting a mapped value");
+        *buf = nb; *cap = nc;
+    }
+}
+
 /* Validate a record against a mapping without touching the backend: 1 if
    every typed cell fits its column, 0 if any non-empty value mismatches.
    Native mode calls this to reject a bad WRITE before it commits. */
-static int map_validate_one(mvx_ctx *ctx, mapmeta *m, const mv_value *rec) {
+static int map_validate_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
+                            const mv_value *rec) {
+    mvx_file_base *b = (mvx_file_base *)f;
+    /* What a mapped TEXT column can hold here, 0 = no practical limit.  In
+       native mode the column is the read, so a value it cannot hold is a
+       value the record loses — silently, and only on the backends that bound
+       their columns (mvx#174). */
+    int64_t tcap = (b && b->driver->map_text_cap) ? b->driver->map_text_cap(f) : 0;
     mv_value av, ov, code;
     mv_init(&av); mv_init(&ov); mv_init(&code);
-    char cell[256];
+    char *cell = NULL;
+    size_t ccap = 0;
     int ok = 1;
     for (int i = 0; i < m->nf && ok; i++) {
         int nv = m->assocs[i][0] ? map_vcount(rec, m->anos[i], &av) : 0;
         for (int seq = 0; seq <= nv; seq++) {
             if (m->assocs[i][0] && seq == 0) continue;   /* MV: 1..nv only */
-            if (map_cell(ctx, rec, m->anos[i], seq, m->convs[i], m->types[i],
-                         &av, &ov, &code, cell, sizeof cell) < 0) {
-                ok = 0;
+            /* The WHOLE value, not the first 255 bytes of it: this is the
+               check MAP-MODE native runs to refuse a record that does not
+               fit, and it was testing a truncated copy. */
+            int64_t cl = map_cell_grow(ctx, rec, m->anos[i], seq, m->convs[i],
+                                       m->types[i], &av, &ov, &code,
+                                       &cell, &ccap);
+            if (cl < 0 || (tcap > 0 && cl > tcap)) {
+                ok = 0;                   /* wrong type, or too long to store */
                 break;
             }
         }
     }
+    free(cell);
     mv_clear(&av); mv_clear(&ov); mv_clear(&code);
     return ok;
 }
@@ -1529,8 +1577,12 @@ static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
     mv_init(&av); mv_init(&ov); mv_init(&code); mv_init(&ta); mv_init(&tb);
     int ok = 1;
 
-    /* parent columns — only the changed ones (all, when there is no old) */
-    static char ps[MAP_MAXF][256];
+    /* parent columns — only the changed ones (all, when there is no old).
+       A GROWING cell per column: a fixed 256 quietly cut every mapped value
+       over 255 bytes, and in native mode, where the column IS the read, the
+       record came back short (mvx#174). */
+    static char *ps[MAP_MAXF];
+    static size_t pscap[MAP_MAXF];
     mvx_mapfield pcol[MAP_MAXF];
     const char *vals[MAP_MAXF];
     int64_t vlens[MAP_MAXF];
@@ -1538,9 +1590,9 @@ static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
     for (int i = 0; i < m->nf; i++) {
         if (m->assocs[i][0] != '\0') continue;
         if (old && map_attr_equal(old, rec, m->anos[i], &ta, &tb)) continue;
-        int64_t vl = map_cell(ctx, rec, m->anos[i], 0, m->convs[i],
-                              m->types[i], &av, &ov, &code, ps[nchg],
-                              sizeof ps[0]);
+        int64_t vl = map_cell_grow(ctx, rec, m->anos[i], 0, m->convs[i],
+                                   m->types[i], &av, &ov, &code,
+                                   &ps[nchg], &pscap[nchg]);
         if (vl < 0) { vl = 0; ps[nchg][0] = '\0'; }
         pcol[nchg].name = m->names[i];
         pcol[nchg].type = m->types[i];
@@ -1868,7 +1920,7 @@ int64_t mvx_mapcheck(mvx_ctx *ctx, const mv_value *fvar,
         const char *rp;
         int64_t rl = mv_val_chars(&rid, rb, sizeof rb, &rp);
         if (!b->driver->read(f, rp, rl, &rec)) continue;
-        if (!map_validate_one(ctx, &m, &rec)) bad++;
+        if (!map_validate_one(ctx, f, &m, &rec)) bad++;
     }
     b->driver->select_end(c);
     mv_clear(&rid); mv_clear(&rec);
