@@ -1,4 +1,4 @@
 postgres: SELECT id FROM "mvxtest"."MWP" WHERE "STATE" = 'NSW'
-postgres: SELECT id FROM "mvxtest"."MWP" WHERE "STATE" = 'NSW' AND NULLIF("mvxtest".mvx_attr(rec,2),'')::numeric > '500'::numeric
+postgres: SELECT id FROM "mvxtest"."MWP" WHERE "STATE" = 'NSW' AND CASE WHEN doc->>'2' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (doc->>'2')::numeric END > '500'::numeric
 postgres: SELECT id FROM "mvxtest"."MWP" ORDER BY "PRICE" LIMIT 3
 postgres: SELECT id FROM "mvxtest"."MWP"; 1 condition(s) applied in the verb

@@ -1909,8 +1909,10 @@ FTEOF
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE BY PRICE FIRST 2' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE BY STATE FIRST 2' 2>&1)"
 
-  # range push-down (#48): numeric range pushes NULLIF(mvx_attr,'')::numeric;
-  # text range falls back to the scan. Result must equal the local tcl-range.
+  # range push-down (#48): a numeric range pushes the GUARDED cast of the
+  # document field (a bare ::numeric fails the whole query on one non-numeric
+  # value, #157); a text range falls back to the scan.  Result must equal the
+  # local tcl-range.
   check tcl-pgrange "$( \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE WITH PRICE > "500" BY @ID' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE WITH PRICE <= "450" BY @ID' 2>&1; \
@@ -2374,19 +2376,25 @@ PDNEOF
       "$TCL" -a "$VMACCT" -c 'LIST PDN NAME CREDIT WITH CREDIT = "1500"' 2>&1)"
 
     # expression indexes (#43): CREATE-INDEX on an un-mapped field builds a
-    # Postgres expression index on the blob (via the IMMUTABLE mvx_attr
-    # helper), so the blob push-down becomes an index scan. A mapped identity
-    # field still gets a column index. PDN has STATE mapped, TIER unmapped.
+    # Postgres expression index on the document field the push-down uses, so
+    # that push-down becomes an index scan.  It needed an IMMUTABLE mvx_attr()
+    # installed into the schema until records became documents (#157); doc->>'n'
+    # is built in.  A mapped identity field still gets a column index.
+    # PDN has STATE mapped, TIER unmapped.
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX PDN STATE' >/dev/null 2>&1
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX PDN TIER' >/dev/null 2>&1
-    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%mvx_attr(rec, 4)%' \
+    # The unmapped attribute indexes the document field the push-down uses.
+    # It was mvx_attr(rec, 4) — a function this driver had to install — until
+    # records became documents (#157); postgres renders the expression as
+    # ((doc ->> '4'::text)).
+    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%doc ->> ''4''%' \
       THEN 'expression' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_TIER_idx'")
     STDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%(\"STATE\")%' \
       THEN 'column' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_STATE_idx'")
     EXPLN=$(psql_ext "SET enable_seqscan=off; EXPLAIN SELECT id FROM \
-      vmtest.\"PDN\" WHERE vmtest.mvx_attr(rec,4)='gold'")
+      vmtest.\"PDN\" WHERE doc->>'4'='gold'")
     USES=$(printf '%s' "$EXPLN" | grep -q 'PDN_TIER_idx' && echo yes || echo no)
     check tcl-exprindex "$(printf '%s\n' \
       "TIER (unmapped) index kind: $IDXDEF" \
@@ -2408,7 +2416,7 @@ RIXEOF
     "$MVX" "$TESTROOT/vmrix.b" -o "$TESTROOT/vmrixbin" 2>/dev/null
     (cd "$VMACCT" && MVXACCOUNT=. "$TESTROOT/vmrixbin")
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX RIX STATE' >/dev/null 2>&1
-    rixkind() { psql_ext "SELECT CASE WHEN indexdef LIKE '%mvx_attr%' THEN \
+    rixkind() { psql_ext "SELECT CASE WHEN indexdef LIKE '%doc ->>%' THEN \
       'expression' WHEN indexdef LIKE '%(\"STATE\")%' THEN 'column' ELSE '?' \
       END FROM pg_indexes WHERE schemaname='vmtest' AND indexname='RIX_STATE_idx'"; }
     RBEFORE=$(rixkind)

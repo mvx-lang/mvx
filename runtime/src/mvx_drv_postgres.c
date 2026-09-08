@@ -13,7 +13,7 @@
 /* postgres driver — a MultiValue file on a PostgreSQL table.
  *
  * Each account/namespace is a schema; each file is a table
- * (id BYTEA PRIMARY KEY, rec BYTEA) in it, so records round-trip
+ * (id BYTEA PRIMARY KEY, doc JSONB) in it, so records round-trip
  * byte-exact (marks and all).  The connection is a named profile
  * (BINDINGS `ORDERS @pgmain`, .mvx-private/connections carries
  * driver/address/dbname/user/password/namespace) — the same indirection
@@ -24,6 +24,7 @@
  * applies) in this first cut — both are follow-ups.
  */
 #include "../include/mvx_driver.h"
+#include "../include/mvx_doc.h"
 
 #include <libpq-fe.h>
 #include <stdio.h>
@@ -149,23 +150,57 @@ static const char *split_spec(const char *spec, char *loc, size_t cap) {
     return nl + 1;
 }
 
-/* An IMMUTABLE helper for the blob attribute expression: convert_from is only
-   STABLE, so the raw split_part expression cannot go in an index.  Wrapping
-   it in a function we declare IMMUTABLE (safe — the database encoding is
-   fixed) makes both the expression index and the push-down query index-
-   eligible, and using the same schema-qualified function in both makes them
-   match.  attr N is the field between the (N-1)th and Nth field mark. */
-static void pg_ensure_attr_fn(PGconn *c, const char *schema) {
-    char *qs = PQescapeIdentifier(c, schema, strlen(schema));
-    char sql[512];
-    snprintf(sql, sizeof sql,
-             "CREATE OR REPLACE FUNCTION %s.mvx_attr(bytea, integer) "
-             "RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS "
-             "$f$ SELECT split_part(convert_from($1,'LATIN1'),chr(254),$2) $f$",
-             qs ? qs : "\"\"");
-    if (qs) PQfreemem(qs);
-    PGresult *r = PQexec(c, sql);
-    if (r) PQclear(r);
+
+/* An attribute of the document, as text: doc->>'N'.  Built in, GIN-indexable,
+   and needing nothing installed in the database — which is the point of storing
+   records as documents (#157).  It replaces a mvx_attr() this driver had to
+   CREATE FUNCTION into the user's schema, a privilege a hosted account often
+   does not have. */
+static void pg_attr_expr(int64_t attr, const char *alias, char *out, size_t cap) {
+    if (alias && alias[0])
+        snprintf(out, cap, "%s.doc->>'%lld'", alias, (long long)attr);
+    else
+        snprintf(out, cap, "doc->>'%lld'", (long long)attr);
+}
+
+/* The attribute as MV's own text: the values joined by @VM, the way the record
+   blob held them.
+ *
+ * A multivalued attribute is a JSON ARRAY in the document, so doc->>'n' renders
+ * it as JSON — `["Adelaide", "Darwin"]` — which neither collates where the blob
+ * text did nor survives string_to_array(..., chr(253)).  The TRANS() joins
+ * split the source key on @VM precisely so a record matches through ANY of its
+ * key values, and that broke silently: the split produced one element that
+ * happened to look like JSON, so a multivalued key simply stopped matching.
+ *
+ * Used only where the whole multivalued attribute is what is wanted.  Equality
+ * push-down keeps doc->>'n', which is indexable, and is unchanged for scalars —
+ * the overwhelming majority. */
+static void pg_attr_mv_expr(int64_t attr, const char *alias, char *out, size_t cap) {
+    char pfx[16] = "";
+    if (alias && alias[0]) snprintf(pfx, sizeof pfx, "%s.", alias);
+    snprintf(out, cap,
+             "CASE WHEN jsonb_typeof(%sdoc->'%lld') = 'array' THEN "
+             "(SELECT string_agg(v, chr(253)) "
+             "FROM jsonb_array_elements_text(%sdoc->'%lld') v) "
+             "ELSE %sdoc->>'%lld' END",
+             pfx, (long long)attr, pfx, (long long)attr, pfx, (long long)attr);
+}
+
+/* The same attribute as a NUMBER, and always GUARDED.
+ *
+ * A bare `(doc->>'N')::numeric` fails the ENTIRE QUERY on one non-numeric
+ * value — `ERROR: invalid input syntax for type numeric: "abc"` — so a single
+ * odd record makes an unrelated range filter fail outright.  Every value is
+ * text now (#157), so this is not a rare shape any more and the guard is not
+ * optional.  A value that does not look numeric yields NULL, which sorts and
+ * filters out rather than raising, and gives the same order MV does: empties
+ * and non-numerics first, then the numbers. */
+static void pg_num_expr(int64_t attr, char *out, size_t cap) {
+    snprintf(out, cap,
+             "CASE WHEN doc->>'%lld' ~ '^-?[0-9]+(\\.[0-9]+)?$' "
+             "THEN (doc->>'%lld')::numeric END",
+             (long long)attr, (long long)attr);
 }
 
 static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
@@ -191,7 +226,9 @@ static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
     f->conn = c;
     snprintf(f->schema, sizeof f->schema, "%s", schema);
     snprintf(f->table, sizeof f->table, "%s", rspec);
-    pg_ensure_attr_fn(c, schema);         /* for blob expression indexes */
+    /* Nothing to install: an attribute is doc->>'n', built in (#157).  This
+       used to CREATE FUNCTION mvx_attr() into the user's schema on every
+       open — a privilege a hosted database account often does not have. */
     return (mvx_file *)f;
 }
 
@@ -207,14 +244,21 @@ static int pg_read(mvx_file *fh, const char *id, int64_t idlen,
     char qt[512];
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
     char sql[640];
-    snprintf(sql, sizeof sql, "SELECT rec FROM %s WHERE id=$1", qt);
+    snprintf(sql, sizeof sql, "SELECT doc::text FROM %s WHERE id=$1", qt);
     const char *pv[1] = {id};
     int pl[1] = {(int)idlen};
     int pf[1] = {1};                      /* binary id */
-    PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 1);
+    /* Result in TEXT: jsonb has no useful binary wire form for us, and the
+       document is text anyway. */
+    PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 0);
     int ok = r && PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1;
-    if (ok)
-        mv_set_str(rec, PQgetvalue(r, 0, 0), PQgetlength(r, 0, 0));
+    if (ok) {
+        mv_value doc;
+        mv_init(&doc);
+        mv_set_str(&doc, PQgetvalue(r, 0, 0), PQgetlength(r, 0, 0));
+        mvx_doc_decode(rec, &doc);
+        mv_clear(&doc);
+    }
     if (r) PQclear(r);
     return ok;
 }
@@ -226,18 +270,26 @@ static int pg_write(mvx_file *fh, const char *id, int64_t idlen,
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
     char sql[768];
     snprintf(sql, sizeof sql,
-             "INSERT INTO %s (id, rec) VALUES ($1,$2) "
-             "ON CONFLICT (id) DO UPDATE SET rec=EXCLUDED.rec",
+             "INSERT INTO %s (id, doc) VALUES ($1,$2::jsonb) "
+             "ON CONFLICT (id) DO UPDATE SET doc=EXCLUDED.doc",
              qt);
+    mv_value doc;
+    mv_init(&doc);
+    mvx_doc_encode(&doc, rec);
     char nb[40];
     const char *rp;
-    int64_t rl = mv_val_chars(rec, nb, sizeof nb, &rp);
+    int64_t rl = mv_val_chars(&doc, nb, sizeof nb, &rp);
+    /* The document is passed as TEXT and cast to jsonb by the server.  It is
+       valid UTF-8 by construction — a value whose bytes are not get wrapped as
+       base64 — which is what makes jsonb usable at all here: postgres rejects
+       invalid UTF-8 in a json string outright. */
     const char *pv[2] = {id, rp};
     int pl[2] = {(int)idlen, (int)rl};
-    int pf[2] = {1, 1};                   /* binary id + rec */
+    int pf[2] = {1, 0};                   /* binary id, text document */
     PGresult *r = PQexecParams(f->conn, sql, 2, NULL, pv, pl, pf, 0);
     int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
     if (r) PQclear(r);
+    mv_clear(&doc);
     return ok;
 }
 
@@ -366,7 +418,6 @@ static int64_t pg_map_backfill(mvx_file *fh, const mvx_mapfield *cols,
         if (!ok) return MVX_MAP_NOPUSH;                  /* OCONV -> loop */
     }
 
-    pg_ensure_attr_fn(f->conn, f->schema);              /* mvx_attr(rec,n) */
     char qt[512];
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
     char *qsch = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
@@ -380,8 +431,8 @@ static int64_t pg_map_backfill(mvx_file *fh, const mvx_mapfield *cols,
     for (int i = 0; i < nf; i++) {
         char *qc = PQescapeIdentifier(f->conn, cols[i].name,
                                       strlen(cols[i].name));
-        char a[160];                                     /* schema.mvx_attr(rec,n) */
-        snprintf(a, sizeof a, "%s.mvx_attr(rec,%lld)", qsch, (long long)anos[i]);
+        char a[160];                                     /* doc->>'n' */
+        pg_attr_expr(anos[i], NULL, a, sizeof a);
         const char *t = cols[i].type;
         char expr[512];
         if (strcmp(t, "NUMERIC") == 0)
@@ -430,7 +481,7 @@ static int pg_create(const char *spec, char *err, size_t errlen) {
     qualify(c, schema, rspec, qt, sizeof qt);
     char sql[700];
     snprintf(sql, sizeof sql,
-             "CREATE TABLE %s (id bytea primary key, rec bytea)", qt);
+             "CREATE TABLE %s (id bytea primary key, doc jsonb)", qt);
     r = PQexec(c, sql);
     int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
     if (!ok && r) {
@@ -782,10 +833,14 @@ static int pg_index_create(mvx_file *fh, const char *item, const char *col,
         snprintf(target, sizeof target, "(%s)", qc ? qc : "\"\"");
         if (qc) PQfreemem(qc);
     } else {
-        char *qs = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
-        snprintf(target, sizeof target, "(%s.mvx_attr(rec,%lld))",
-                 qs ? qs : "\"\"", (long long)attr);
-        if (qs) PQfreemem(qs);
+        /* DOUBLE parentheses.  The outer pair is the index's column list; an
+           OPERATOR expression needs its own pair inside it, where the function
+           call this used to build (mvx_attr(rec,n)) did not — `ON t (doc->>'3')`
+           is a syntax error, and the index was silently not created, which the
+           push-down then could not use. */
+        char ax[160];
+        pg_attr_expr(attr, NULL, ax, sizeof ax);
+        snprintf(target, sizeof target, "((%s))", ax);
     }
     char sql[1200];
     snprintf(sql, sizeof sql, "CREATE INDEX IF NOT EXISTS %s ON %s %s",
@@ -913,20 +968,19 @@ static mvx_cursor *pg_select_attr(mvx_file *fh, int64_t attr, const char *op,
     if (attr < 1) return NULL;
     char qt[512];
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
-    char *qs = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
-    char sql[900];
-    if (isrange)
-        /* compare the raw internal value numerically, matching MV's numeric
-           compare; an empty attribute becomes NULL and drops out. */
+    char sql[900], ax[400];
+    if (isrange) {
+        /* Compare numerically, matching MV's numeric compare — through the
+           GUARDED cast, so one non-numeric value yields NULL and drops out
+           instead of failing the whole query. */
+        pg_num_expr(attr, ax, sizeof ax);
         snprintf(sql, sizeof sql,
-                 "SELECT id FROM %s WHERE "
-                 "NULLIF(%s.mvx_attr(rec,%lld),'')::numeric %s $1::numeric",
-                 qt, qs ? qs : "\"\"", (long long)attr, sqlop);
-    else
+                 "SELECT id FROM %s WHERE %s %s $1::numeric", qt, ax, sqlop);
+    } else {
+        pg_attr_expr(attr, NULL, ax, sizeof ax);
         snprintf(sql, sizeof sql,
-                 "SELECT id FROM %s WHERE %s.mvx_attr(rec,%lld) %s $1",
-                 qt, qs ? qs : "\"\"", (long long)attr, sqlop);
-    if (qs) PQfreemem(qs);
+                 "SELECT id FROM %s WHERE %s %s $1", qt, ax, sqlop);
+    }
     const char *pv[1] = {val};
     int pl[1] = {(int)vlen}, pf[1] = {0};   /* text value */
     PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 1);
@@ -977,26 +1031,20 @@ static mvx_cursor *pg_select_join(mvx_file *srch, int64_t sk,
     qualify(s->conn, t->schema, t->table, tqt, sizeof tqt);
     /* Prefer a mapped identity column over the blob split_part: it can use an
        index and, in native mode, is the authoritative value. */
-    char skexpr[320], taexpr[320];
+    char skexpr[640], taexpr[640];
     if (src_keycol && src_keycol[0]) {
         char *qc = PQescapeIdentifier(s->conn, src_keycol, strlen(src_keycol));
         snprintf(skexpr, sizeof skexpr, "s.%s", qc ? qc : "\"\"");
         if (qc) PQfreemem(qc);
     } else {
-        char *qs = PQescapeIdentifier(s->conn, s->schema, strlen(s->schema));
-        snprintf(skexpr, sizeof skexpr, "%s.mvx_attr(s.rec,%lld)",
-                 qs ? qs : "\"\"", (long long)sk);
-        if (qs) PQfreemem(qs);
+        pg_attr_mv_expr(sk, "s", skexpr, sizeof skexpr);
     }
     if (tgt_col && tgt_col[0]) {
         char *qc = PQescapeIdentifier(t->conn, tgt_col, strlen(tgt_col));
         snprintf(taexpr, sizeof taexpr, "t.%s", qc ? qc : "\"\"");
         if (qc) PQfreemem(qc);
     } else {
-        char *qs = PQescapeIdentifier(t->conn, t->schema, strlen(t->schema));
-        snprintf(taexpr, sizeof taexpr, "%s.mvx_attr(t.rec,%lld)",
-                 qs ? qs : "\"\"", (long long)ta);
-        if (qs) PQfreemem(qs);
+        pg_attr_mv_expr(ta, "t", taexpr, sizeof taexpr);
     }
     /* The source key may be multivalued (@VM-separated); classic TRANS maps
        element-wise, so a record matches when ANY of its key values points at a
@@ -1048,26 +1096,20 @@ static mvx_cursor *pg_select_join_order(mvx_file *srch, int64_t sk,
     char sqt[512], tqt[512];
     qualify(s->conn, s->schema, s->table, sqt, sizeof sqt);
     qualify(s->conn, t->schema, t->table, tqt, sizeof tqt);
-    char skexpr[320], taexpr[320];
+    char skexpr[640], taexpr[640];
     if (src_keycol && src_keycol[0]) {
         char *qc = PQescapeIdentifier(s->conn, src_keycol, strlen(src_keycol));
         snprintf(skexpr, sizeof skexpr, "s.%s", qc ? qc : "\"\"");
         if (qc) PQfreemem(qc);
     } else {
-        char *qs = PQescapeIdentifier(s->conn, s->schema, strlen(s->schema));
-        snprintf(skexpr, sizeof skexpr, "%s.mvx_attr(s.rec,%lld)",
-                 qs ? qs : "\"\"", (long long)sk);
-        if (qs) PQfreemem(qs);
+        pg_attr_mv_expr(sk, "s", skexpr, sizeof skexpr);
     }
     if (tgt_col && tgt_col[0]) {
         char *qc = PQescapeIdentifier(t->conn, tgt_col, strlen(tgt_col));
         snprintf(taexpr, sizeof taexpr, "t.%s", qc ? qc : "\"\"");
         if (qc) PQfreemem(qc);
     } else {
-        char *qs = PQescapeIdentifier(t->conn, t->schema, strlen(t->schema));
-        snprintf(taexpr, sizeof taexpr, "%s.mvx_attr(t.rec,%lld)",
-                 qs ? qs : "\"\"", (long long)ta);
-        if (qs) PQfreemem(qs);
+        pg_attr_mv_expr(ta, "t", taexpr, sizeof taexpr);
     }
     const char *missexpr = (ctl == 'C') ? "k.kv" : "''";
     const char *coll = otext ? " COLLATE \"C\"" : "";
@@ -1126,10 +1168,7 @@ static int64_t pg_count_where(mvx_file *fh, const char *col, int64_t attr,
             snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
             if (qc) PQfreemem(qc);
         } else {
-            char *qs = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
-            snprintf(expr, sizeof expr, "%s.mvx_attr(rec,%lld)",
-                     qs ? qs : "\"\"", (long long)attr);
-            if (qs) PQfreemem(qs);
+            pg_attr_expr(attr, NULL, expr, sizeof expr);
         }
         snprintf(sql, sizeof sql, "SELECT count(*) FROM %s WHERE %s %s $1",
                  qt, expr, sqlop);
@@ -1172,10 +1211,7 @@ static int pg_sum_where(mvx_file *fh, const char *sumcol, const char *fcol,
             snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
             if (qc) PQfreemem(qc);
         } else {
-            char *qs = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
-            snprintf(expr, sizeof expr, "%s.mvx_attr(rec,%lld)",
-                     qs ? qs : "\"\"", (long long)fattr);
-            if (qs) PQfreemem(qs);
+            pg_attr_expr(fattr, NULL, expr, sizeof expr);
         }
         snprintf(sql + p, sizeof sql - p, " WHERE %s %s $1", expr, sqlop);
         nparam = 1;
@@ -1218,10 +1254,7 @@ static mvx_cursor *pg_select_order(mvx_file *fh, const char *fcol,
             snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
             if (qc) PQfreemem(qc);
         } else {
-            char *qs = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
-            snprintf(expr, sizeof expr, "%s.mvx_attr(rec,%lld)",
-                     qs ? qs : "\"\"", (long long)fattr);
-            if (qs) PQfreemem(qs);
+            pg_attr_expr(fattr, NULL, expr, sizeof expr);
         }
         p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s %s $1",
                               expr, sqlop);
@@ -1253,7 +1286,7 @@ static mvx_cursor *pg_select_order(mvx_file *fh, const char *fcol,
 }
 
 /* Multi-condition WITH: SELECT id WHERE p1 AND p2 AND ... — each predicate a
-   column or the mvx_attr blob expression, numeric for a range. */
+   column or the document's attribute field, numeric for a range. */
 static mvx_cursor *pg_select_multi(mvx_file *fh, const mvx_pred *preds,
                                    int npred) {
     pg_file *f = (pg_file *)fh;
@@ -1279,14 +1312,8 @@ static mvx_cursor *pg_select_multi(mvx_file *fh, const mvx_pred *preds,
             snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
             if (qc) PQfreemem(qc);
         } else {
-            char *qs = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
-            if (q->numeric)
-                snprintf(expr, sizeof expr, "NULLIF(%s.mvx_attr(rec,%lld),'')::numeric",
-                         qs ? qs : "\"\"", (long long)q->attr);
-            else
-                snprintf(expr, sizeof expr, "%s.mvx_attr(rec,%lld)",
-                         qs ? qs : "\"\"", (long long)q->attr);
-            if (qs) PQfreemem(qs);
+            if (q->numeric) pg_num_expr(q->attr, expr, sizeof expr);
+            else            pg_attr_expr(q->attr, NULL, expr, sizeof expr);
         }
         p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s $%d%s",
                               i ? " AND " : "", expr, sqlop, i + 1,
@@ -1344,14 +1371,8 @@ static int pg_explain(mvx_file *fh, const mvx_pred *preds, int npred,
             snprintf(expr, sizeof expr, "%s", qc ? qc : "\"\"");
             if (qc) PQfreemem(qc);
         } else {
-            char *qs = PQescapeIdentifier(f->conn, f->schema, strlen(f->schema));
-            if (q->numeric)
-                snprintf(expr, sizeof expr, "NULLIF(%s.mvx_attr(rec,%lld),'')::numeric",
-                         qs ? qs : "\"\"", (long long)q->attr);
-            else
-                snprintf(expr, sizeof expr, "%s.mvx_attr(rec,%lld)",
-                         qs ? qs : "\"\"", (long long)q->attr);
-            if (qs) PQfreemem(qs);
+            if (q->numeric) pg_num_expr(q->attr, expr, sizeof expr);
+            else            pg_attr_expr(q->attr, NULL, expr, sizeof expr);
         }
         char *lit = PQescapeLiteral(f->conn, q->val, (size_t)q->vlen);
         p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s %s%s",
@@ -1435,7 +1456,7 @@ static int pg_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     const char *pv[1] = {schema};
     PGresult *r = PQexecParams(c,
         "SELECT table_name FROM information_schema.columns "
-        "WHERE table_schema=$1 AND column_name='rec' ORDER BY table_name",
+        "WHERE table_schema=$1 AND column_name='doc' ORDER BY table_name",
         1, NULL, pv, NULL, NULL, 0);
     if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
         if (r) { snprintf(err, errlen, "postgres: %s", PQerrorMessage(c));
