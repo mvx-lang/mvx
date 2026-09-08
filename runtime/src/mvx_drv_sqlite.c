@@ -34,6 +34,7 @@
  */
 
 #include "mvx_driver.h"
+#include "mvx_doc.h"
 #include "mvx_runtime.h"
 
 #include <sqlite3.h>
@@ -88,33 +89,6 @@ static void quote_ident(const char *s, char *out, size_t cap) {
     }
     out[o++] = '"';
     out[o] = '\0';
-}
-
-/* mvx_attr(rec, n) — the nth @AM-delimited attribute of a record, as
-   text.  Registered as a C function rather than built out of SQL string
-   functions: it is exact on bytes, it is fast, and being DETERMINISTIC
-   it can be used in an expression index, which is what makes a WITH on
-   an unmapped attribute index-eligible.  Attribute n is the field
-   between the (n-1)th and nth mark, 1-based, matching MV. */
-static void fn_mvx_attr(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-    if (argc != 2) { sqlite3_result_null(ctx); return; }
-    const unsigned char *rec = sqlite3_value_blob(argv[0]);
-    int len = sqlite3_value_bytes(argv[0]);
-    int want = sqlite3_value_int(argv[1]);
-    if (!rec || want < 1) { sqlite3_result_text(ctx, "", 0, SQLITE_STATIC); return; }
-    int field = 1, start = 0;
-    for (int i = 0; i <= len; i++) {
-        int mark = (i == len) || rec[i] == (unsigned char)0xFE;   /* @AM */
-        if (!mark) continue;
-        if (field == want) {
-            sqlite3_result_text(ctx, (const char *)rec + start, i - start,
-                                SQLITE_TRANSIENT);
-            return;
-        }
-        field++;
-        start = i + 1;
-    }
-    sqlite3_result_text(ctx, "", 0, SQLITE_STATIC);   /* past the end */
 }
 
 /* mvx_vm_has(keys, id) — 1 when `id` equals one of the @VM-separated
@@ -172,9 +146,9 @@ static sqlite3 *sq_connect(const char *path, char *err, size_t errlen) {
     sqlite3_exec(db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
     sqlite3_busy_timeout(db, 5000);
-    sqlite3_create_function(db, "mvx_attr", 2,
-                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
-                            fn_mvx_attr, NULL, NULL);
+    /* No mvx_attr() any more: the record is a document, so an attribute is
+       json_extract(doc,'$."n"') — built in, and index-eligible without a
+       function of ours in the database (#157). */
     sqlite3_create_function(db, "mvx_vm_has", 2,
                             SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
                             fn_mvx_vm_has, NULL, NULL);
@@ -273,14 +247,19 @@ static int sq_read(mvx_file *fh, const char *id, int64_t idlen, mv_value *rec) {
     sq_file *f = (sq_file *)fh;
     char qt[300], sql[400];
     quote_ident(f->table, qt, sizeof qt);
-    snprintf(sql, sizeof sql, "SELECT rec FROM %s WHERE id = ?1", qt);
+    snprintf(sql, sizeof sql, "SELECT doc FROM %s WHERE id = ?1", qt);
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(f->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_blob(st, 1, id, (int)idlen, SQLITE_STATIC);
     int got = 0;
     if (sqlite3_step(st) == SQLITE_ROW) {
-        const void *b = sqlite3_column_blob(st, 0);
-        mv_set_str(rec, (const char *)b, sqlite3_column_bytes(st, 0));
+        /* The document IS the record (#157): there is no blob behind it. */
+        mv_value doc;
+        mv_init(&doc);
+        mv_set_str(&doc, (const char *)sqlite3_column_text(st, 0),
+                   sqlite3_column_bytes(st, 0));
+        mvx_doc_decode(rec, &doc);
+        mv_clear(&doc);
         got = 1;
     }
     sqlite3_finalize(st);
@@ -293,15 +272,19 @@ static int sq_write(mvx_file *fh, const char *id, int64_t idlen,
     char qt[300], sql[500];
     quote_ident(f->table, qt, sizeof qt);
     snprintf(sql, sizeof sql,
-             "INSERT INTO %s (id, rec) VALUES (?1, ?2) "
-             "ON CONFLICT(id) DO UPDATE SET rec = excluded.rec", qt);
+             "INSERT INTO %s (id, doc) VALUES (?1, ?2) "
+             "ON CONFLICT(id) DO UPDATE SET doc = excluded.doc", qt);
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(f->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    mv_value doc;
+    mv_init(&doc);
+    mvx_doc_encode(&doc, rec);
     char buf[256];
     const char *rp;
-    int64_t rl = mv_val_chars((mv_value *)rec, buf, sizeof buf, &rp);
+    int64_t rl = mv_val_chars(&doc, buf, sizeof buf, &rp);
     sqlite3_bind_blob(st, 1, id, (int)idlen, SQLITE_STATIC);
-    sqlite3_bind_blob(st, 2, rp, (int)rl, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, rp, (int)rl, SQLITE_TRANSIENT);
+    mv_clear(&doc);
     int ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     return ok;
@@ -361,7 +344,7 @@ static int sq_create(const char *spec, char *err, size_t errlen) {
     char qt[300], sql[500];
     quote_ident(tbl, qt, sizeof qt);
     snprintf(sql, sizeof sql,
-             "CREATE TABLE %s (id BLOB PRIMARY KEY, rec BLOB)", qt);
+             "CREATE TABLE %s (id BLOB PRIMARY KEY, doc TEXT)", qt);
     if (!exec_sql(db, sql)) {
         snprintf(err, errlen, "sqlite: %s", sqlite3_errmsg(db));
         return 0;
@@ -392,15 +375,17 @@ static int sq_remove(const char *spec, char *err, size_t errlen) {
 static int sq_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     sqlite3 *db = sq_connect(loc, err, errlen);
     if (!db) return 0;
-    /* A table is an MV file if it has a `rec` column — the same test the
-       postgres driver uses.  That excludes association child tables and
-       anything else sharing the database, without pattern-matching names
-       that MV files are legitimately allowed to contain. */
+    /* A table is an MV file if it has a `doc` column.  That excludes
+       association child tables and anything else sharing the database,
+       without pattern-matching names that MV files are legitimately allowed
+       to contain.  It was `rec` before the record became a document (#157) —
+       the column name is load-bearing here, not just storage, which is worth
+       knowing before renaming it again: LISTF silently returned no files. */
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT m.name FROM sqlite_master m "
             "JOIN pragma_table_info(m.name) p "
-            "WHERE m.type='table' AND p.name='rec' ORDER BY m.name",
+            "WHERE m.type='table' AND p.name='doc' ORDER BY m.name",
             -1, &st, NULL) != SQLITE_OK) {
         snprintf(err, errlen, "sqlite: %s", sqlite3_errmsg(db));
         return 0;
@@ -755,8 +740,10 @@ static int sq_map_child_read(mvx_file *fh, const char *id, int64_t idlen,
  * The backend already stores and maintains the mapped columns, so an
  * index is one CREATE INDEX and there is no per-record backfill and no
  * write_ix/del_ix maintenance — which is why those two stay NULL below.
- * An unmapped attribute gets an expression index on mvx_attr(rec,n),
- * which is index-eligible because that function is DETERMINISTIC. */
+ * An unmapped attribute gets an expression index on
+ * json_extract(doc,'$."n"'), which is index-eligible because the JSON
+ * functions are built in and deterministic — no function of ours in the
+ * database, which is the point of storing records as documents (#157). */
 
 static void index_name(sq_file *f, const char *item, char *out, size_t cap) {
     snprintf(out, cap, "mvxix_%s_%s", f->table, item);
@@ -775,7 +762,8 @@ static int sq_index_create(mvx_file *fh, const char *item,
         snprintf(expr, sizeof expr, "%s", qc);
     } else {
         if (attr < 1) return -1;
-        snprintf(expr, sizeof expr, "mvx_attr(rec,%lld)", (long long)attr);
+        snprintf(expr, sizeof expr, "json_extract(doc,'$.\"%lld\"')",
+                 (long long)attr);
     }
     snprintf(sql, sizeof sql, "CREATE INDEX IF NOT EXISTS %s ON %s (%s)",
              qn, qt, expr);
@@ -848,12 +836,12 @@ static int sq_index_drop(mvx_file *fh, const char *item) {
 
 /* ----------------------------------------------------- WITH push-down */
 
-/* The comparison expression for one side: a mapped column, or the blob
-   attribute.  Shared by every push-down so they agree on what a field
-   means — and so an expression index built on mvx_attr matches. */
+/* The comparison expression for one side: a mapped column, or a field of
+   the document.  Shared by every push-down so they agree on what a field
+   means — and so an expression index built on the same text matches. */
 static void field_expr(const char *col, int64_t attr, char *out, size_t cap) {
     if (col && col[0]) quote_ident(col, out, cap);
-    else snprintf(out, cap, "mvx_attr(rec,%lld)", (long long)attr);
+    else snprintf(out, cap, "json_extract(doc,'$.\"%lld\"')", (long long)attr);
 }
 
 static const char *sql_op(const char *op) {
@@ -1049,12 +1037,14 @@ static mvx_cursor *sq_select_join(mvx_file *srch, int64_t sk,
         char qc[300];
         quote_ident(src_keycol, qc, sizeof qc);
         snprintf(skx, sizeof skx, "s.%s", qc);
-    } else snprintf(skx, sizeof skx, "mvx_attr(s.rec,%lld)", (long long)sk);
+    } else snprintf(skx, sizeof skx, "json_extract(s.doc,'$.\"%lld\"')",
+                    (long long)sk);
     if (tgt_col && tgt_col[0]) {
         char qc[300];
         quote_ident(tgt_col, qc, sizeof qc);
         snprintf(tax, sizeof tax, "t.%s", qc);
-    } else snprintf(tax, sizeof tax, "mvx_attr(t.rec,%lld)", (long long)ta);
+    } else snprintf(tax, sizeof tax, "json_extract(t.doc,'$.\"%lld\"')",
+                    (long long)ta);
     /* DISTINCT collapses a source record that matches through more than one
        of its key values. */
     char sql[1600];

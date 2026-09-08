@@ -2505,7 +2505,7 @@ SQDEOF
   esac
   desc="$("$TCL" -a "$SQA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
   case "$desc" in
-    *"SELECT id FROM"*"mvx_attr"*) PASS=$((PASS+1))
+    *"SELECT id FROM"*"json_extract(doc,"*) PASS=$((PASS+1))
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL sqlite push-down plan: $desc" ;;
   esac
