@@ -354,6 +354,29 @@ static mvx_cursor *run_ids(MYSQL *db, const char *sql,
    looks for `doc`), COUNT reports the rows it can see, and every READ says
    the record is not there.  Three answers about one file and no error, which
    reads as "mvx lost my data". */
+/* The stored format of `table`: the stamped table comment when there is one,
+   else 0 so the caller falls back to the shape.  SHOW CREATE TABLE shows it,
+   which is where someone looking at the schema would find it. */
+static int my_format_of(MYSQL *db, const char *table) {
+    char q[600], esc[300];
+    mysql_real_escape_string(db, esc, table, (unsigned long)strlen(table));
+    snprintf(q, sizeof q,
+             "SELECT table_comment FROM information_schema.tables "
+             "WHERE table_schema = DATABASE() AND table_name = '%s'", esc);
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(db);
+    int fmt = 0;
+    if (r) {
+        MYSQL_ROW row = mysql_fetch_row(r);
+        if (row && row[0]) {
+            const char *m = strstr(row[0], "mvx: format=");
+            if (m) fmt = atoi(m + 12);
+        }
+        mysql_free_result(r);
+    }
+    return fmt;
+}
+
 static int my_is_pre157(MYSQL *db, const char *table) {
     char q[600];
     char esc[300];
@@ -379,7 +402,14 @@ static mvx_file *my_open(const char *spec, char *err, size_t errlen) {
     MYSQL *db = my_connect(loc, err, errlen);
     if (!db) return NULL;
     if (!table_exists(db, tbl)) return NULL;   /* not found: normal ELSE path */
-    if (my_is_pre157(db, tbl)) {
+    int fmt = my_format_of(db, tbl);
+    if (fmt > MVX_FILE_FORMAT) {
+        snprintf(err, errlen,
+                 "mysql: %s is stored in format %d; this build understands %d "
+                 "— it was written by a newer mvx", tbl, fmt, MVX_FILE_FORMAT);
+        return NULL;
+    }
+    if ((fmt > 0 && fmt < MVX_FILE_FORMAT) || (fmt == 0 && my_is_pre157(db, tbl))) {
         snprintf(err, errlen,
                  "mysql: %s was written before records became documents "
                  "(it has a `rec` column and no `doc`).  Convert it with:  "
@@ -549,7 +579,8 @@ static int my_create(const char *spec, char *err, size_t errlen) {
        limit.  The record itself is a LONGBLOB and unbounded. */
     snprintf(sql, sizeof sql,
              "CREATE TABLE %s (id VARBINARY(255) NOT NULL PRIMARY KEY, "
-             "doc JSON) ENGINE=InnoDB", qt);
+             "doc JSON) ENGINE=InnoDB COMMENT = 'mvx: format=%d'",
+             qt, MVX_FILE_FORMAT);
     if (!exec_sql(db, sql)) {
         snprintf(err, errlen, "mysql: %s", mysql_error(db));
         return 0;
@@ -1470,6 +1501,11 @@ static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
         if (!failed) {
             snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
             if (mysql_query(db, sql) != 0) failed = 1;
+        }
+        if (!failed) {                    /* say what it is now (mvx#171) */
+            snprintf(sql, sizeof sql, "ALTER TABLE %s COMMENT = 'mvx: format=%d'",
+                     qt, MVX_FILE_FORMAT);
+            mysql_query(db, sql);         /* best effort: the data is converted */
         }
         if (failed) {
             snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));

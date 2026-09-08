@@ -364,6 +364,21 @@ typedef struct mvx_file_base {
    It must return NULL if `abi` is not an ABI version it supports,
    otherwise its driver vtable.  The search path is $MVXDRIVERS
    (colon-separated), then the runtime's built-in driver directory. */
+/* The stored-file format a build understands.
+ *
+ *   1  the record is an opaque blob (pre-#157)
+ *   2  the record is a JSON document, one field per attribute
+ *
+ * Where the backend can carry a text note on the table — postgres and mysql
+ * both can — the drivers stamp `mvx: format=N` there, so the database says
+ * what it is and a DBA reading the schema can see it.  sqlite has no comment
+ * syntax at all (a comment written into CREATE TABLE does not survive: it
+ * normalises the DDL it stores) and mongo has no collection metadata, so on
+ * those the version is INFERRED from the shape — a `rec` column means 1, a
+ * `doc` column means 2.  The inference is the fallback everywhere, because a
+ * file created before the stamp existed has no note either. */
+#define MVX_FILE_FORMAT 2
+
 #define MVX_DRIVER_ABI 13
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);

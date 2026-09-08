@@ -215,6 +215,25 @@ static void pg_num_expr(int64_t attr, char *out, size_t cap) {
    looks for `doc`), COUNT reports the rows it can see, and every READ says
    the record is not there.  Three answers about one file and no error, which
    reads as "mvx lost my data". */
+/* The stored format of `table`: the stamped comment when there is one, else
+   inferred from the shape.  0 when the table does not exist / cannot be
+   read. */
+static int pg_format_of(PGconn *c, const char *schema, const char *table) {
+    const char *pv[2] = {schema, table};
+    PGresult *r = PQexecParams(c,
+        "SELECT obj_description((quote_ident($1)||'.'||quote_ident($2))::regclass)",
+        2, NULL, pv, NULL, NULL, 0);
+    int fmt = 0;
+    if (r && PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1 &&
+        !PQgetisnull(r, 0, 0)) {
+        const char *cm = PQgetvalue(r, 0, 0);
+        const char *m = strstr(cm, "mvx: format=");
+        if (m) fmt = atoi(m + 12);
+    }
+    if (r) PQclear(r);
+    return fmt;
+}
+
 static int pg_is_pre157(PGconn *c, const char *schema, const char *table) {
     const char *pv[2] = {schema, table};
     PGresult *r = PQexecParams(c,
@@ -288,7 +307,15 @@ static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
                  PQntuples(r) == 1 && !PQgetisnull(r, 0, 0);
     if (r) PQclear(r);
     if (!exists) return NULL;             /* not found: normal ELSE path */
-    if (pg_is_pre157(c, schema, rspec)) {
+    int fmt = pg_format_of(c, schema, rspec);
+    if (fmt > MVX_FILE_FORMAT) {
+        snprintf(err, errlen,
+                 "postgres: %s is stored in format %d; this build understands "
+                 "%d — it was written by a newer mvx", rspec, fmt,
+                 MVX_FILE_FORMAT);
+        return NULL;
+    }
+    if ((fmt > 0 && fmt < MVX_FILE_FORMAT) || (fmt == 0 && pg_is_pre157(c, schema, rspec))) {
         snprintf(err, errlen,
                  "postgres: %s was written before records became documents "
                  "(it has a `rec` column and no `doc`).  Convert it with:  "
@@ -561,6 +588,16 @@ static int pg_create(const char *spec, char *err, size_t errlen) {
              "CREATE TABLE %s (id bytea primary key, doc jsonb)", qt);
     r = PQexec(c, sql);
     int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
+    if (ok) {
+        /* Say what the file IS, in the place a DBA reading the schema looks.
+           The shape is still inferred on open when there is no comment — a
+           file created before this existed has none (mvx#171). */
+        char csql[800];
+        snprintf(csql, sizeof csql,
+                 "COMMENT ON TABLE %s IS 'mvx: format=%d'", qt, MVX_FILE_FORMAT);
+        PGresult *cr = PQexec(c, csql);
+        if (cr) PQclear(cr);
+    }
     if (!ok && r) {
         /* 42P07 = duplicate_table: create returns 0 if it exists */
         const char *sqlstate = PQresultErrorField(r, PG_DIAG_SQLSTATE);
@@ -1664,6 +1701,13 @@ static int pg_migrate_docs(const char *loc, char *err, size_t errlen) {
             PGresult *d = PQexec(c, sql);
             failed = !(d && PQresultStatus(d) == PGRES_COMMAND_OK);
             if (d) PQclear(d);
+        }
+        if (!failed) {                    /* say what it is now (mvx#171) */
+            snprintf(sql, sizeof sql,
+                     "COMMENT ON TABLE %s IS 'mvx: format=%d'",
+                     qt, MVX_FILE_FORMAT);
+            PGresult *cm = PQexec(c, sql);
+            if (cm) PQclear(cm);
         }
         if (failed) {
             snprintf(err, errlen, "postgres: %s: %s", names[i], PQerrorMessage(c));

@@ -222,12 +222,20 @@ static mvx_cursor *cursor_from(sqlite3_stmt *st) {
 
 /* ---------------------------------------------------- record operations */
 
-/* A file written before records became documents (#157) has a `rec` blob
-   column and no `doc`.  Nothing converts one — this is a pre-1.0 format break
-   — but it must SAY so.  Left undetected it is not a clean break at all: LISTF
-   reports no files (it looks for `doc`), COUNT reports the rows it can see,
-   and every READ says the record is not there.  Three different answers about
-   the same file and no error anywhere, which reads as "mvx lost my data". */
+/* THE STORED FORMAT, INFERRED FROM THE SHAPE.
+ *
+ * sqlite carries no note of its own: it has no table-comment syntax, and a
+ * comment written into CREATE TABLE does not survive — it normalises the DDL
+ * it stores, so `.schema` comes back without it (measured).  postgres and
+ * mysql stamp `mvx: format=N` on the table; here the shape IS the version,
+ * which is enough because the two formats differ in a column name: `rec` is
+ * format 1, `doc` is format 2 (mvx#171).
+ *
+ * It has to be detected either way.  Left undetected an old file is not a
+ * clean break at all: LISTF reports no files (it looks for `doc`), COUNT
+ * reports the rows it can see, and every READ says the record is not there —
+ * three different answers about one file and no error anywhere, which reads
+ * as "mvx lost my data". */
 static int sq_is_pre157(sqlite3 *db, const char *tbl) {
     char qt[300], sql[600];
     quote_ident(tbl, qt, sizeof qt);
