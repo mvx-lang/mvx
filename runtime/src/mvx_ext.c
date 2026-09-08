@@ -87,10 +87,22 @@ static void load_dir(const char *dir) {
     closedir(d);
 }
 
+/* The tables compiled into libmvxrt.  Registered before any dlopen, so a
+   package shipping the same name cannot displace a built-in ("first
+   registration wins" in register_ext) -- which is the point of a built-in:
+   JSONENCODE means the same thing in every account, whatever is installed. */
+static void register_builtins(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    register_ext(mvx_json_builtin());
+}
+
 void mvx_ext_load_libs(void) {
     if (g_loaded) return;
     g_loaded = 1;
 
+    register_builtins();                        /* before any dlopen */
     load_dir("LIB");                            /* account catalog */
 
     FILE *fp = fopen("PACKAGES", "r");          /* linked packages */
@@ -117,6 +129,7 @@ void mvx_ext_load_libs(void) {
 }
 
 int mvx_ext_has(const char *name) {
+    register_builtins();          /* available before any library is searched */
     if (find_ext(name)) return 1;
     if (!g_loaded) { mvx_ext_load_libs(); return find_ext(name) != NULL; }
     return 0;
@@ -124,6 +137,7 @@ int mvx_ext_has(const char *name) {
 
 void mvx_ext_invoke(mvx_ctx *ctx, const char *name, mv_value *ret,
                     int32_t argc, mv_value **argv) {
+    register_builtins();
     reg_ent *r = find_ext(name);
     if (!r && !g_loaded) { mvx_ext_load_libs(); r = find_ext(name); }
     if (!r)

@@ -24,6 +24,64 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MVX="$ROOT/build/bin/mvx-basic"
 TCL="$ROOT/build/bin/mvx"
+
+# --- packages under test ------------------------------------------------
+# The packages are separate products with their own releases; mvx no longer
+# carries them as submodules (#169).  The tests that exercise LINK-PKG fetch a
+# PINNED release and build it with mkpkg.sh -- exactly what they used to do to
+# the submodule working tree, except the tree is now the one users install.
+#
+# The SOURCE tarball, not the mvx binary artifact: mkpkg.sh compiles the
+# package here, and the published mvx binaries are linux-x86_64 only, so a
+# binary artifact would make this suite unrunnable on any other host.
+#
+# Bump a version here deliberately.  A pinned version is why a failure means
+# "mvx broke", not "a package released this morning".
+PKG_VERSION_cmd=1.4.1
+PKG_VERSION_getopt=1.1.0
+PKG_VERSION_git=2.0.3
+PKG_ASSET_cmd=cmd
+PKG_ASSET_getopt=getopt
+PKG_ASSET_git=mvx-lang_git
+PKG_REPO_cmd=mvx-lang/mv_cmd
+PKG_REPO_getopt=mvx-lang/getopt
+PKG_REPO_git=mvx-lang/mv_git
+
+# Cached across runs so a re-run is offline and fast; blow it away to re-fetch.
+#
+# Laid out as <cache>/pkgs/<name> -- BY NAME, no version in the directory --
+# because LINK-PKG resolves a dependency by looking for a sibling of that name
+# ("searched: linked packages, <pkg>/../, $MVXPKGPATH").  Versioned directory
+# names silently broke that: linking git stopped pulling cmd and getopt, and
+# the test still passed as far as exit status went -- only the recorded output
+# showed one `linked` line where there had been three.  The pinned version
+# lives in a stamp file instead, so a bump still re-fetches.
+PKGCACHE="${MVX_PKG_CACHE:-$ROOT/.pkgcache}"
+
+pkg_dir() { # pkg_dir <name> -> path to the unpacked, mkpkg-built package
+  _pn="$1"
+  eval "_pv=\$PKG_VERSION_$_pn"; eval "_pa=\$PKG_ASSET_$_pn"; eval "_pr=\$PKG_REPO_$_pn"
+  _pd="$PKGCACHE/pkgs/$_pn"
+  if [ "$(cat "$_pd/.version" 2>/dev/null)" != "$_pv" ]; then
+    rm -rf "$_pd"; mkdir -p "$_pd"
+    _url="https://github.com/$_pr/releases/download/$_pv/$_pa-$_pv-source.tar.gz"
+    if ! curl -fsSL "$_url" | tar xzf - -C "$_pd" 2>/dev/null; then
+      rm -rf "$_pd"
+      echo "test.sh: could not fetch $_pn $_pv from $_url" >&2
+      echo "         (set MVX_PKG_CACHE to a cache holding pkgs/$_pn to run offline)" >&2
+      exit 1
+    fi
+    printf '%s\n' "$_pv" > "$_pd/.version"
+  fi
+  # MVX_ROOT explicitly.  A package with a native part (git) finds the runtime
+  # headers at <pkg>/../.. by default, which happened to be the mvx tree only
+  # because the package sat in $ROOT/packages/.  Out of that position the
+  # default resolves to the cache directory and the native build fails --
+  # quietly, leaving a package whose GIT verb is missing while the suite still
+  # ran.  Say where the tree is instead of relying on where the package sits.
+  MVX_ROOT="$ROOT" "$ROOT/scripts/mkpkg.sh" "$_pd" >/dev/null
+  printf '%s' "$_pd"
+}
 EXP="$ROOT/tests/expected"
 
 BLESS=0
@@ -76,7 +134,9 @@ normalise() {
   # LIST-PKGS) sizes the padding from the *absolute* path length, which
   # differs by platform; @ROOT@ hides the path but not the trailing
   # spaces, so squeeze 2+ spaces after a normalised path token to one.
-  sed -E -e "s#$TESTROOT#@TESTROOT@#g" -e "s#$ROOT#@ROOT@#g" \
+  sed -E -e "s#$TESTROOT#@TESTROOT@#g" \
+         -e "s#$PKGCACHE/pkgs#@PKG@#g" \
+         -e "s#$ROOT#@ROOT@#g" \
          -e "s#(@(TEST)?ROOT@[^ ]*)  +#\1 #g" \
          -e 's/^([a-z][a-z0-9_-]*)@[0-9][^ ]* +/\1@VER /'
 }
@@ -726,23 +786,23 @@ printf 'I\nDOCTAG(file)\n\nFile\n10L\n' > "$ACCT/BP.DICT/FILE"
 printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
-# packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/getopt" >/dev/null
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/cmd" >/dev/null
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/git" >/dev/null
+# packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# Fetched and built once here, reused by every package test below.
+PKG_GETOPT="$(pkg_dir getopt)"
+PKG_CMD="$(pkg_dir cmd)"
+PKG_GIT="$(pkg_dir git)"
 check tcl-packages "$(printf '%s\n' \
-  "LINK-PKG $ROOT/packages/git" \
+  "LINK-PKG $PKG_GIT" \
   'LIST-PKGS' \
   'GIT' \
-  "UNLINK-PKG $ROOT/packages/cmd" \
-  "UNLINK-PKG $ROOT/packages/git" \
-  "UNLINK-PKG $ROOT/packages/cmd" | tclrun)"
+  "UNLINK-PKG $PKG_CMD" \
+  "UNLINK-PKG $PKG_GIT" \
+  "UNLINK-PKG $PKG_CMD" | tclrun)"
 
 # getopt: the declarative option parser exercised through the real LINK-PKG path.
 # A consumer verb declares flags once; GETOPT.PARSE splits the sentence (quoted
 # multi-word value, --flag, positionals) and the accessors read the result out
 # of COMMON /GETOPT/ across the package boundary.
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/getopt" >/dev/null
 GOP="$TESTROOT/gotest"
 mkdir -p "$GOP/BP" "$GOP/VOC"
 printf 'gotest\n1.0\ngetopt consumer\nmvx\n' > "$GOP/PKG"
@@ -760,9 +820,9 @@ EOF
 printf 'V\nCATALOG/GOTEST' > "$GOP/VOC/GOTEST"
 check tcl-getopt "$( \
   printf 'BUILD-PKG %s\n' "$GOP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
-  printf '%s\n' "LINK-PKG $ROOT/packages/getopt" "LINK-PKG $GOP" \
+  printf '%s\n' "LINK-PKG $PKG_GETOPT" "LINK-PKG $GOP" \
     'GOTEST -m "hi there" one --open two' \
-    "UNLINK-PKG $GOP" "UNLINK-PKG $ROOT/packages/getopt" | tclrun)"
+    "UNLINK-PKG $GOP" "UNLINK-PKG $PKG_GETOPT" | tclrun)"
 
 # cmd declarative flags: a subcommand declares flags with CMD.FLAG; CMD.RUN parses
 # the sentence against them via getopt and the handler reads GETOPT.VAL/HAS/ARG.
@@ -789,11 +849,11 @@ EOF
 printf 'V\nCATALOG/CFTEST' > "$CFP/VOC/CFTEST"
 check tcl-cmdflags "$( \
   printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
-  printf '%s\n' "LINK-PKG $ROOT/packages/getopt" "LINK-PKG $ROOT/packages/cmd" "LINK-PKG $CFP" \
+  printf '%s\n' "LINK-PKG $PKG_GETOPT" "LINK-PKG $PKG_CMD" "LINK-PKG $CFP" \
     'CFTEST COMMIT -m "hello world" --all f1 f2' \
     'CFTEST COMMIT --help' \
     'CFTEST COMMIT -z' \
-    "UNLINK-PKG $CFP" "UNLINK-PKG $ROOT/packages/cmd" "UNLINK-PKG $ROOT/packages/getopt" | tclrun)"
+    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun)"
 
 # native package build: BUILD-PKG compiles a package's BP -> CATALOG/LIB
 # through the runtime (no shell, no mkpkg on PATH), needing only developer
@@ -1280,7 +1340,7 @@ EOF
   printf 'OPEN "CUST" TO F ELSE STOP\nWRITE "Ada":@AM:"London" ON F, "C1"\n' > "$TESTROOT/vba.b"
   "$MVX" "$TESTROOT/vba.b" -o "$TESTROOT/vba.bin" 2>/dev/null
   (cd "$VBA" && MVXACCOUNT=. "$TESTROOT/vba.bin") >/dev/null
-  "$TCL" -a "$VBA" -c "LINK-PKG $ROOT/packages/git" >/dev/null 2>&1
+  "$TCL" -a "$VBA" -c "LINK-PKG $PKG_GIT" >/dev/null 2>&1
   "$TCL" -a "$VBA" -c 'GIT INIT' >/dev/null 2>&1
   "$TCL" -a "$VBA" -c 'GIT CONFIG user.name t' >/dev/null 2>&1
   "$TCL" -a "$VBA" -c 'GIT CONFIG user.email t@t' >/dev/null 2>&1
@@ -1320,7 +1380,7 @@ GSEOF
 "$MVX" "$gseed" -o "$TESTROOT/gseedbin" 2>/dev/null
 (cd "$GACCT" && MVXACCOUNT=. "$TESTROOT/gseedbin")
 check tcl-gitnative "$( \
-  printf "LINK-PKG $ROOT/packages/git\nGIT INIT\nGIT ADD CUST\nGIT STATUS\nGIT COMMIT -m initial\nGIT LOG\n" | \
+  printf "LINK-PKG $PKG_GIT\nGIT INIT\nGIT ADD CUST\nGIT STATUS\nGIT COMMIT -m initial\nGIT LOG\n" | \
     "$TCL" -a "$GACCT" 2>&1 \
       | normalise \
       | sed -E -e 's/[0-9a-f]{7,40}/HASH/g' \
@@ -1382,7 +1442,7 @@ DCEOF
 "$MVX" "$custom" -o "$TESTROOT/dcustombin" 2>/dev/null
 check tcl-delivery "$( \
   export MVXACCOUNT="$DACCT"; \
-  { printf "LINK-PKG $ROOT/packages/git\nGIT INIT\nGIT ADD MENU\nGIT COMMIT -m stock\nGIT BRANCH site\nGIT CHECKOUT site\n" | "$TCL" -a "$DACCT" 2>&1; \
+  { printf "LINK-PKG $PKG_GIT\nGIT INIT\nGIT ADD MENU\nGIT COMMIT -m stock\nGIT BRANCH site\nGIT CHECKOUT site\n" | "$TCL" -a "$DACCT" 2>&1; \
     (cd "$DACCT" && "$TESTROOT/dcustombin"); \
     printf 'GIT ADD MENU\nGIT COMMIT -m acme-custom\nGIT CHECKOUT main\nGIT CHERRY-PICK site\nCT MENU M9\nGIT BRANCH\n' | "$TCL" -a "$DACCT" 2>&1; \
   } | sed -E 's/\[[0-9a-f]{7,40}\]/[HASH]/g; s/^[0-9a-f]{7,40} /HASH /g' | normalise; \
@@ -1404,7 +1464,7 @@ IGEOF
 "$MVX" "$igseed" -o "$TESTROOT/igseedbin" 2>/dev/null
 (cd "$IGACCT" && MVXACCOUNT=. "$TESTROOT/igseedbin")
 check tcl-gitignore "$(printf '%s\n' \
-  "LINK-PKG $ROOT/packages/git" \
+  "LINK-PKG $PKG_GIT" \
   'GIT INIT' \
   'GIT IGNORE ORDERS' \
   'GIT ADD ORDERS' \

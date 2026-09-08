@@ -235,7 +235,9 @@ package, libgit2 (`brew install libgit2`). See the
 - `daemon/` — `mvx-lmdbd`, the networked LMDB storage daemon
 - `tcl/` — `mvx`, the classic shell
 - `verbs/` — the standard verb set (MVX BASIC)
-- `packages/` — shipped packages (`cmd`, `git`, `sample`)
+- `packages/` — packages built into the system account (`http`, `sample`).
+  The released packages (`cmd`, `getopt`, `git`, `json`, `mapfield`) are
+  separate repositories, installed with MVPKG rather than vendored here.
 - `docs/` — the documentation, a submodule of the GitHub wiki
 - `examples/` — larger sample programs (full-screen demo, Snake)
 - `demo/` — the demo account (a submodule of `mvx-lang/demo`): clients,

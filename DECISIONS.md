@@ -139,10 +139,11 @@
   library instead of making a verb; mkpkg.sh does the same for
   packages. The subroutine ABI is unchanged — this is resolution
   policy, not calling convention.
-- **The cmd package** (packages/cmd) is the Cobra-shaped command
+- **The cmd package** (mvx-lang/mv_cmd) is the Cobra-shaped command
   framework: CMD.INIT / CMD.ADD / CMD.RUN over a named COMMON, with
-  generated help and CALL @ handler dispatch. packages/git is the
-  reference consumer.
+  generated help and CALL @ handler dispatch. mvx-lang/mv_git is the
+  reference consumer. Both are separate products, installed with MVPKG;
+  mvx carried them as submodules until #169.
 - **Packages are account-shaped directories** (`BP/` source, `VOC/`
   verb records, `CATALOG/` executables — built by `scripts/mkpkg.sh`)
   linked into an account by the LINK-PKG / UNLINK-PKG / LIST-PKGS
