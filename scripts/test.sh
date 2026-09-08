@@ -2858,6 +2858,23 @@ fi
 # only moment that change is provably behaviour-neutral.  This is what keeps
 # them in: a rule nothing checks is a rule that decays, and this one has to hold
 # across six files that have no other reason to agree with each other.
+echo "== records as documents"
+# Compiled here rather than by CMake: it is a test, not something to install,
+# and building it against build/lib is the same thing build-native.sh does.
+if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/doc-roundtrip.c" \
+      -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/doc-roundtrip" 2>"$TESTROOT/dcerr"; then
+  if DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+     "$TESTROOT/doc-roundtrip" > "$TESTROOT/docout" 2>&1; then
+    PASS=$((PASS + 1)); sed -n 's/^doc-roundtrip: /  /p' "$TESTROOT/docout" | tail -1
+  else
+    echo "FAIL doc-roundtrip:"; sed 's/^/    /' "$TESTROOT/docout" | grep -A3 FAIL | head -20
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "FAIL doc-roundtrip: did not compile"; sed 's/^/    /' "$TESTROOT/dcerr" | head -10
+  FAIL=$((FAIL + 1))
+fi
+
 echo "== byte accessor discipline"
 stray=$(grep -rn -- '->data' "$ROOT"/runtime/src/*.c 2>/dev/null \
         | grep -v '^.*mv_str\.c:' || true)

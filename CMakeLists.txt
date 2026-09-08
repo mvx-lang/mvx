@@ -71,6 +71,7 @@ add_library(mvxrt SHARED
   runtime/src/mvx_ctx.c
   runtime/src/mvx_map.c
   runtime/src/mvx_json.c
+  runtime/src/mvx_doc.c
   runtime/src/mvx_ext.c
   runtime/src/mvx_store.c
   runtime/src/mvx_exec.c
