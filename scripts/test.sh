@@ -2726,10 +2726,39 @@ MYDEOF
   esac
   desc="$("$TCL" -a "$MYA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
   case "$desc" in
-    *"SELECT id FROM"*"SUBSTRING_INDEX"*) PASS=$((PASS+1))
+    *"SELECT id FROM"*"JSON_EXTRACT(doc,"*) PASS=$((PASS+1))
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL mysql push-down plan: $desc" ;;
   esac
+
+  # A MULTIVALUED TRANS() key.  Only postgres had this (tcl-transjoinmv), and
+  # the gap hid a real break: the join asks "is the target id one of the source
+  # key's values", which was a delimiter-wrapped LOCATE over the blob's
+  # @VM-joined text.  A multivalued attribute is a JSON ARRAY now (#157), so
+  # that text became `["C1", "C2"]` and the test silently stopped matching —
+  # measured at 1 row where 2 are right, and 0 where 1 is.  JSON_CONTAINS is
+  # the membership test for an array and a scalar alike.
+  for jf in MYCUSJ MYORDMV; do
+    "$TCL" -a "$MYA" -c "DELETE-FILE $jf" >/dev/null 2>&1
+    "$TCL" -a "$MYA" -c "CREATE-FILE $jf" >/dev/null 2>&1
+  done
+  cat > "$TESTROOT/myjnmv.b" <<'MYJEOF'
+OPEN "MYCUSJ" TO C ELSE STOP
+WRITE "Alpha":@AM:"Sydney" ON C, "C1"
+WRITE "Beta":@AM:"Melbourne" ON C, "C2"
+OPEN "MYORDMV" TO O ELSE STOP
+WRITE "C1":@AM:"Single" ON O, "M1"
+WRITE "C1":@VM:"C2":@AM:"Multi" ON O, "M2"
+OPEN "DICT", "MYORDMV" TO D ELSE STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"Product":@AM:"10L" ON D, "PRODUCT"
+WRITE "I":@AM:"TRANS(MYCUSJ,1,2,X)":@AM:"":@AM:"City":@AM:"10L" ON D, "CITY"
+MYJEOF
+  "$MVX" "$TESTROOT/myjnmv.b" -o "$TESTROOT/myjnmvbin" 2>/dev/null
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myjnmvbin")
+  # Sydney -> M1 (C1) + M2 (C1 is one of its values) = 2; Melbourne -> M2 = 1.
+  check tcl-mysql-transjoinmv "$( \
+    "$TCL" -a "$MYA" -c 'SELECT MYORDMV WITH CITY = "Sydney"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'SELECT MYORDMV WITH CITY = "Melbourne"' 2>&1)"
 else
   echo "  (mysql test skipped — set MVX_MYSQL to run)"
 fi
@@ -2927,6 +2956,8 @@ ag_seed() { # ag_seed <dir> [create-args]
   mkdir -p "$d"
   printf '# MVX account descriptor\nname=agree\nversion=1\n' > "$d/.mvx"
   [ -n "${AG_BIND:-}" ] && printf '%s\n' "$AG_BIND" > "$d/BINDINGS"
+  # the backend section above may have left its own CUST behind
+  "$TCL" -a "$d" -c 'DELETE-FILE CUST' >/dev/null 2>&1
   "$TCL" -a "$d" -c "CREATE-FILE CUST $*" >/dev/null 2>&1
   (cd "$d" && MVXACCOUNT=. "$TESTROOT/agseedbin") >/dev/null 2>&1
 }
@@ -2959,6 +2990,12 @@ if [ -n "${MVX_MONGO:-}" ]; then
   G=$(ag_answers "$AGACC/mg")
   AGOUT="$AGOUT
 mongo             $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+fi
+if [ -n "${MVX_MYSQL:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 2>&1; then
+  AG_BIND="* mysql $MVX_MYSQL" ag_seed "$AGACC/my"
+  G=$(ag_answers "$AGACC/my")
+  AGOUT="$AGOUT
+mysql             $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
 fi
 check tcl-backends-agree "$AGOUT"
 

@@ -2,3 +2,4 @@ verb (reference)  =London:1 #London:3 =empty:1
 sqlite            =London:1 #London:3 =empty:1
 postgres          =London:1 #London:3 =empty:1
 mongo             =London:1 #London:3 =empty:1
+mysql             =London:1 #London:3 =empty:1

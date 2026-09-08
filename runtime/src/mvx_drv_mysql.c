@@ -38,6 +38,7 @@
 
 #include "mvx_driver.h"
 #include "mvx_runtime.h"
+#include "mvx_doc.h"
 
 #include <mysql.h>
 #include <stdio.h>
@@ -97,20 +98,22 @@ static void quote_ident(const char *s, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* The nth @AM attribute of a column, as a SQL expression.
+/* The nth attribute, as a SQL expression.
  *
- * SUBSTRING_INDEX(x, d, n) returns everything before the nth delimiter,
- * and with a negative count everything after it -- so nesting the two
- * picks out field n.  The IF guards the end: asked for a field past the
- * last one, SUBSTRING_INDEX would hand back the whole string, where MV
- * says "".  Field count is (delimiters + 1), and the delimiter count is
- * the length lost when they are all removed. */
+ * A field of the document (#157).  This used to be a nest of SUBSTRING_INDEX
+ * over the record blob, with an IF to catch the end -- SUBSTRING_INDEX hands
+ * back the whole string when asked for a field past the last one, where MV
+ * says "".  Worse, an expression that shape cannot be indexed without a
+ * generated column, so raw attributes were not indexable here at all.
+ *
+ * JSON_UNQUOTE(JSON_EXTRACT(...)) rather than the ->> shorthand, which
+ * MariaDB does not accept.  COALESCE because an ABSENT KEY IS NULL while an
+ * attribute past the end reads as EMPTY in MV -- the same trap that made
+ * `# value` stop matching shorter records on postgres. */
 static void attr_expr(const char *col, int64_t n, char *out, size_t cap) {
     snprintf(out, cap,
-             "IF(%lld <= 1 + LENGTH(%s) - LENGTH(REPLACE(%s, CHAR(254), '')), "
-             "SUBSTRING_INDEX(SUBSTRING_INDEX(%s, CHAR(254), %lld), CHAR(254), -1), "
-             "'')",
-             (long long)n, col, col, col, (long long)n);
+             "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(%s, '$.\"%lld\"')), '')",
+             col, (long long)n);
 }
 
 /* The comparison expression for a field: a mapped column, or the blob
@@ -126,7 +129,7 @@ static void field_expr(const char *col, int64_t attr, const char *tbl_alias,
         char recref[64];
         snprintf(recref, sizeof recref, "%s%s",
                  (tbl_alias && tbl_alias[0]) ? tbl_alias : "",
-                 (tbl_alias && tbl_alias[0]) ? ".rec" : "rec");
+                 (tbl_alias && tbl_alias[0]) ? ".doc" : "doc");
         attr_expr(recref, attr, out, cap);
     }
 }
@@ -313,7 +316,7 @@ static int my_read(mvx_file *fh, const char *id, int64_t idlen, mv_value *rec) {
     my_file *f = (my_file *)fh;
     char qt[300], sql[400];
     quote_ident(f->table, qt, sizeof qt);
-    snprintf(sql, sizeof sql, "SELECT rec FROM %s WHERE id = ?", qt);
+    snprintf(sql, sizeof sql, "SELECT doc FROM %s WHERE id = ?", qt);
     MYSQL_STMT *st = mysql_stmt_init(f->db);
     if (!st) return 0;
     if (mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) != 0) {
@@ -345,7 +348,12 @@ static int my_read(mvx_file *fh, const char *id, int64_t idlen, mv_value *rec) {
         if (!buf) mvx_fatal("out of memory in mysql read");
         ob.buffer = buf; ob.buffer_length = outlen;
         if (mysql_stmt_fetch_column(st, &ob, 0, 0) == 0) {
-            mv_set_str(rec, buf, (int64_t)outlen);
+            /* The document IS the record (#157) — no blob behind it. */
+            mv_value doc;
+            mv_init(&doc);
+            mv_set_str(&doc, buf, (int64_t)outlen);
+            mvx_doc_decode(rec, &doc);
+            mv_clear(&doc);
             got = 1;
         }
         free(buf);
@@ -361,26 +369,32 @@ static int my_write(mvx_file *fh, const char *id, int64_t idlen,
     quote_ident(f->table, qt, sizeof qt);
     /* Upsert: MV's WRITE replaces whatever was there. */
     snprintf(sql, sizeof sql,
-             "INSERT INTO %s (id, rec) VALUES (?, ?) "
-             "ON DUPLICATE KEY UPDATE rec = VALUES(rec)", qt);
+             "INSERT INTO %s (id, doc) VALUES (?, ?) "
+             "ON DUPLICATE KEY UPDATE doc = VALUES(doc)", qt);
     MYSQL_STMT *st = mysql_stmt_init(f->db);
     if (!st) return 0;
     if (mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) != 0) {
         mysql_stmt_close(st); return 0;
     }
+    mv_value jdoc;
+    mv_init(&jdoc);
+    mvx_doc_encode(&jdoc, rec);
     char buf[256];
     const char *rp;
-    int64_t rl = mv_val_chars((mv_value *)rec, buf, sizeof buf, &rp);
+    int64_t rl = mv_val_chars(&jdoc, buf, sizeof buf, &rp);
     MYSQL_BIND b[2];
     unsigned long il = (unsigned long)idlen, rlen = (unsigned long)rl;
     memset(b, 0, sizeof b);
     b[0].buffer_type = MYSQL_TYPE_BLOB; b[0].buffer = (void *)id;
     b[0].buffer_length = il; b[0].length = &il;
-    b[1].buffer_type = MYSQL_TYPE_BLOB; b[1].buffer = (void *)rp;
+    /* STRING, not BLOB: a JSON column takes text, and the document is valid
+       UTF-8 by construction (bytes that are not get base64-wrapped). */
+    b[1].buffer_type = MYSQL_TYPE_STRING; b[1].buffer = (void *)rp;
     b[1].buffer_length = rlen; b[1].length = &rlen;
     mysql_stmt_bind_param(st, b);
     int ok = mysql_stmt_execute(st) == 0;
     mysql_stmt_close(st);
+    mv_clear(&jdoc);
     return ok;
 }
 
@@ -446,7 +460,7 @@ static int my_create(const char *spec, char *err, size_t errlen) {
        limit.  The record itself is a LONGBLOB and unbounded. */
     snprintf(sql, sizeof sql,
              "CREATE TABLE %s (id VARBINARY(255) NOT NULL PRIMARY KEY, "
-             "rec LONGBLOB) ENGINE=InnoDB", qt);
+             "doc JSON) ENGINE=InnoDB", qt);
     if (!exec_sql(db, sql)) {
         snprintf(err, errlen, "mysql: %s", mysql_error(db));
         return 0;
@@ -478,7 +492,7 @@ static int my_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     if (!db) return 0;
     if (!exec_sql(db,
             "SELECT table_name FROM information_schema.columns "
-            "WHERE table_schema = DATABASE() AND column_name = 'rec' "
+            "WHERE table_schema = DATABASE() AND column_name = 'doc' "
             "ORDER BY table_name")) {
         snprintf(err, errlen, "mysql: %s", mysql_error(db));
         return 0;
@@ -1136,12 +1150,31 @@ static mvx_cursor *my_select_join(mvx_file *srch, int64_t sk,
        makes LOCATE an EXACT element test -- without it "10" would match
        inside "100".  DISTINCT collapses a source record matching through
        more than one of its key values. */
+    /* How "the target id is one of the source key's values" is asked depends
+       on what the source key IS.
+       A MAPPED COLUMN still holds MV's own @VM-joined text, so the delimiter-
+       wrapped LOCATE is still the exact element test.
+       A RAW ATTRIBUTE is now a field of the document, and a multivalued one is
+       a JSON ARRAY (#157) — against which the LOCATE test silently stopped
+       matching, because the text it searched became `["C1", "C2"]`.  Measured
+       before this: a two-value key matched one row instead of two, and its
+       second value matched none at all.  JSON_CONTAINS is the membership test
+       for both shapes: true for an array holding the value, true for a scalar
+       equal to it, NULL (falsy in a JOIN) when the attribute is absent. */
+    char onx[1200];
+    if (src_keycol && src_keycol[0])
+        snprintf(onx, sizeof onx,
+                 "LOCATE(CONCAT(CHAR(253), t.id, CHAR(253)), "
+                 "CONCAT(CHAR(253), %s, CHAR(253))) > 0", skx);
+    else
+        snprintf(onx, sizeof onx,
+                 "JSON_CONTAINS(JSON_EXTRACT(s.doc, '$.\"%lld\"'), "
+                 "JSON_QUOTE(CONVERT(t.id USING utf8mb4)))",
+                 (long long)sk);
     char sql[2400];
     snprintf(sql, sizeof sql,
-             "SELECT DISTINCT s.id FROM %s s JOIN %s t "
-             "ON LOCATE(CONCAT(CHAR(253), t.id, CHAR(253)), "
-             "CONCAT(CHAR(253), %s, CHAR(253))) > 0 "
-             "WHERE %s = ?", sqt, tqt, skx, tax);
+             "SELECT DISTINCT s.id FROM %s s JOIN %s t ON %s WHERE %s = ?",
+             sqt, tqt, onx, tax);
     return run_ids(s->db, sql, &val, &vlen, 1);
 }
 
