@@ -749,6 +749,10 @@ static void index_name(sq_file *f, const char *item, char *out, size_t cap) {
     snprintf(out, cap, "mvxix_%s_%s", f->table, item);
 }
 
+/* Defined with the push-down helpers below; the index must be built on the
+   IDENTICAL text the query uses, so both come from here. */
+static void field_expr(const char *col, int64_t attr, char *out, size_t cap);
+
 static int sq_index_create(mvx_file *fh, const char *item,
                            const char *col, int64_t attr) {
     sq_file *f = (sq_file *)fh;
@@ -762,8 +766,7 @@ static int sq_index_create(mvx_file *fh, const char *item,
         snprintf(expr, sizeof expr, "%s", qc);
     } else {
         if (attr < 1) return -1;
-        snprintf(expr, sizeof expr, "json_extract(doc,'$.\"%lld\"')",
-                 (long long)attr);
+        field_expr(NULL, attr, expr, sizeof expr);   /* same text as the query */
     }
     snprintf(sql, sizeof sql, "CREATE INDEX IF NOT EXISTS %s ON %s (%s)",
              qn, qt, expr);
@@ -840,8 +843,18 @@ static int sq_index_drop(mvx_file *fh, const char *item) {
    the document.  Shared by every push-down so they agree on what a field
    means — and so an expression index built on the same text matches. */
 static void field_expr(const char *col, int64_t attr, char *out, size_t cap) {
-    if (col && col[0]) quote_ident(col, out, cap);
-    else snprintf(out, cap, "json_extract(doc,'$.\"%lld\"')", (long long)attr);
+    if (col && col[0]) { quote_ident(col, out, cap); return; }
+    /* COALESCE to '': AN ATTRIBUTE PAST THE END READS AS EMPTY in MV, and
+       json_extract is NULL for an absent key, where the mvx_attr() this
+       replaced returned '' (#157).
+       DEFENSIVE HERE, load-bearing on postgres.  sqlite maps `#` to IS NOT,
+       which is NULL-aware, so it agreed with the verb either way — measured,
+       by reverting this and watching tcl-backends-agree stay green.  Postgres
+       uses <> and silently stopped matching shorter records.  Kept so the two
+       drivers say the same thing about a missing attribute rather than relying
+       on one dialect's NULL handling. */
+    snprintf(out, cap, "COALESCE(json_extract(doc,'$.\"%lld\"'),'')",
+             (long long)attr);
 }
 
 static const char *sql_op(const char *op) {

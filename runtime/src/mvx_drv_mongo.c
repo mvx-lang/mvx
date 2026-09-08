@@ -39,6 +39,7 @@
  * authority (the runtime's process-local lock table applies).
  */
 #include "../include/mvx_driver.h"
+#include "../include/mvx_doc.h"
 
 #include <mongoc/mongoc.h>
 #include <errno.h>
@@ -234,13 +235,28 @@ static int mongo_read(mvx_file *fh, const char *id, int64_t idlen,
     int found = 0;
     if (mongoc_cursor_next(cur, &doc)) {
         bson_iter_t it;
-        if (bson_iter_init_find(&it, doc, "rec") && BSON_ITER_HOLDS_BINARY(&it)) {
-            bson_subtype_t st;
-            uint32_t len;
-            const uint8_t *data;
-            bson_iter_binary(&it, &st, &len, &data);
-            mv_set_str(rec, (const char *)data, (int64_t)len);
-            found = 1;
+        if (bson_iter_init_find(&it, doc, "doc") &&
+            BSON_ITER_HOLDS_DOCUMENT(&it)) {
+            /* Back through JSON: every value in the representation is a string
+               (#157), so relaxed extended JSON of this subdocument is plain
+               JSON and mvx_doc_decode is its exact inverse. */
+            uint32_t dlen = 0;
+            const uint8_t *ddata = NULL;
+            bson_iter_document(&it, &dlen, &ddata);
+            bson_t sub;
+            if (bson_init_static(&sub, ddata, dlen)) {
+                size_t jlen = 0;
+                char *js = bson_as_relaxed_extended_json(&sub, &jlen);
+                if (js) {
+                    mv_value jv;
+                    mv_init(&jv);
+                    mv_set_str(&jv, js, (int64_t)jlen);
+                    mvx_doc_decode(rec, &jv);
+                    mv_clear(&jv);
+                    bson_free(js);
+                    found = 1;
+                }
+            }
         }
     }
     mongoc_cursor_destroy(cur);
@@ -257,15 +273,30 @@ static int mongo_write(mvx_file *fh, const char *id, int64_t idlen,
     char nb[40];
     const char *rp;
     int64_t rl = mv_val_chars(rec, nb, sizeof nb, &rp);
-    /* Update only `rec` (upserting {_id, rec} when absent) rather than
-       replacing the whole document, so any mapped columns projected onto the
-       document survive a write that did not change them — the runtime's
-       mapping projection re-applies only the *changed* columns afterwards. */
+    /* Update only `doc` (upserting {_id, doc} when absent) rather than
+       replacing the whole document, so any mapped columns projected onto it
+       survive a write that did not change them — the runtime's mapping
+       projection re-applies only the *changed* columns afterwards.
+       The record is stored as a real BSON SUBDOCUMENT, not a blob: that is
+       what gives mongo a raw-attribute filter at all (doc.3), which it has
+       never had, because there is no server-side way to split a blob (#157). */
     bson_t sel, set, update, opts;
     sel_id(&sel, id, idlen);
     bson_init(&set);
-    bson_append_binary(&set, "rec", 3, BSON_SUBTYPE_BINARY,
-                       (const uint8_t *)rp, (uint32_t)rl);
+    mv_value jdoc;
+    mv_init(&jdoc);
+    mvx_doc_encode(&jdoc, rec);
+    char jb[40];
+    const char *jp;
+    int64_t jl = mv_val_chars(&jdoc, jb, sizeof jb, &jp);
+    bson_error_t jerr;
+    bson_t *body = bson_new_from_json((const uint8_t *)jp, (ssize_t)jl, &jerr);
+    if (body) {
+        bson_append_document(&set, "doc", 3, body);
+        bson_destroy(body);
+    }
+    mv_clear(&jdoc);
+    (void)rp; (void)rl;
     bson_init(&update);
     bson_append_document(&update, "$set", 4, &set);
     bson_init(&opts);
@@ -663,6 +694,75 @@ static int mongo_index_drop(mvx_file *fh, const char *item) {
 }
 
 /* Server-side WITH push-down: the ids whose mapped column satisfies "="/"#". */
+/* A predicate on a RAW attribute of the document — the push-down this driver
+ * has never had, because there was no server-side way to split a blob (#157).
+ *
+ * MONGO MATCHES ARRAY ELEMENTS NATIVELY, and that is the trap here.  A
+ * multivalued attribute is a JSON array, so the obvious {"doc.3": "6"} matches
+ * a record whose attribute 3 is ["5","6"] — while sqlite and postgres, which
+ * compare the whole attribute, do not.  Letting that through would make WITH
+ * mean something different on mongo than everywhere else, which is exactly the
+ * backend-specific behaviour non-negotiable 6 rules out.
+ *
+ * So an equality is constrained to a SCALAR attribute, and a not-equal admits
+ * arrays (a multivalued attribute is indeed not equal to a single value).  The
+ * result agrees with the other backends value for value.
+ *
+ * When the any-value question is settled (it is a real improvement mongo could
+ * offer for free), all four backends change together — not this one alone. */
+static void build_attr_pred(bson_t *filter, int64_t attr, const char *op,
+                            const char *val, int64_t vlen) {
+    char path[32];
+    snprintf(path, sizeof path, "doc.%lld", (long long)attr);
+    if (op[0] == '=') {
+        bson_t arr, eqd, notd, typd;
+        bson_append_array_begin(filter, "$and", 4, &arr);
+        bson_append_document_begin(&arr, "0", 1, &eqd);
+        bson_append_utf8(&eqd, path, -1, val, (int)vlen);
+        bson_append_document_end(&arr, &eqd);
+        bson_append_document_begin(&arr, "1", 1, &notd);
+        bson_t fieldd, notinner;
+        bson_append_document_begin(&notd, path, -1, &fieldd);
+        bson_append_document_begin(&fieldd, "$not", 4, &notinner);
+        bson_append_utf8(&notinner, "$type", 5, "array", 5);
+        bson_append_document_end(&fieldd, &notinner);
+        bson_append_document_end(&notd, &fieldd);
+        bson_append_document_end(&arr, &notd);
+        bson_append_array_end(filter, &arr);
+        (void)typd;
+    } else {                              /* '#' — not equal */
+        bson_t arr, isarr, ned;
+        bson_append_array_begin(filter, "$or", 3, &arr);
+        bson_append_document_begin(&arr, "0", 1, &isarr);
+        bson_t f1;
+        bson_append_document_begin(&isarr, path, -1, &f1);
+        bson_append_utf8(&f1, "$type", 5, "array", 5);
+        bson_append_document_end(&isarr, &f1);
+        bson_append_document_end(&arr, &isarr);
+        bson_append_document_begin(&arr, "1", 1, &ned);
+        bson_t f2;
+        bson_append_document_begin(&ned, path, -1, &f2);
+        bson_append_utf8(&f2, "$ne", 3, val, (int)vlen);
+        bson_append_document_end(&ned, &f2);
+        bson_append_document_end(&arr, &ned);
+        bson_append_array_end(filter, &arr);
+    }
+}
+
+/* WITH on an un-mapped attribute, in the backend. */
+static mvx_cursor *mongo_select_attr(mvx_file *fh, int64_t attr, const char *op,
+                                     const char *val, int64_t vlen) {
+    if (!op || !((op[0] == '=' || op[0] == '#') && !op[1])) return NULL;
+    if (attr < 1) return NULL;
+    mongo_file *f = (mongo_file *)fh;
+    bson_t filter;
+    bson_init(&filter);
+    build_attr_pred(&filter, attr, op, val, vlen);
+    mvx_cursor *c = query_ids(f, &filter);
+    bson_destroy(&filter);
+    return c;
+}
+
 static mvx_cursor *mongo_select_where(mvx_file *fh, const char *col,
                                       const char *op, const char *val,
                                       int64_t vlen) {
@@ -682,16 +782,17 @@ static mvx_cursor *mongo_select_where(mvx_file *fh, const char *col,
 static int64_t mongo_count_where(mvx_file *fh, const char *col, int64_t attr,
                                  const char *op, const char *val,
                                  int64_t vlen) {
-    (void)attr;
     mongo_file *f = (mongo_file *)fh;
     bson_t filter;
     bson_init(&filter);
     if (op && op[0]) {
-        if (!col || !((op[0] == '=' || op[0] == '#') && !op[1])) {
+        if (!((op[0] == '=' || op[0] == '#') && !op[1])) {
             bson_destroy(&filter);
             return -1;
         }
-        build_pred(&filter, col, op, val, vlen);
+        if (col && col[0]) build_pred(&filter, col, op, val, vlen);
+        else if (attr >= 1) build_attr_pred(&filter, attr, op, val, vlen);
+        else { bson_destroy(&filter); return -1; }
     }
     mongoc_collection_t *coll = coll_of(f);
     bson_error_t berr;
@@ -730,10 +831,11 @@ static const mvx_driver mvx_driver_mongo = {
     .index_drop = mongo_index_drop,
     /* WITH / COUNT equality push-down on a mapped column (#62). */
     .select_where = mongo_select_where,
+    .select_attr = mongo_select_attr,     /* raw attribute — new with #157 */
     .count_where = mongo_count_where,
     /* Deferred to the runtime's client-side fallback (#62): native read-back
-       (map_read/map_child_read — mirror mode only), select_attr (Mongo cannot
-       split the raw blob server-side), select_join, sum_where, select_order,
+       (map_read/map_child_read — mirror mode only), select_join, sum_where,
+       select_order,
        select_multi, explain, bulk batching, map_backfill, and lock authority. */
 };
 

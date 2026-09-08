@@ -157,10 +157,16 @@ static const char *split_spec(const char *spec, char *loc, size_t cap) {
    CREATE FUNCTION into the user's schema, a privilege a hosted account often
    does not have. */
 static void pg_attr_expr(int64_t attr, const char *alias, char *out, size_t cap) {
+    /* COALESCE to '' because AN ATTRIBUTE PAST THE END READS AS EMPTY in MV,
+       and doc->>'n' is NULL when the key is absent.  The blob expression this
+       replaced returned '' (split_part does), so without this a record that
+       simply has fewer attributes stops matching `# value` — NULL <> 'x' is
+       NULL, not true.  The index expression and the query expression both come
+       from here, so they still match. */
     if (alias && alias[0])
-        snprintf(out, cap, "%s.doc->>'%lld'", alias, (long long)attr);
+        snprintf(out, cap, "COALESCE(%s.doc->>'%lld','')", alias, (long long)attr);
     else
-        snprintf(out, cap, "doc->>'%lld'", (long long)attr);
+        snprintf(out, cap, "COALESCE(doc->>'%lld','')", (long long)attr);
 }
 
 /* The attribute as MV's own text: the values joined by @VM, the way the record

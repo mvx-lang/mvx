@@ -2387,14 +2387,17 @@ PDNEOF
     # It was mvx_attr(rec, 4) — a function this driver had to install — until
     # records became documents (#157); postgres renders the expression as
     # ((doc ->> '4'::text)).
-    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%doc ->> ''4''%' \
+    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%COALESCE%doc ->> ''4''%' \
       THEN 'expression' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_TIER_idx'")
     STDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%(\"STATE\")%' \
       THEN 'column' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_STATE_idx'")
+    # The expression must be IDENTICAL to the one the driver builds, or the
+    # index does not match it.  Both come from pg_attr_expr, COALESCE included
+    # (an attribute past the end reads as empty in MV, #157).
     EXPLN=$(psql_ext "SET enable_seqscan=off; EXPLAIN SELECT id FROM \
-      vmtest.\"PDN\" WHERE doc->>'4'='gold'")
+      vmtest.\"PDN\" WHERE COALESCE(doc->>'4','')='gold'")
     USES=$(printf '%s' "$EXPLN" | grep -q 'PDN_TIER_idx' && echo yes || echo no)
     check tcl-exprindex "$(printf '%s\n' \
       "TIER (unmapped) index kind: $IDXDEF" \
@@ -2882,6 +2885,82 @@ else
   echo "FAIL doc-roundtrip: did not compile"; sed 's/^/    /' "$TESTROOT/dcerr" | head -10
   FAIL=$((FAIL + 1))
 fi
+
+# ---------------------------------------------------------------------------
+# The backends agree with each other, and with the verb.
+#
+# Non-negotiable 6: nothing above the driver may depend on backend-specific
+# behaviour.  A push-down is only correct if it returns what the client-side
+# scan returns, so lmdb — which has no push-down and filters in the verb — is
+# the reference every other backend is compared against.
+#
+# This exists because storing records as documents (#157) broke that quietly
+# twice.  A missing attribute became NULL where the blob expression had
+# returned '', so a shorter record stopped matching `# value` on sqlite and
+# postgres; and mongo matches array elements natively, so a multivalued
+# attribute matched `= value` there and nowhere else.  Both passed every
+# existing test: each backend was self-consistent, and nothing compared them.
+echo "== backends agree"
+AGACC="$TESTROOT/agree"; mkdir -p "$AGACC"
+cat > "$TESTROOT/agseed.b" <<'AGEOF'
+OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
+OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L":@AM:"S" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "Ada":@AM:"London" ON F, "C1"
+WRITE "Grace":@AM:"York" ON F, "C2"
+WRITE "Alan":@AM:"London":@VM:"York" ON F, "C3"
+WRITE "Edsger":@AM:"" ON F, "C4"
+AGEOF
+"$MVX" "$TESTROOT/agseed.b" -o "$TESTROOT/agseedbin" >/dev/null 2>&1
+
+# answers <account-dir> -> the three counts, on one line
+ag_answers() {
+  a="$1"
+  n1=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  n2=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY # "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  n3=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = ""' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  printf '=London:%s #London:%s =empty:%s' "${n1:-?}" "${n2:-?}" "${n3:-?}"
+}
+ag_seed() { # ag_seed <dir> [create-args]
+  d="$1"; shift
+  mkdir -p "$d"
+  printf '# MVX account descriptor\nname=agree\nversion=1\n' > "$d/.mvx"
+  [ -n "${AG_BIND:-}" ] && printf '%s\n' "$AG_BIND" > "$d/BINDINGS"
+  "$TCL" -a "$d" -c "CREATE-FILE CUST $*" >/dev/null 2>&1
+  (cd "$d" && MVXACCOUNT=. "$TESTROOT/agseedbin") >/dev/null 2>&1
+}
+
+AG_BIND="" ag_seed "$AGACC/lmdb"
+REF=$(ag_answers "$AGACC/lmdb")
+AGOUT="verb (reference)  $REF"
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  AG_BIND="* sqlite $AGACC/sq.sqlite" ag_seed "$AGACC/sqlite"
+  G=$(ag_answers "$AGACC/sqlite")
+  AGOUT="$AGOUT
+sqlite            $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+fi
+if [ -n "${MVX_PG:-}" ]; then
+  psql_ext "DROP SCHEMA IF EXISTS agree CASCADE" >/dev/null 2>&1
+  mkdir -p "$AGACC/pg"
+  printf 'SET-CONNECTION cn driver=postgres %s namespace=agree\n' "$MVX_PG" | \
+    "$TCL" -a "$AGACC/pg" >/dev/null 2>&1
+  AG_BIND="CUST @cn" ag_seed "$AGACC/pg" "USING @cn"
+  G=$(ag_answers "$AGACC/pg")
+  AGOUT="$AGOUT
+postgres          $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+fi
+if [ -n "${MVX_MONGO:-}" ]; then
+  mkdir -p "$AGACC/mg"
+  printf 'SET-CONNECTION cn driver=mongo address=%s namespace=agree\n' \
+    "$(printf '%s' "$MVX_MONGO" | sed -n 's/.*address=\([^ ]*\).*/\1/p')" | \
+    "$TCL" -a "$AGACC/mg" >/dev/null 2>&1
+  AG_BIND="CUST @cn" ag_seed "$AGACC/mg" "USING @cn"
+  G=$(ag_answers "$AGACC/mg")
+  AGOUT="$AGOUT
+mongo             $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+fi
+check tcl-backends-agree "$AGOUT"
 
 echo "== byte accessor discipline"
 stray=$(grep -rn -- '->data' "$ROOT"/runtime/src/*.c 2>/dev/null \
