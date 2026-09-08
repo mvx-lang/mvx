@@ -132,12 +132,15 @@ normalise() {
   # Substitute absolute roots, then collapse the column padding that
   # trails a substituted path.  A verb that FMT-pads a path column (e.g.
   # LIST-PKGS) sizes the padding from the *absolute* path length, which
-  # differs by platform; @ROOT@ hides the path but not the trailing
+  # differs by platform; the token hides the path but not the trailing
   # spaces, so squeeze 2+ spaces after a normalised path token to one.
+  # EVERY token has to be in that list.  @PKG@ was not, and the padding
+  # for a fetched package's path then depended on where the checkout
+  # lived -- passing here and failing on the CI runner (#169).
   sed -E -e "s#$TESTROOT#@TESTROOT@#g" \
          -e "s#$PKGCACHE/pkgs#@PKG@#g" \
          -e "s#$ROOT#@ROOT@#g" \
-         -e "s#(@(TEST)?ROOT@[^ ]*)  +#\1 #g" \
+         -e "s#(@(TESTROOT|ROOT|PKG)@[^ ]*)  +#\1 #g" \
          -e 's/^([a-z][a-z0-9_-]*)@[0-9][^ ]* +/\1@VER /'
 }
 
