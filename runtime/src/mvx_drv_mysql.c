@@ -939,16 +939,61 @@ static void index_name(my_file *f, const char *item, char *out, size_t cap) {
    than depend on a version or silently build something different on each,
    the raw-attribute case declines and the caller scans.  A dictionary field
    worth indexing is worth mapping. */
+/* The generated column carrying a raw attribute, so it can be indexed.  Named
+   from the attribute, not the dict item, because two items on one attribute are
+   one stored value read two ways (#158) and should share the column. */
+static void gen_col_name(int64_t attr, char *out, size_t cap) {
+    snprintf(out, cap, "mvxa%lld", (long long)attr);
+}
+
 static int my_index_create(mvx_file *fh, const char *item, const char *col,
                            int64_t attr) {
     my_file *f = (my_file *)fh;
-    (void)attr;
-    if (!col || !col[0]) return -1;
     char qt[300], qc[300], nm[512], qn[600], sql[1400];
     quote_ident(f->table, qt, sizeof qt);
-    quote_ident(col, qc, sizeof qc);
     index_name(f, item, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
+
+    if (!col || !col[0]) {
+        /* AN UN-MAPPED ATTRIBUTE.  MySQL refuses a functional index on an
+           expression returning TEXT ("ERROR 3757: Cannot create a functional
+           index on an expression that returns a BLOB or TEXT"), which is why
+           raw attributes were not indexable here at all — the driver returned
+           -1 and the runtime built its own index instead.
+           A STORED GENERATED COLUMN carrying the same expression, with a PREFIX
+           index on it, gets there without changing what anything means: the
+           push-down query is untouched, and MySQL matches the expression to the
+           generated column and uses the index (measured: `key: ix`, ref access).
+           A prefix index is transparent — MySQL rechecks the full value — so
+           unlike a bounded CAST it does not make two long values compare equal.
+           The expression must be BYTE-IDENTICAL to the push-down's, so it comes
+           from field_expr, the same place. */
+        if (attr < 1) return -1;
+        char gen[64], qg[80], ex[700];
+        gen_col_name(attr, gen, sizeof gen);
+        quote_ident(gen, qg, sizeof qg);
+        field_expr(NULL, attr, NULL, ex, sizeof ex);
+        snprintf(sql, sizeof sql,
+                 "ALTER TABLE %s ADD COLUMN %s TEXT AS (%s) STORED", qt, qg, ex);
+        /* 1060 = ER_DUP_FIELDNAME: the column is already there, which is what
+           makes a second CREATE-INDEX on the same attribute idempotent. */
+        if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1060) return -1;
+        snprintf(sql, sizeof sql, "CREATE INDEX %s ON %s (%s(255))",
+                 qn, qt, qg);
+        if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1061) return -1;
+        char csql2[400];
+        snprintf(csql2, sizeof csql2, "SELECT COUNT(*) FROM %s", qt);
+        int rn = 0;
+        if (exec_sql(f->db, csql2)) {
+            MYSQL_RES *r = mysql_store_result(f->db);
+            MYSQL_ROW row = r ? mysql_fetch_row(r) : NULL;
+            if (row && row[0]) rn = atoi(row[0]);
+            if (r) mysql_free_result(r);
+        }
+        return rn;
+    }
+
+    quote_ident(col, qc, sizeof qc);
     snprintf(sql, sizeof sql, "CREATE INDEX %s ON %s (%s)", qn, qt, qc);
     /* 1061 = ER_DUP_KEYNAME: already indexed is success, not failure. */
     if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1061) return -1;
@@ -997,8 +1042,32 @@ static int my_index_drop(mvx_file *fh, const char *item) {
     quote_ident(f->table, qt, sizeof qt);
     index_name(f, item, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
+    /* Which column it covers, before dropping it: a raw-attribute index has a
+       generated column behind it (mvxa<n>) that would otherwise be left
+       orphaned on the table, still costing a write on every WRITE. */
+    char et[520], en[520], q[900], gen[256] = "";
+    mysql_real_escape_string(f->db, et, f->table, (unsigned long)strlen(f->table));
+    mysql_real_escape_string(f->db, en, nm, (unsigned long)strlen(nm));
+    snprintf(q, sizeof q,
+             "SELECT column_name FROM information_schema.statistics "
+             "WHERE table_schema = DATABASE() AND table_name = '%s' "
+             "AND index_name = '%s' ORDER BY seq_in_index LIMIT 1", et, en);
+    if (exec_sql(f->db, q)) {
+        MYSQL_RES *r = mysql_store_result(f->db);
+        MYSQL_ROW row = r ? mysql_fetch_row(r) : NULL;
+        if (row && row[0] && strncmp(row[0], "mvxa", 4) == 0)
+            snprintf(gen, sizeof gen, "%s", row[0]);
+        if (r) mysql_free_result(r);
+    }
     snprintf(sql, sizeof sql, "DROP INDEX %s ON %s", qn, qt);
-    return exec_sql(f->db, sql) || mysql_errno(f->db) == 1091;  /* absent = done */
+    int ok = exec_sql(f->db, sql) || mysql_errno(f->db) == 1091;  /* absent = done */
+    if (ok && gen[0]) {
+        char qg[300];
+        quote_ident(gen, qg, sizeof qg);
+        snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN %s", qt, qg);
+        exec_sql(f->db, sql);            /* best effort: the index is gone */
+    }
+    return ok;
 }
 
 /* ----------------------------------------------------- WITH push-down */

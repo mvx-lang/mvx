@@ -2731,6 +2731,39 @@ MYDEOF
     *) FAIL=$((FAIL+1)); echo "FAIL mysql push-down plan: $desc" ;;
   esac
 
+  # CREATE-INDEX on an UN-MAPPED attribute.  MySQL refuses a functional index
+  # on an expression returning TEXT, so raw attributes were not indexable here
+  # at all — the driver returned -1 and the runtime built its own index.  It
+  # now adds a STORED generated column carrying the push-down expression and a
+  # prefix index on it (#157).
+  #
+  # This asserts the path works and still answers correctly.  That the index is
+  # USED was measured by hand, and is worth recording because it is easy to get
+  # a false negative: the generated column stores its literals in the
+  # CONNECTION's character set, so an EXPLAIN issued from a client on a
+  # different charset does not match the expression and reports a full scan —
+  #   _utf8mb4'$."2"'  (mvx's connection)  vs  _latin1'$."2"'  (mysql CLI default)
+  # On a matching connection: `key: mvxix_CITY`, ref access, 1 row.
+  "$TCL" -a "$MYA" -c 'DELETE-FILE IXR' >/dev/null 2>&1
+  "$TCL" -a "$MYA" -c 'CREATE-FILE IXR' >/dev/null 2>&1
+  cat > "$TESTROOT/myixr.b" <<'MYIEOF'
+OPEN "IXR" TO F ELSE STOP
+OPEN "DICT", "IXR" TO D ELSE STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "Ada":@AM:"London" ON F, "R1"
+WRITE "Grace":@AM:"York" ON F, "R2"
+WRITE "Alan":@AM:"London" ON F, "R3"
+MYIEOF
+  "$MVX" "$TESTROOT/myixr.b" -o "$TESTROOT/myixrbin" 2>/dev/null
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myixrbin")
+  check tcl-mysql-rawindex "$( \
+    "$TCL" -a "$MYA" -c 'CREATE-INDEX IXR CITY' 2>&1; \
+    "$TCL" -a "$MYA" -c 'LIST-INDEXES IXR' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "London"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "York"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'DELETE-INDEX IXR CITY' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "London"' 2>&1)"
+
   # A MULTIVALUED TRANS() key.  Only postgres had this (tcl-transjoinmv), and
   # the gap hid a real break: the join asks "is the target id one of the source
   # key's values", which was a delimiter-wrapped LOCATE over the blob's
