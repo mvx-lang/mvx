@@ -291,12 +291,44 @@ static mvx_cursor *run_ids(MYSQL *db, const char *sql,
 
 /* ---------------------------------------------------- record operations */
 
+/* A file written before records became documents (#157): a `rec` blob column
+   and no `doc`.  Nothing converts one — a pre-1.0 format break — but it must
+   SAY so.  Undetected it is not a clean break: LISTF reports no files (it
+   looks for `doc`), COUNT reports the rows it can see, and every READ says
+   the record is not there.  Three answers about one file and no error, which
+   reads as "mvx lost my data". */
+static int my_is_pre157(MYSQL *db, const char *table) {
+    char q[600];
+    char esc[300];
+    mysql_real_escape_string(db, esc, table, (unsigned long)strlen(table));
+    snprintf(q, sizeof q,
+             "SELECT SUM(column_name='doc'), SUM(column_name='rec') "
+             "FROM information_schema.columns "
+             "WHERE table_schema = DATABASE() AND table_name = '%s'", esc);
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(db);
+    int old = 0;
+    if (r) {
+        MYSQL_ROW row = mysql_fetch_row(r);
+        if (row) old = (!row[0] || atoi(row[0]) == 0) && row[1] && atoi(row[1]) > 0;
+        mysql_free_result(r);
+    }
+    return old;
+}
+
 static mvx_file *my_open(const char *spec, char *err, size_t errlen) {
     char loc[1024];
     const char *tbl = split_spec(spec, loc, sizeof loc);
     MYSQL *db = my_connect(loc, err, errlen);
     if (!db) return NULL;
     if (!table_exists(db, tbl)) return NULL;   /* not found: normal ELSE path */
+    if (my_is_pre157(db, tbl)) {
+        snprintf(err, errlen,
+                 "mysql: %s was written before records became documents "
+                 "(it has a `rec` column and no `doc`).  Convert it with:  "
+                 "mvx-doc-migrate mysql <connection>", tbl);
+        return NULL;
+    }
     my_file *f = calloc(1, sizeof(my_file));
     if (!f) mvx_fatal("out of memory opening %s", spec);
     f->base.driver = &mvx_driver_mysql;
@@ -1217,6 +1249,123 @@ static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
 
 /* ------------------------------------------------------------- vtable */
 
+/* ------------------------------------------------------- doc migration */
+
+/* Convert every pre-#157 file in this database to the document form.  Same
+   shape as the other SQL drivers, different dialect: add `doc JSON`, encode
+   each record into it, prove every row converted, drop `rec`.  One
+   transaction per file. */
+static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
+    MYSQL *db = my_connect(loc, err, errlen);
+    if (!db) return -1;
+    if (mysql_query(db,
+            "SELECT c.table_name FROM information_schema.columns c "
+            "WHERE c.table_schema = DATABASE() AND c.column_name = 'rec' "
+            "AND NOT EXISTS (SELECT 1 FROM information_schema.columns d "
+            "  WHERE d.table_schema = c.table_schema "
+            "  AND d.table_name = c.table_name AND d.column_name = 'doc') "
+            "ORDER BY c.table_name") != 0) {
+        snprintf(err, errlen, "mysql: %s", mysql_error(db));
+        return -1;
+    }
+    MYSQL_RES *lr = mysql_store_result(db);
+    if (!lr) { snprintf(err, errlen, "mysql: %s", mysql_error(db)); return -1; }
+    int n = (int)mysql_num_rows(lr);
+    char (*names)[128] = n ? calloc((size_t)n, sizeof *names) : NULL;
+    for (int i = 0; i < n; i++) {
+        MYSQL_ROW row = mysql_fetch_row(lr);
+        snprintf(names[i], sizeof names[0], "%s", row && row[0] ? row[0] : "");
+    }
+    mysql_free_result(lr);
+
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        char qt[300], sql[900];
+        quote_ident(names[i], qt, sizeof qt);
+        mysql_query(db, "START TRANSACTION");
+        snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc JSON", qt);
+        if (mysql_query(db, sql) != 0) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        snprintf(sql, sizeof sql, "SELECT id, rec FROM %s", qt);
+        if (mysql_query(db, sql) != 0) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        MYSQL_RES *rows = mysql_store_result(db);
+        if (!rows) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        int rn = (int)mysql_num_rows(rows), failed = 0;
+        snprintf(sql, sizeof sql, "UPDATE %s SET doc = ? WHERE id = ?", qt);
+        MYSQL_ROW row;
+        while (!failed && (row = mysql_fetch_row(rows))) {
+            unsigned long *lens = mysql_fetch_lengths(rows);
+            mv_value rec, doc;
+            mv_init(&rec); mv_init(&doc);
+            mv_set_str(&rec, row[1] ? row[1] : "", (int64_t)(lens ? lens[1] : 0));
+            mvx_doc_encode(&doc, &rec);
+            char nb[64];
+            const char *dp;
+            int64_t dl = mv_val_chars(&doc, nb, sizeof nb, &dp);
+            MYSQL_STMT *st = mysql_stmt_init(db);
+            if (st && mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) == 0) {
+                MYSQL_BIND b[2];
+                unsigned long dlen = (unsigned long)dl;
+                unsigned long ilen = lens ? lens[0] : 0;
+                memset(b, 0, sizeof b);
+                b[0].buffer_type = MYSQL_TYPE_STRING;
+                b[0].buffer = (void *)dp; b[0].buffer_length = dlen;
+                b[0].length = &dlen;
+                b[1].buffer_type = MYSQL_TYPE_BLOB;
+                b[1].buffer = (void *)row[0]; b[1].buffer_length = ilen;
+                b[1].length = &ilen;
+                mysql_stmt_bind_param(st, b);
+                if (mysql_stmt_execute(st) != 0 ||
+                    mysql_stmt_affected_rows(st) != 1)
+                    failed = 1;             /* wrote nothing: do not drop */
+            } else failed = 1;
+            if (st) mysql_stmt_close(st);
+            mv_clear(&rec); mv_clear(&doc);
+        }
+        mysql_free_result(rows);
+        /* PROVE EVERY ROW CONVERTED BEFORE DROPPING THE OLD COLUMN. */
+        if (!failed) {
+            snprintf(sql, sizeof sql,
+                     "SELECT COUNT(*) FROM %s WHERE doc IS NULL", qt);
+            long nulls = -1;
+            if (mysql_query(db, sql) == 0) {
+                MYSQL_RES *ck = mysql_store_result(db);
+                if (ck) {
+                    MYSQL_ROW cr = mysql_fetch_row(ck);
+                    if (cr && cr[0]) nulls = atol(cr[0]);
+                    mysql_free_result(ck);
+                }
+            }
+            if (nulls != 0) {
+                snprintf(err, errlen,
+                         "mysql: %s: %ld of %d record(s) did not convert — "
+                         "left in the old format", names[i], nulls, rn);
+                mysql_query(db, "ROLLBACK"); free(names); return -1;
+            }
+        }
+        if (!failed) {
+            snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
+            if (mysql_query(db, sql) != 0) failed = 1;
+        }
+        if (failed) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        mysql_query(db, "COMMIT");
+        done++;
+    }
+    free(names);
+    return done;
+}
+
 static const mvx_driver mvx_driver_mysql = {
     "mysql",
     my_open, my_close,
@@ -1248,6 +1397,7 @@ static const mvx_driver mvx_driver_mysql = {
     NULL,                                 /* select_join_order: the verb sorts
                                              the reference itself */
     my_rollback,                          /* abort a failed logical write */
+    my_migrate_docs,                      /* pre-#157 blob -> document */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

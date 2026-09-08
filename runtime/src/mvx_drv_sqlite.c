@@ -222,12 +222,41 @@ static mvx_cursor *cursor_from(sqlite3_stmt *st) {
 
 /* ---------------------------------------------------- record operations */
 
+/* A file written before records became documents (#157) has a `rec` blob
+   column and no `doc`.  Nothing converts one — this is a pre-1.0 format break
+   — but it must SAY so.  Left undetected it is not a clean break at all: LISTF
+   reports no files (it looks for `doc`), COUNT reports the rows it can see,
+   and every READ says the record is not there.  Three different answers about
+   the same file and no error anywhere, which reads as "mvx lost my data". */
+static int sq_is_pre157(sqlite3 *db, const char *tbl) {
+    char qt[300], sql[600];
+    quote_ident(tbl, qt, sizeof qt);
+    snprintf(sql, sizeof sql,
+             "SELECT sum(name='doc'), sum(name='rec') FROM pragma_table_info(%s)",
+             "?1");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, tbl, -1, SQLITE_STATIC);
+    int old = 0;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        old = sqlite3_column_int(st, 0) == 0 && sqlite3_column_int(st, 1) > 0;
+    sqlite3_finalize(st);
+    return old;
+}
+
 static mvx_file *sq_open(const char *spec, char *err, size_t errlen) {
     char path[1024];
     const char *tbl = split_spec(spec, path, sizeof path);
     sqlite3 *db = sq_connect(path, err, errlen);
     if (!db) return NULL;
     if (!table_exists(db, tbl)) return NULL;   /* not found: normal ELSE path */
+    if (sq_is_pre157(db, tbl)) {
+        snprintf(err, errlen,
+                 "sqlite: %s was written before records became documents "
+                 "(it has a `rec` blob and no `doc`).  Convert it with:  "
+                 "mvx-doc-migrate sqlite <database>", tbl);
+        return NULL;
+    }
     sq_file *f = calloc(1, sizeof(sq_file));
     if (!f) mvx_fatal("out of memory opening %s", spec);
     f->base.driver = &mvx_driver_sqlite;
@@ -1111,6 +1140,148 @@ static int sq_explain(mvx_file *fh, const mvx_pred *preds, int npred,
 
 /* ------------------------------------------------------------- vtable */
 
+/* ------------------------------------------------------- doc migration */
+
+/* Convert every pre-#157 file in this database to the document form.
+ *
+ * Whole-database rather than per file because an old file cannot be opened:
+ * sq_open refuses it and LISTF does not list it, so the only place the set of
+ * them exists is sqlite's own catalogue.
+ *
+ * Per file: add `doc`, encode each record into it, then drop `rec`.  The
+ * encode has to happen HERE, in C — it is mvx_doc_encode, not something SQL
+ * can express — so this reads every row rather than doing a clever UPDATE.
+ *
+ * The whole file is one transaction, so an interrupted run leaves the file in
+ * the old format rather than half converted.  Idempotent: a file that already
+ * has `doc` is skipped. */
+static int sq_migrate_docs(const char *loc, char *err, size_t errlen) {
+    sqlite3 *db = sq_connect(loc, err, errlen);
+    if (!db) return -1;
+
+    /* Collect the names first: the conversion alters the schema, and walking
+       sqlite_master while doing so is asking for trouble. */
+    char (*names)[256] = NULL;
+    int n = 0, cap = 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.name FROM sqlite_master m "
+            "JOIN pragma_table_info(m.name) p "
+            "WHERE m.type='table' AND p.name='rec' "
+            "AND NOT EXISTS (SELECT 1 FROM pragma_table_info(m.name) q "
+            "                WHERE q.name='doc') ORDER BY m.name",
+            -1, &st, NULL) != SQLITE_OK) {
+        snprintf(err, errlen, "sqlite: %s", sqlite3_errmsg(db));
+        return -1;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 8;
+            void *np = realloc(names, (size_t)nc * sizeof *names);
+            if (!np) { free(names); sqlite3_finalize(st);
+                       snprintf(err, errlen, "sqlite: out of memory"); return -1; }
+            names = np; cap = nc;
+        }
+        snprintf(names[n], sizeof names[0], "%s",
+                 (const char *)sqlite3_column_text(st, 0));
+        n++;
+    }
+    sqlite3_finalize(st);
+
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        char qt[300];
+        quote_ident(names[i], qt, sizeof qt);
+        char sql[800];
+        if (sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) {
+            snprintf(err, errlen, "sqlite: %s", sqlite3_errmsg(db));
+            free(names); return -1;
+        }
+        snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc TEXT", qt);
+        if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) {
+            snprintf(err, errlen, "sqlite: %s: %s", names[i], sqlite3_errmsg(db));
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            free(names); return -1;
+        }
+        /* By ROWID, not by id.  An id is a BLOB here, and matching it back
+           depends on storage class — a row whose id was stored as TEXT does
+           not equal the same bytes bound as a blob, so the UPDATE matches
+           nothing.  rowid is an integer and always matches itself. */
+        snprintf(sql, sizeof sql, "SELECT rowid, rec FROM %s", qt);
+        sqlite3_stmt *rd = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &rd, NULL) != SQLITE_OK) {
+            snprintf(err, errlen, "sqlite: %s: %s", names[i], sqlite3_errmsg(db));
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            free(names); return -1;
+        }
+        char usql[800];
+        snprintf(usql, sizeof usql, "UPDATE %s SET doc = ?2 WHERE rowid = ?1", qt);
+        int failed = 0;
+        int64_t seen = 0;
+        while (!failed && sqlite3_step(rd) == SQLITE_ROW) {
+            sqlite3_int64 rid = sqlite3_column_int64(rd, 0);
+            const void *rp = sqlite3_column_blob(rd, 1);
+            int rl = sqlite3_column_bytes(rd, 1);
+            seen++;
+            mv_value rec, doc;
+            mv_init(&rec); mv_init(&doc);
+            mv_set_str(&rec, (const char *)rp, (int64_t)rl);
+            mvx_doc_encode(&doc, &rec);
+            char nb[64];
+            const char *dp;
+            int64_t dl = mv_val_chars(&doc, nb, sizeof nb, &dp);
+            sqlite3_stmt *up = NULL;
+            if (sqlite3_prepare_v2(db, usql, -1, &up, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(up, 1, rid);
+                sqlite3_bind_text(up, 2, dp, (int)dl, SQLITE_TRANSIENT);
+                if (sqlite3_step(up) != SQLITE_DONE || sqlite3_changes(db) != 1)
+                    failed = 1;                  /* wrote nothing: do not drop */
+                sqlite3_finalize(up);
+            } else failed = 1;
+            mv_clear(&rec); mv_clear(&doc);
+        }
+        sqlite3_finalize(rd);
+        /* PROVE EVERY ROW WAS CONVERTED BEFORE DROPPING THE OLD COLUMN.  An
+           UPDATE that matches nothing is not an error in SQL, so without this
+           the migration reports success, drops `rec`, and the records are
+           gone — which is exactly what the first version of this did. */
+        if (!failed) {
+            char csql[800];
+            snprintf(csql, sizeof csql,
+                     "SELECT count(*) FROM %s WHERE doc IS NULL", qt);
+            sqlite3_stmt *ck = NULL;
+            int64_t nulls = -1;
+            if (sqlite3_prepare_v2(db, csql, -1, &ck, NULL) == SQLITE_OK) {
+                if (sqlite3_step(ck) == SQLITE_ROW)
+                    nulls = sqlite3_column_int64(ck, 0);
+                sqlite3_finalize(ck);
+            }
+            if (nulls != 0) {
+                snprintf(err, errlen,
+                         "sqlite: %s: %lld of %lld record(s) did not convert — "
+                         "left in the old format",
+                         names[i], (long long)nulls, (long long)seen);
+                sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+                free(names);
+                return -1;
+            }
+        }
+        if (!failed) {
+            snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
+            if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) failed = 1;
+        }
+        if (failed) {
+            snprintf(err, errlen, "sqlite: %s: %s", names[i], sqlite3_errmsg(db));
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            free(names); return -1;
+        }
+        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+        done++;
+    }
+    free(names);
+    return done;
+}
+
 static const mvx_driver mvx_driver_sqlite = {
     "sqlite",
     sq_open, sq_close,
@@ -1151,6 +1322,7 @@ static const mvx_driver mvx_driver_sqlite = {
                                              sorts the reference itself, which
                                              is correct and only slower */
     sq_rollback,                          /* abort a failed logical write */
+    sq_migrate_docs,                      /* pre-#157 blob -> document */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

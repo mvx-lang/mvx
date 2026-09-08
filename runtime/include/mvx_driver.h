@@ -307,6 +307,16 @@ typedef struct mvx_driver {
        write).  Only the caller that started one may commit or roll it back;
        an inner bracket that returned 0 must do neither. */
     int (*rollback)(mvx_file *f);
+
+    /* Convert every file in `loc` from the pre-#157 record blob to the
+       document form, in place.  Optional (NULL where a driver never stored a
+       blob, e.g. the local key-value backends, whose records ARE the bytes).
+       Location-wide rather than per file because a file in the old format
+       cannot be opened at all: `open` refuses it, and LISTF does not list it —
+       the enumeration has to come from the backend's own catalogue.
+       Returns the number of files converted, or -1 with `err` set.  Idempotent:
+       a file already in the document form is skipped, not rewritten. */
+    int (*migrate_docs)(const char *loc, char *err, size_t errlen);
 } mvx_driver;
 
 /* map_backfill sentinel: the transform is not expressible in this backend, so
@@ -331,7 +341,7 @@ typedef struct mvx_file_base {
    It must return NULL if `abi` is not an ABI version it supports,
    otherwise its driver vtable.  The search path is $MVXDRIVERS
    (colon-separated), then the runtime's built-in driver directory. */
-#define MVX_DRIVER_ABI 11
+#define MVX_DRIVER_ABI 12
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

@@ -254,6 +254,12 @@ target_link_libraries(mvx-git-adopt PRIVATE mvxrt)
 set_target_properties(mvx-git-adopt PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# --- mvx-doc-migrate: pre-#157 record blobs -> the document form -------
+add_executable(mvx-doc-migrate tools/mvx_doc_migrate.c)
+target_link_libraries(mvx-doc-migrate PRIVATE mvxrt ${CMAKE_DL_LIBS})
+set_target_properties(mvx-doc-migrate PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # --- classic TCL shell -------------------------------------------------
 add_executable(mvx tcl/mvx_tcl.c)
 target_link_libraries(mvx PRIVATE mvxrt ${CMAKE_DL_LIBS})

@@ -209,6 +209,27 @@ static void pg_num_expr(int64_t attr, char *out, size_t cap) {
              (long long)attr, (long long)attr);
 }
 
+/* A file written before records became documents (#157): a `rec` blob column
+   and no `doc`.  Nothing converts one — a pre-1.0 format break — but it must
+   SAY so.  Undetected it is not a clean break: LISTF reports no files (it
+   looks for `doc`), COUNT reports the rows it can see, and every READ says
+   the record is not there.  Three answers about one file and no error, which
+   reads as "mvx lost my data". */
+static int pg_is_pre157(PGconn *c, const char *schema, const char *table) {
+    const char *pv[2] = {schema, table};
+    PGresult *r = PQexecParams(c,
+        "SELECT count(*) FILTER (WHERE column_name='doc'), "
+        "       count(*) FILTER (WHERE column_name='rec') "
+        "FROM information_schema.columns "
+        "WHERE table_schema=$1 AND table_name=$2",
+        2, NULL, pv, NULL, NULL, 0);
+    int old = 0;
+    if (r && PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1)
+        old = atoi(PQgetvalue(r, 0, 0)) == 0 && atoi(PQgetvalue(r, 0, 1)) > 0;
+    if (r) PQclear(r);
+    return old;
+}
+
 static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
     char loc[1024];
     const char *rspec = split_spec(spec, loc, sizeof loc);
@@ -224,6 +245,13 @@ static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
                  PQntuples(r) == 1 && !PQgetisnull(r, 0, 0);
     if (r) PQclear(r);
     if (!exists) return NULL;             /* not found: normal ELSE path */
+    if (pg_is_pre157(c, schema, rspec)) {
+        snprintf(err, errlen,
+                 "postgres: %s was written before records became documents "
+                 "(it has a `rec` column and no `doc`).  Convert it with:  "
+                 "mvx-doc-migrate postgres @<connection>", rspec);
+        return NULL;
+    }
 
     pg_file *f = calloc(1, sizeof(pg_file));
     if (!f) mvx_fatal("out of memory opening %s", spec);
@@ -1492,6 +1520,119 @@ static int pg_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     return 1;
 }
 
+/* ------------------------------------------------------- doc migration */
+
+/* Convert every pre-#157 file in this schema to the document form.
+ *
+ * Whole-schema rather than per file: an old file cannot be opened (pg_open
+ * refuses it) and LISTF does not list it, so the set of them only exists in
+ * information_schema.
+ *
+ * Per file: add `doc jsonb`, encode each record into it, prove every row
+ * converted, then drop `rec`.  The encode is mvx_doc_encode — C, not
+ * something SQL can express — so this reads every row rather than doing a
+ * clever UPDATE.  One transaction per file, so an interruption leaves a file
+ * wholly in the old format.  A file that already has `doc` is skipped. */
+static int pg_migrate_docs(const char *loc, char *err, size_t errlen) {
+    char schema[128];
+    PGconn *c = pg_connect(loc, schema, sizeof schema, err, errlen);
+    if (!c) return -1;
+
+    const char *sv[1] = {schema};
+    PGresult *r = PQexecParams(c,
+        "SELECT table_name FROM information_schema.columns c "
+        "WHERE table_schema=$1 AND column_name='rec' "
+        "AND NOT EXISTS (SELECT 1 FROM information_schema.columns d "
+        "                WHERE d.table_schema=c.table_schema "
+        "                AND d.table_name=c.table_name AND d.column_name='doc') "
+        "ORDER BY table_name", 1, NULL, sv, NULL, NULL, 0);
+    if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
+        snprintf(err, errlen, "postgres: %s", PQerrorMessage(c));
+        if (r) PQclear(r);
+        return -1;
+    }
+    int n = PQntuples(r);
+    char (*names)[128] = n ? calloc((size_t)n, sizeof *names) : NULL;
+    for (int i = 0; i < n; i++)
+        snprintf(names[i], sizeof names[0], "%s", PQgetvalue(r, i, 0));
+    PQclear(r);
+
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        char qt[512], sql[900];
+        qualify(c, schema, names[i], qt, sizeof qt);
+        PQclear(PQexec(c, "BEGIN"));
+        snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc jsonb", qt);
+        PGresult *a = PQexec(c, sql);
+        int ok = a && PQresultStatus(a) == PGRES_COMMAND_OK;
+        if (a) PQclear(a);
+        if (!ok) {
+            snprintf(err, errlen, "postgres: %s: %s", names[i], PQerrorMessage(c));
+            PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
+        }
+        snprintf(sql, sizeof sql, "SELECT id, rec FROM %s", qt);
+        PGresult *rows = PQexecParams(c, sql, 0, NULL, NULL, NULL, NULL, 1);
+        if (!rows || PQresultStatus(rows) != PGRES_TUPLES_OK) {
+            snprintf(err, errlen, "postgres: %s: %s", names[i], PQerrorMessage(c));
+            if (rows) PQclear(rows);
+            PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
+        }
+        int rn = PQntuples(rows), failed = 0;
+        snprintf(sql, sizeof sql,
+                 "UPDATE %s SET doc = $2::jsonb WHERE id = $1", qt);
+        for (int k = 0; k < rn && !failed; k++) {
+            mv_value rec, doc;
+            mv_init(&rec); mv_init(&doc);
+            mv_set_str(&rec, PQgetvalue(rows, k, 1), PQgetlength(rows, k, 1));
+            mvx_doc_encode(&doc, &rec);
+            char nb[64];
+            const char *dp;
+            int64_t dl = mv_val_chars(&doc, nb, sizeof nb, &dp);
+            const char *pv[2] = {PQgetvalue(rows, k, 0), dp};
+            int pl[2] = {PQgetlength(rows, k, 0), (int)dl};
+            int pf[2] = {1, 0};
+            PGresult *u = PQexecParams(c, sql, 2, NULL, pv, pl, pf, 0);
+            if (!u || PQresultStatus(u) != PGRES_COMMAND_OK ||
+                atoi(PQcmdTuples(u)) != 1)
+                failed = 1;                 /* wrote nothing: do not drop */
+            if (u) PQclear(u);
+            mv_clear(&rec); mv_clear(&doc);
+        }
+        PQclear(rows);
+        /* PROVE EVERY ROW CONVERTED BEFORE DROPPING THE OLD COLUMN.  An UPDATE
+           that matches nothing is not an error in SQL, so without this the
+           migration reports success, drops `rec`, and the records are gone. */
+        if (!failed) {
+            snprintf(sql, sizeof sql,
+                     "SELECT count(*) FROM %s WHERE doc IS NULL", qt);
+            PGresult *ck = PQexec(c, sql);
+            long nulls = (ck && PQresultStatus(ck) == PGRES_TUPLES_OK &&
+                          PQntuples(ck)) ? atol(PQgetvalue(ck, 0, 0)) : -1;
+            if (ck) PQclear(ck);
+            if (nulls != 0) {
+                snprintf(err, errlen,
+                         "postgres: %s: %ld of %d record(s) did not convert — "
+                         "left in the old format", names[i], nulls, rn);
+                PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
+            }
+        }
+        if (!failed) {
+            snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
+            PGresult *d = PQexec(c, sql);
+            failed = !(d && PQresultStatus(d) == PGRES_COMMAND_OK);
+            if (d) PQclear(d);
+        }
+        if (failed) {
+            snprintf(err, errlen, "postgres: %s: %s", names[i], PQerrorMessage(c));
+            PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
+        }
+        PQclear(PQexec(c, "COMMIT"));
+        done++;
+    }
+    free(names);
+    return done;
+}
+
 static const mvx_driver mvx_driver_postgres = {
     "postgres",
     pg_open, pg_close,
@@ -1520,6 +1661,7 @@ static const mvx_driver mvx_driver_postgres = {
     pg_map_backfill,                      /* whole-mapping backfill push-down */
     pg_select_join_order,                 /* co-located TRANS() ORDER BY */
     pg_rollback,                          /* abort a failed logical write */
+    pg_migrate_docs,                      /* pre-#157 blob -> document */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

@@ -803,6 +803,97 @@ static int64_t mongo_count_where(mvx_file *fh, const char *col, int64_t attr,
     return n;                             /* -1 on backend error */
 }
 
+/* ------------------------------------------------------- doc migration */
+
+/* Convert every pre-#157 collection in this database to the document form.
+   No schema to alter here — the change is per document: encode the `rec`
+   BinData into a `doc` subdocument and unset `rec`.  Mongo has no
+   multi-document transaction on a standalone server, so this converts a
+   document at a time and is written to be re-runnable: a document that
+   already has `doc` is left alone, so an interrupted run is finished by
+   running it again. */
+static int mongo_migrate_docs(const char *loc, char *err, size_t errlen) {
+    char dbname[128] = "";
+    mongoc_client_t *cl = mongo_connect(loc, dbname, sizeof dbname, err, errlen);
+    if (!cl) return -1;
+    mongoc_database_t *db = mongoc_client_get_database(cl, dbname);
+    bson_error_t berr;
+    char **colls = mongoc_database_get_collection_names_with_opts(db, NULL, &berr);
+    if (!colls) {
+        snprintf(err, errlen, "mongo: %s", berr.message);
+        mongoc_database_destroy(db);
+        return -1;
+    }
+    int done = 0;
+    for (int i = 0; colls[i]; i++) {
+        mongoc_collection_t *coll =
+            mongoc_client_get_collection(cl, dbname, colls[i]);
+        bson_t filter;
+        bson_init(&filter);
+        bson_t ex;
+        bson_append_document_begin(&filter, "rec", 3, &ex);
+        bson_append_bool(&ex, "$exists", 7, true);
+        bson_append_document_end(&filter, &ex);
+        mongoc_cursor_t *cur =
+            mongoc_collection_find_with_opts(coll, &filter, NULL, NULL);
+        const bson_t *d;
+        int converted = 0, failed = 0;
+        while (!failed && mongoc_cursor_next(cur, &d)) {
+            bson_iter_t it, idit;
+            if (bson_iter_init_find(&it, d, "doc")) continue;   /* already done */
+            if (!bson_iter_init_find(&it, d, "rec") ||
+                !BSON_ITER_HOLDS_BINARY(&it) ||
+                !bson_iter_init_find(&idit, d, "_id")) continue;
+            bson_subtype_t st;
+            uint32_t rl = 0;
+            const uint8_t *rp = NULL;
+            bson_iter_binary(&it, &st, &rl, &rp);
+            mv_value rec, jdoc;
+            mv_init(&rec); mv_init(&jdoc);
+            mv_set_str(&rec, (const char *)rp, (int64_t)rl);
+            mvx_doc_encode(&jdoc, &rec);
+            char nb[64];
+            const char *jp;
+            int64_t jl = mv_val_chars(&jdoc, nb, sizeof nb, &jp);
+            bson_error_t je;
+            bson_t *body = bson_new_from_json((const uint8_t *)jp, (ssize_t)jl, &je);
+            if (body) {
+                bson_t sel, set, unset, update;
+                bson_init(&sel);
+                bson_append_value(&sel, "_id", 3, bson_iter_value(&idit));
+                bson_init(&update);
+                bson_init(&set);
+                bson_append_document(&set, "doc", 3, body);
+                bson_append_document(&update, "$set", 4, &set);
+                bson_init(&unset);
+                bson_append_int32(&unset, "rec", 3, 1);
+                bson_append_document(&update, "$unset", 6, &unset);
+                if (!mongoc_collection_update_one(coll, &sel, &update, NULL,
+                                                  NULL, &berr))
+                    failed = 1;
+                else converted++;
+                bson_destroy(&sel); bson_destroy(&set);
+                bson_destroy(&unset); bson_destroy(&update);
+                bson_destroy(body);
+            } else failed = 1;
+            mv_clear(&rec); mv_clear(&jdoc);
+        }
+        mongoc_cursor_destroy(cur);
+        bson_destroy(&filter);
+        mongoc_collection_destroy(coll);
+        if (failed) {
+            snprintf(err, errlen, "mongo: %s: %s", colls[i], berr.message);
+            bson_strfreev(colls);
+            mongoc_database_destroy(db);
+            return -1;
+        }
+        if (converted) done++;
+    }
+    bson_strfreev(colls);
+    mongoc_database_destroy(db);
+    return done;
+}
+
 static const mvx_driver mvx_driver_mongo = {
     .name = "mongo",
     .open = mongo_open,
@@ -833,6 +924,7 @@ static const mvx_driver mvx_driver_mongo = {
     .select_where = mongo_select_where,
     .select_attr = mongo_select_attr,     /* raw attribute — new with #157 */
     .count_where = mongo_count_where,
+    .migrate_docs = mongo_migrate_docs,   /* pre-#157 blob -> document */
     /* Deferred to the runtime's client-side fallback (#62): native read-back
        (map_read/map_child_read — mirror mode only), select_join, sum_where,
        select_order,
