@@ -43,7 +43,7 @@
 #include <unistd.h>
 
 #ifdef HAVE_EDITLINE
-#include <editline/readline.h>
+#include <histedit.h>
 #endif
 
 #ifndef MVX_SYSTEM_DIR
@@ -317,6 +317,297 @@ static int run_verb(const char *path, const char *line) {
 
 /* Execute one TCL line; return a process-style status (0 ok) so the -c
    one-shot can exit with a verb's code. */
+
+/* ------------------------------------------------------------ #114
+ * The R83 command stack.
+ *
+ * Semantics are D3's, from the Pick Systems Reference Manual's "dot stack"
+ * and "tcl stack" entries -- not invented here, because a half-right stack
+ * re-executes the wrong line, which is worse than having none.  What that
+ * manual specifies, and what this implements:
+ *
+ *   - Every UNIQUE command typed at the prompt is saved.  "Unique" is strict:
+ *     `who` appears once however often it is used.
+ *   - Re-executing an entry, or editing one, moves it to the TOP.  That is
+ *     what keeps the stack compact, and it means entry numbers shift.
+ *   - Entry 1 is the top, i.e. the most recent.
+ *   - The stack outlives the session; D3 keys it by user-id rather than by
+ *     terminal, and ~/.mvx_history is the closest thing we have to that.
+ *
+ * D3 has no size limit and tells the operator to prune by hand.  We keep a
+ * cap because we rewrite the whole file on every command and an unbounded
+ * one would eventually cost real time at every prompt.
+ *
+ * Not implemented: the macro forms .C, .CO, `.X name` and `.X file name`.
+ * They need a macro processor, which MVX has not got yet (#177).
+ *
+ * `!str` -- search the stack and execute -- is NOT taken: `!` is already the
+ * documented shell escape here, and silently changing it would break the
+ * thing an operator is most likely to have in a script. */
+
+#define STACK_MAX 500
+static char *g_stack[STACK_MAX];
+static int   g_nstack;                /* g_stack[0] is entry 1, the top */
+static char  g_stackfile[4096];
+static int   g_stack_depth;           /* .X re-entry guard */
+
+/* Trim exactly as command() does before it dispatches.  Without this a
+   stray trailing space makes "COUNT VOC " a different entry from
+   "COUNT VOC", the uniqueness rule stops collapsing them, and the stack
+   fills with near-duplicates -- which is the opposite of what it is for. */
+static char *stack_trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r' ||
+                     s[n-1] == ' '  || s[n-1] == '\t'))
+        s[--n] = '\0';
+    return s;
+}
+
+static void stack_load(void) {
+    if (!g_stackfile[0]) return;
+    FILE *fp = fopen(g_stackfile, "rb");
+    if (!fp) return;
+    char buf[4096];
+    while (g_nstack < STACK_MAX && fgets(buf, sizeof buf, fp)) {
+        size_t n = strlen(buf);
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+        /* libedit wrote this file before the stack existed, and its own
+           format leads with a version line.  Skip it rather than offering
+           the operator "_HiStOrY_V2_" as entry 1. */
+        if (n == 0 || strcmp(buf, "_HiStOrY_V2_") == 0) continue;
+        g_stack[g_nstack++] = strdup(buf);
+    }
+    fclose(fp);
+}
+
+static void stack_save(void) {
+    if (!g_stackfile[0]) return;
+    FILE *fp = fopen(g_stackfile, "wb");
+    if (!fp) return;
+    for (int i = 0; i < g_nstack; i++) fprintf(fp, "%s\n", g_stack[i]);
+    fclose(fp);
+}
+
+/* Add a command, D3-style: an identical entry anywhere is removed first, so
+   the command ends up at the top exactly once. */
+static void stack_push(const char *cmd) {
+    if (!cmd || !cmd[0]) return;
+    for (int i = 0; i < g_nstack; i++)
+        if (strcmp(g_stack[i], cmd) == 0) {
+            free(g_stack[i]);
+            memmove(&g_stack[i], &g_stack[i + 1],
+                    (size_t)(g_nstack - i - 1) * sizeof g_stack[0]);
+            g_nstack--;
+            break;
+        }
+    if (g_nstack == STACK_MAX) { free(g_stack[--g_nstack]); }
+    memmove(&g_stack[1], &g_stack[0], (size_t)g_nstack * sizeof g_stack[0]);
+    g_stack[0] = strdup(cmd);
+    g_nstack++;
+    stack_save();
+}
+
+/* Move entry i (0-based) to the top.  Both .X and a successful edit do this. */
+static void stack_totop(int i) {
+    if (i <= 0 || i >= g_nstack) return;
+    char *e = g_stack[i];
+    memmove(&g_stack[1], &g_stack[0], (size_t)i * sizeof g_stack[0]);
+    g_stack[0] = e;
+}
+
+static void stack_delete(int i) {
+    if (i < 0 || i >= g_nstack) return;
+    free(g_stack[i]);
+    memmove(&g_stack[i], &g_stack[i + 1],
+            (size_t)(g_nstack - i - 1) * sizeof g_stack[0]);
+    g_nstack--;
+}
+
+static void stack_list(int from, int to) {     /* 1-based, inclusive */
+    if (from < 1) from = 1;
+    if (to > g_nstack) to = g_nstack;
+    for (int i = from; i <= to; i++)
+        printf("%3d %s\n", i, g_stack[i - 1]);
+    fflush(stdout);
+}
+
+/* Replace str1 with str2 in s; `all` does every occurrence.  Returns a fresh
+   string, or NULL when str1 does not appear (so the caller can say so rather
+   than silently rewriting nothing). */
+static char *stack_subst(const char *s, const char *a, const char *b, int all) {
+    if (!a[0]) return NULL;
+    size_t la = strlen(a), lb = strlen(b), n = 0;
+    for (const char *p = s; (p = strstr(p, a)) != NULL; p += la) { n++; if (!all) break; }
+    if (n == 0) return NULL;
+    char *out = malloc(strlen(s) + n * (lb > la ? lb - la : 0) + 1);
+    if (!out) return NULL;
+    char *w = out;
+    const char *p = s;
+    while (*p) {
+        const char *h = strstr(p, a);
+        if (!h || (!all && w != out)) { strcpy(w, p); break; }
+        memcpy(w, p, (size_t)(h - p)); w += h - p;
+        memcpy(w, b, lb);              w += lb;
+        p = h + la;
+        if (!*p) *w = '\0';
+    }
+    return out;
+}
+
+#ifdef HAVE_EDITLINE
+static char *el_prompt(EditLine *e) {   /* libedit asks for the prompt */
+    (void)e;
+    static char p[300];
+    snprintf(p, sizeof p, "%s> ", g_acct_base);
+    return p;
+}
+static EditLine *g_el;                /* .R needs to type INTO the next prompt */
+#endif
+
+/* Offer entry i for editing.  On a terminal that means seeding the next
+   prompt with it, which is what "display and allow modification" means when
+   the line editor is the editor.  Off a terminal there is nothing to edit
+   into, so print it -- a script can then see what it would have got. */
+static void stack_recall(int i) {
+    if (i < 0 || i >= g_nstack) { printf("[1310] no such stack entry\n"); return; }
+#ifdef HAVE_EDITLINE
+    /* el_push types the entry into the next prompt, where it can be edited
+       like anything else -- which is what the manual's "display and allow
+       modification" means when the line editor IS the editor.
+       (libedit's readline-compat layer cannot do this: it calls
+       rl_startup_hook / rl_pre_input_hook but rl_insert_text from inside
+       them never reaches the line buffer.  Measured, not assumed -- which is
+       why this shell drives the native API.) */
+    if (g_el && isatty(0)) { el_push(g_el, g_stack[i]); return; }
+#endif
+    printf("%3d %s\n", i + 1, g_stack[i]);
+    fflush(stdout);
+}
+
+static void stack_help(void) {
+    printf(
+      ".?              this list\n"
+      ".L              list the stack\n"
+      ".L n            list the top n entries\n"
+      ".L m-n          list entries m through n\n"
+      ".R              recall the top entry for editing\n"
+      ".R n            recall entry n for editing\n"
+      ".R n/old/new    replace old with new in entry n\n"
+      ".RU n/old/new   replace every old with new in entry n\n"
+      ".DE             delete the top entry\n"
+      ".DE n           delete the top n entries\n"
+      ".DE n/str       delete any of the top n entries containing str\n"
+      ".X              execute the top entry\n"
+      ".X n{,n}        execute entry n (and it moves to the top)\n"
+      ".n{,n}          same as .X n\n");
+    fflush(stdout);
+}
+
+static int command(char *line);       /* .X runs an entry back through dispatch */
+
+/* Handle a dot command.  Returns 1 when the line was one (with *rc set),
+   0 when it was not and normal dispatch should take it. */
+static int stack_command(const char *line, int *rc) {
+    if (line[0] != '.') return 0;
+    *rc = 0;
+    const char *p = line + 1;
+    char op[4] = "";
+    size_t on = 0;
+    while (*p && !isdigit((unsigned char)*p) && *p != ' ' && on < sizeof op - 1)
+        op[on++] = (char)toupper((unsigned char)*p++);
+    op[on] = '\0';
+    while (*p == ' ') p++;
+
+    if (strcmp(op, "?") == 0) { stack_help(); return 1; }
+
+    if (strcmp(op, "L") == 0) {
+        if (!*p) { stack_list(1, g_nstack); return 1; }
+        int m = 0, n = 0;
+        if (sscanf(p, "%d-%d", &m, &n) == 2) stack_list(m, n);
+        else if (sscanf(p, "%d", &n) == 1)   stack_list(1, n);
+        else { printf("[1311] .L takes a count or a m-n range\n"); *rc = 2; }
+        return 1;
+    }
+
+    if (strcmp(op, "R") == 0 || strcmp(op, "RU") == 0) {
+        int all = op[1] == 'U';
+        if (!*p) { stack_recall(0); return 1; }
+        int n = 0;
+        const char *slash = strchr(p, '/');
+        if (sscanf(p, "%d", &n) != 1 || n < 1 || n > g_nstack) {
+            printf("[1310] no such stack entry\n"); *rc = 2; return 1;
+        }
+        if (!slash) { stack_recall(n - 1); return 1; }
+        char a[512] = "", b[512] = "";
+        const char *s2 = strchr(slash + 1, '/');
+        if (!s2) { printf("[1311] .R n/old/new needs both parts\n"); *rc = 2; return 1; }
+        snprintf(a, sizeof a, "%.*s", (int)(s2 - slash - 1), slash + 1);
+        snprintf(b, sizeof b, "%s", s2 + 1);
+        char *nw = stack_subst(g_stack[n - 1], a, b, all);
+        if (!nw) { printf("[1312] \"%s\" is not in entry %d\n", a, n); *rc = 2; return 1; }
+        free(g_stack[n - 1]);
+        g_stack[n - 1] = nw;
+        stack_totop(n - 1);            /* an edited entry moves to the top */
+        stack_save();
+        stack_list(1, 1);
+        return 1;
+    }
+
+    if (strcmp(op, "DE") == 0) {
+        if (!*p) { stack_delete(0); stack_save(); return 1; }
+        int n = 0;
+        const char *slash = strchr(p, '/');
+        if (sscanf(p, "%d", &n) != 1 || n < 1) {
+            printf("[1311] .DE takes a count\n"); *rc = 2; return 1;
+        }
+        if (n > g_nstack) n = g_nstack;
+        if (slash) {                   /* only those of the top n containing str */
+            for (int i = n - 1; i >= 0; i--)
+                if (strstr(g_stack[i], slash + 1)) stack_delete(i);
+        } else {
+            for (int i = 0; i < n; i++) stack_delete(0);
+        }
+        stack_save();
+        return 1;
+    }
+
+    /* .X, .X n{,n} and the bare .n{,n} the manual writes as .{X} n{,n} */
+    int isx = strcmp(op, "X") == 0;
+    if (!isx && op[0] != '\0') return 0;      /* .SOMETHINGELSE is not ours */
+    if (g_stack_depth > 8) {
+        printf("[1313] the stack is executing itself; stopping\n");
+        *rc = 2; return 1;
+    }
+    if (!*p) {                                /* .X -- the top entry */
+        if (g_nstack == 0) { printf("[1310] the stack is empty\n"); *rc = 2; return 1; }
+        char *cp = strdup(g_stack[0]);
+        printf("%s\n", cp);
+        g_stack_depth++;
+        *rc = command(cp);
+        g_stack_depth--;
+        free(cp);
+        return 1;
+    }
+    for (const char *q = p; *q; ) {           /* n{,n} */
+        int n = 0;
+        if (sscanf(q, "%d", &n) != 1 || n < 1 || n > g_nstack) {
+            printf("[1310] no such stack entry\n"); *rc = 2; return 1;
+        }
+        char *cp = strdup(g_stack[n - 1]);
+        stack_totop(n - 1);                   /* .X pops the entry to the top */
+        stack_save();
+        printf("%s\n", cp);
+        g_stack_depth++;
+        *rc = command(cp);
+        g_stack_depth--;
+        free(cp);
+        while (*q && *q != ',') q++;
+        if (*q == ',') q++;
+    }
+    return 1;
+}
+
 static int command(char *line) {
     while (*line == ' ' || *line == '\t') line++;
     size_t len = strlen(line);
@@ -324,6 +615,12 @@ static int command(char *line) {
                        line[len - 1] == ' '))
         line[--len] = '\0';
     if (len == 0) return 0;
+
+    /* The command stack first: a dot command operates ON the stack and is
+       not itself an entry, or .L would push .L and the operator would be
+       reading their own bookkeeping back (#114). */
+    int srsc = 0;
+    if (stack_command(line, &srsc)) return srsc;
 
     if (line[0] == '!') {               /* raw Unix — runtime-gated */
         int64_t rc = mvx_unix_cmd(g_ctx, line + 1);
@@ -431,6 +728,22 @@ int main(int argc, char **argv) {
     if (!has_descriptor() && has_markers())
         write_descriptor(g_acct_base);
 
+    /* Resolve and load the stack before anything runs.  Not gated on a
+       terminal: .L and .X have to work down a pipe too, or the feature is
+       both untestable and unavailable to a script.  MVXSTACK exists so a
+       test can point somewhere other than the operator's real stack. */
+    {
+        const char *sf = getenv("MVXSTACK");
+        if (sf && sf[0])
+            snprintf(g_stackfile, sizeof g_stackfile, "%s", sf);
+        else {
+            const char *home = getenv("HOME");
+            if (home && home[0])
+                snprintf(g_stackfile, sizeof g_stackfile, "%s/.mvx_history", home);
+        }
+        stack_load();
+    }
+
     if (one_cmd) {                      /* ssh/cron style: -c and out */
         char *dup = strdup(one_cmd);
         int rc = command(dup);          /* propagate the verb's exit status */
@@ -475,14 +788,25 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
 
+    /* One history, not two.  The stack and the line editor's up-arrow used
+       to be separate lists over the same commands, so .L and ^P could
+       disagree about what you had just run (#114).  The stack is the only
+       store now; the editor is seeded from it, oldest first so the newest
+       entry is the first one up-arrow reaches. */
 #ifdef HAVE_EDITLINE
-    char histfile[4096] = "";
+    History  *elh = NULL;
+    HistEvent elev;
     if (tty) {
-        const char *home = getenv("HOME");
-        if (home && home[0]) {
-            snprintf(histfile, sizeof histfile, "%s/.mvx_history", home);
-            read_history(histfile);
-        }
+        g_el = el_init("mvx", stdin, stdout, stderr);
+        elh  = history_init();
+        history(elh, &elev, H_SETSIZE, STACK_MAX);
+        el_set(g_el, EL_PROMPT, el_prompt);
+        el_set(g_el, EL_EDITOR, "emacs");
+        el_set(g_el, EL_SIGNAL, 1);
+        el_set(g_el, EL_HIST, history, elh);
+        /* oldest first, so the newest entry is the first one up-arrow reaches */
+        for (int i = g_nstack - 1; i >= 0; i--)
+            history(elh, &elev, H_ENTER, g_stack[i]);
     }
 #endif
 
@@ -490,16 +814,21 @@ int main(int argc, char **argv) {
     for (;;) {
 #ifdef HAVE_EDITLINE
         if (tty) {
-            char prompt[300];
-            snprintf(prompt, sizeof prompt, "%s> ", g_acct_base);
-            char *l = readline(prompt);
-            if (!l) break;
-            if (*l) {
-                add_history(l);
-                if (histfile[0]) write_history(histfile);
-            }
+            int eln = 0;
+            const char *l = el_gets(g_el, &eln);
+            if (!l || eln <= 0) break;
             snprintf(line, sizeof line, "%s", l);
-            free(l);
+            size_t ll = strlen(line);
+            while (ll > 0 && (line[ll-1] == '\n' || line[ll-1] == '\r'))
+                line[--ll] = '\0';
+            /* Push before running, so a command that fails is still recallable
+               -- D3 stacks what was typed, not what worked, and a typo is
+               exactly what you want back to fix. */
+            char *t = stack_trim(line);
+            if (t[0] && t[0] != '.') {
+                stack_push(t);
+                history(elh, &elev, H_ENTER, t);
+            }
             command(line);
             continue;
         }
@@ -510,9 +839,20 @@ int main(int argc, char **argv) {
         }
 #endif
         if (!read_line_raw(line, sizeof line)) break;
+        {   /* same rule as the interactive branch: what is entered at the
+               prompt is stacked, and a dot command is not an entry */
+            char tmp[sizeof line];
+            snprintf(tmp, sizeof tmp, "%s", line);
+            char *t = stack_trim(tmp);
+            if (t[0] && t[0] != '.') stack_push(t);
+        }
         command(line);
     }
     if (tty) fputc('\n', stdout);
+#ifdef HAVE_EDITLINE
+    if (g_el) { el_end(g_el); g_el = NULL; }
+    if (elh) history_end(elh);
+#endif
     mvx_ctx_destroy(g_ctx);
     if (sesspath[0]) unlink(sesspath);
     return 0;
