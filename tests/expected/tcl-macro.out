@@ -1,0 +1,21 @@
+--- N runs each command; the parameter reaches only the first
+3 record(s) counted
+VOC                      lmdb
+--- M shows each command before running it
+COUNT VOC
+3 record(s) counted
+LISTF
+--- .C files a macro from stack entries, .C again refuses, .CO replaces
+MK created
+[415] 'MK' exists on file.
+MK created
+--- and it was filed in D3 form
+001 M
+002 LISTF
+--- a verb still wins over a macro of the same name
+4 record(s) counted
+--- .X name, and a missing one is reported
+LISTF
+[1326] no macro "NOPE"
+--- stacked input is refused out loud, not dropped in silence
+[1321] "SMAC": stacked input (extra values) is not run

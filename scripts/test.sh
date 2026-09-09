@@ -756,6 +756,39 @@ check tcl-stack "$( \
   echo '--- .FOO is a verb, not a stack command'; \
   printf '.FOO\n' | stk | tail -1)"
 
+# TCL macros and the stack's macro forms (#177).  D3's model: a VOC item whose
+# attribute 1 is M (show each command for editing) or N (run it), one command
+# per attribute after that, and parameters typed after the name reaching the
+# FIRST command only.  The M path off a terminal prints each command before
+# running it, which is the half of "display then execute" that survives a pipe.
+MACC="$TESTROOT/macct"; mkdir -p "$MACC"
+"$TCL" -a "$MACC" -c 'CREATE-FILE VOC' >/dev/null 2>&1
+cat > "$TESTROOT/mkmac.b" <<'MACEOF'
+OPEN "VOC" TO V ELSE STOP
+WRITE "N":@AM:"COUNT":@AM:"LISTF" ON V, "NMAC"
+WRITE "M":@AM:"COUNT":@AM:"LISTF" ON V, "MMAC"
+WRITE "N":@AM:"COUNT":@VM:"stacked" ON V, "SMAC"
+MACEOF
+"$MVX" "$TESTROOT/mkmac.b" -o "$TESTROOT/mkmac" >/dev/null 2>&1
+(cd "$MACC" && MVXACCOUNT=. "$TESTROOT/mkmac" >/dev/null 2>&1)
+mstk() { rm -f "$STK"; MVXSTACK="$STK" "$TCL" -a "$MACC" 2>&1; }
+check tcl-macro "$( \
+  echo '--- N runs each command; the parameter reaches only the first'; \
+  printf 'NMAC VOC\n' | mstk | grep -E 'record\(s\) counted|^VOC '; \
+  echo '--- M shows each command before running it'; \
+  printf 'MMAC VOC\n' | mstk | grep -E '^COUNT VOC$|^LISTF$|record\(s\) counted'; \
+  echo '--- .C files a macro from stack entries, .C again refuses, .CO replaces'; \
+  printf 'COUNT VOC\nLISTF\n.C MK 2,1\n.C MK 1\n.CO MK 1\n' | mstk \
+    | grep -E 'created|exists'; \
+  echo '--- and it was filed in D3 form'; \
+  printf 'CT VOC MK\n' | mstk | grep -E '^00[12] '; \
+  echo '--- a verb still wins over a macro of the same name'; \
+  printf 'COUNT VOC\n' | mstk | grep -E 'record\(s\) counted'; \
+  echo '--- .X name, and a missing one is reported'; \
+  printf '.X MK\n.X NOPE\n' | mstk | grep -E '^\[13|^LISTF$'; \
+  echo '--- stacked input is refused out loud, not dropped in silence'; \
+  printf 'SMAC VOC\n' | mstk | grep -E '^\[1321\]')"
+
 # An existing libedit history file has to become the stack, not be discarded
 # and not be shown back with its own format header as entry 1.
 printf '_HiStOrY_V2_\nOLD ONE\nOLD TWO\n' > "$TESTROOT/mig"
