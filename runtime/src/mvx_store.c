@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -838,6 +839,10 @@ static trans_ent *trans_file(mvx_ctx *ctx, const char *nm, int64_t nl) {
 
 static void ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
                   const char *sp, int64_t sl, int depth);
+/* ieval plus the dictionary a bare name resolves against (#121). */
+static void ieval_ex(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
+                     const char *sp, int64_t sl, int depth,
+                     const mv_value *dictf);
 static void trans_core(mvx_ctx *ctx, mv_value *dst, const char *np, int64_t nl,
                        const mv_value *key, const char *attr, int64_t attrl,
                        char ctl, int depth);
@@ -923,7 +928,7 @@ static void dict_eval(mvx_ctx *ctx, mv_value *dst, trans_ent *t,
             char sbf[256];
             const char *sp;
             int64_t sl = mv_val_chars(&spec, sbf, sizeof sbf, &sp);
-            ieval(ctx, dst, rec, sp, sl, depth + 1);
+            ieval_ex(ctx, dst, rec, sp, sl, depth + 1, &t->dfvar);
             mv_clear(&spec);
         } else {
             mv_value amc;
@@ -940,10 +945,316 @@ static void dict_eval(mvx_ctx *ctx, mv_value *dst, trans_ent *t,
     mv_clear(&di);
 }
 
+/* --- arithmetic and aggregate I-types (#121) -------------------------------
+ *
+ * An I-descriptor like `PRICE * QTY` or `SUM(EPRICE)` used to evaluate to ""
+ * with nothing said, because the evaluator only ever recognised TRANS and
+ * DOCTAG.  Arithmetic over sibling attributes is the commonest I-type there
+ * is, and every account arriving from UniData or UniVerse has them.
+ *
+ * This is a small recursive-descent evaluator over the dictionary-expression
+ * subset -- `+ - * /`, parentheses, unary minus, numbers, quoted strings,
+ * dictionary names, and TRANS / DOCTAG / SUM -- and NOT a second BASIC.  The
+ * issue asks whether to reuse the compiler's parser instead: that would mean
+ * linking the C++ compiler into a runtime the verbs dlopen, to gain a grammar
+ * far larger than a D-item can hold.  The cost of two evaluators is real, so
+ * the boundary is drawn tightly and stated here: if an I-type ever needs
+ * conditionals or functions beyond these, that is the point to reconsider,
+ * not to grow this one quietly.
+ *
+ * MULTIVALUES.  `QTY * PRICE` inside an association has to work value by
+ * value -- that is what makes a line-item extension, and a scalar broadcasts
+ * across them (a single PRICE against three QTYs gives three answers).  That
+ * rule is what SUM() then folds up. */
+
+/* Say once, on stderr, that a spec could not be evaluated.  A LIST calls the
+   evaluator per record, so this remembers what it has already complained
+   about -- otherwise the diagnostic buries the report it is describing. */
+#define IEVAL_SEEN 32
+static char g_ie_seen[IEVAL_SEEN][160];
+static int  g_ie_nseen;
+static void ieval_complain(const char *sp, int64_t sl, int nodict) {
+    if (sl > 150) sl = 150;
+    char k[160];
+    snprintf(k, sizeof k, "%.*s", (int)sl, sp);
+    for (int i = 0; i < g_ie_nseen; i++)
+        if (strcmp(g_ie_seen[i], k) == 0) return;
+    if (g_ie_nseen < IEVAL_SEEN) snprintf(g_ie_seen[g_ie_nseen++],
+                                          sizeof g_ie_seen[0], "%s", k);
+    fprintf(stderr, "ieval: cannot evaluate \"%s\"%s\n", k,
+            nodict ? " (no dictionary in scope for its names)" : "");
+}
+
+/* Format a number back to MV text: integral values stay integral, so
+   24900 * 64 is 1593600 and not 1593600.000000, because a D-item's
+   conversion (MD2$ and friends) is applied to the digits afterwards. */
+static void ie_num(mv_value *dst, double v) {
+    char b[64];
+    if (v == (double)(long long)v && v < 9e18 && v > -9e18)
+        snprintf(b, sizeof b, "%lld", (long long)v);
+    else {
+        snprintf(b, sizeof b, "%.10f", v);
+        char *e = b + strlen(b) - 1;
+        while (e > b && *e == '0') *e-- = '\0';
+        if (e > b && *e == '.') *e = '\0';
+    }
+    mv_set_str(dst, b, (int64_t)strlen(b));
+}
+
+static double ie_num_of(const mv_value *v) {
+    char b[64];
+    const char *p;
+    int64_t n = mv_val_chars(v, b, sizeof b, &p);
+    if (n <= 0) return 0;
+    char t[64];
+    if (n >= (int64_t)sizeof t) n = sizeof t - 1;
+    memcpy(t, p, (size_t)n);
+    t[n] = '\0';
+    return atof(t);
+}
+
+/* Apply `op` value by value, broadcasting a single value across many. */
+static void ie_arith(mv_value *dst, const mv_value *a, const mv_value *b,
+                     char op) {
+    mv_value vm;
+    mv_init(&vm);
+    mv_set_str(&vm, "\xFD", 1);
+    int64_t na = mv_dcount_fn(a, &vm), nb = mv_dcount_fn(b, &vm);
+    mv_clear(&vm);
+    if (na < 1) na = 1;
+    if (nb < 1) nb = 1;
+    int64_t n = na > nb ? na : nb;
+    mv_value out, ea, eb, one;
+    mv_init(&out); mv_init(&ea); mv_init(&eb); mv_init(&one);
+    mv_set_str(&out, "", 0);
+    for (int64_t i = 1; i <= n; i++) {
+        mv_extract_fn(&ea, a, 1, na == 1 ? 1 : i, 0);
+        mv_extract_fn(&eb, b, 1, nb == 1 ? 1 : i, 0);
+        double x = ie_num_of(&ea), y = ie_num_of(&eb), r = 0;
+        switch (op) {
+            case '+': r = x + y; break;
+            case '-': r = x - y; break;
+            case '*': r = x * y; break;
+            /* Division by zero yields 0 rather than aborting: a dictionary
+               column is display, and one bad row should not take the report
+               down with it. */
+            case '/': r = (y == 0) ? 0 : x / y; break;
+        }
+        ie_num(&one, r);
+        mv_replace_fn(&out, &out, 1, i, 0, &one);
+    }
+    mv_copy(dst, &out);
+    mv_clear(&out); mv_clear(&ea); mv_clear(&eb); mv_clear(&one);
+}
+
+
+/* The expression parser.  `dictf` is the dictionary a bare name is resolved
+   against -- the file's own DICT, which is what makes PRICE mean attribute 4
+   rather than a literal.  NULL when the caller had none, and then a name is
+   an error rather than a silent blank. */
+typedef struct {
+    mvx_ctx        *ctx;
+    const mv_value *rec;
+    const mv_value *dictf;
+    int             depth;
+    const char     *p, *end;
+    int             err;          /* set once; the whole expression is void */
+} iexp;
+
+static void ie_expr(iexp *x, mv_value *dst);
+
+static void ie_ws(iexp *x) { while (x->p < x->end && *x->p == ' ') x->p++; }
+
+/* A bare name: read it out of the dictionary and evaluate what it points at. */
+static void ie_name(iexp *x, mv_value *dst, const char *np, int64_t nl) {
+    mv_set_str(dst, "", 0);
+    if (nl == 2 && strncasecmp(np, "ID", 2) == 0) return;   /* no id in scope */
+    if (!x->dictf) { x->err = 1; return; }
+    mv_value key, di;
+    mv_init(&key); mv_init(&di);
+    mv_set_str(&key, np, nl);
+    if (mvx_read(x->ctx, &di, x->dictf, &key, 0) > 0) {
+        mv_value ty, a2;
+        mv_init(&ty); mv_init(&a2);
+        mv_extract_fn(&ty, &di, 1, 0, 0);
+        mv_extract_fn(&a2, &di, 2, 0, 0);
+        char tb[8];
+        const char *tp;
+        int64_t tl = mv_val_chars(&ty, tb, sizeof tb, &tp);
+        if (tl > 0 && (tp[0] == 'I' || tp[0] == 'i')) {
+            char sbf[512];
+            const char *sp;
+            int64_t sl = mv_val_chars(&a2, sbf, sizeof sbf, &sp);
+            ieval_ex(x->ctx, dst, x->rec, sp, sl, x->depth + 1, x->dictf);
+        } else {
+            int64_t ano = mv_get_int(&a2);
+            if (ano >= 1) mv_extract_fn(dst, x->rec, ano, 0, 0);
+        }
+        mv_clear(&ty); mv_clear(&a2);
+    } else {
+        x->err = 1;                      /* a name that is not in the DICT */
+    }
+    mv_clear(&key); mv_clear(&di);
+}
+
+/* SUM(x): fold x's values into one.  This is what turns a line-item
+   extension into an order total. */
+static void ie_sum(iexp *x, mv_value *dst, const mv_value *v) {
+    (void)x;
+    mv_value vm, e;
+    mv_init(&vm); mv_init(&e);
+    mv_set_str(&vm, "\xFD", 1);
+    int64_t n = mv_dcount_fn(v, &vm);
+    mv_clear(&vm);
+    if (n < 1) n = 1;
+    double t = 0;
+    for (int64_t i = 1; i <= n; i++) {
+        mv_extract_fn(&e, v, 1, i, 0);
+        t += ie_num_of(&e);
+    }
+    mv_clear(&e);
+    ie_num(dst, t);
+}
+
+static void ie_factor(iexp *x, mv_value *dst) {
+    mv_set_str(dst, "", 0);
+    ie_ws(x);
+    if (x->p >= x->end) { x->err = 1; return; }
+    if (*x->p == '-') { x->p++; mv_value t; mv_init(&t); ie_factor(x, &t);
+                        mv_value z; mv_init(&z); mv_set_str(&z, "0", 1);
+                        ie_arith(dst, &z, &t, '-');
+                        mv_clear(&t); mv_clear(&z); return; }
+    if (*x->p == '(') { x->p++; ie_expr(x, dst); ie_ws(x);
+                        if (x->p < x->end && *x->p == ')') x->p++;
+                        else x->err = 1;
+                        return; }
+    if (*x->p == '"' || *x->p == '\'') {          /* a literal */
+        char q = *x->p++;
+        const char *s = x->p;
+        while (x->p < x->end && *x->p != q) x->p++;
+        mv_set_str(dst, s, x->p - s);
+        if (x->p < x->end) x->p++; else x->err = 1;
+        return;
+    }
+    if (isdigit((unsigned char)*x->p) || *x->p == '.') {
+        const char *s = x->p;
+        while (x->p < x->end && (isdigit((unsigned char)*x->p) || *x->p == '.'))
+            x->p++;
+        mv_set_str(dst, s, x->p - s);
+        return;
+    }
+    if (isalpha((unsigned char)*x->p) || *x->p == '@' || *x->p == '_') {
+        const char *s = x->p;
+        if (*x->p == '@') x->p++;
+        while (x->p < x->end && (isalnum((unsigned char)*x->p) ||
+                                 *x->p == '.' || *x->p == '_' || *x->p == '$'))
+            x->p++;
+        const char *ns = (*s == '@') ? s + 1 : s;
+        int64_t nl = x->p - ns;
+        ie_ws(x);
+        if (x->p < x->end && *x->p == '(') {      /* a function call */
+            x->p++;
+            const char *as = x->p;
+            int par = 1;
+            while (x->p < x->end && par) {        /* to the matching ')' */
+                if (*x->p == '(') par++;
+                else if (*x->p == ')') par--;
+                if (par) x->p++;
+            }
+            if (par) { x->err = 1; return; }
+            int64_t al = x->p - as;
+            x->p++;                               /* past ')' */
+            if (nl == 3 && strncasecmp(ns, "SUM", 3) == 0) {
+                iexp inner = *x;
+                inner.p = as; inner.end = as + al;
+                mv_value v;
+                mv_init(&v);
+                ie_expr(&inner, &v);
+                if (inner.err) x->err = 1;
+                ie_sum(x, dst, &v);
+                mv_clear(&v);
+                return;
+            }
+            /* TRANS and DOCTAG keep their existing implementations: rebuild
+               the call text and hand it to the evaluator that already knows
+               them, rather than growing a second copy here. */
+            char call[600];
+            if (nl + al + 3 >= (int64_t)sizeof call) { x->err = 1; return; }
+            int k = snprintf(call, sizeof call, "%.*s(%.*s)",
+                             (int)nl, ns, (int)al, as);
+            ieval_ex(x->ctx, dst, x->rec, call, k, x->depth + 1, x->dictf);
+            return;
+        }
+        ie_name(x, dst, ns, nl);
+        return;
+    }
+    x->err = 1;
+}
+
+static void ie_term(iexp *x, mv_value *dst) {
+    ie_factor(x, dst);
+    for (;;) {
+        ie_ws(x);
+        if (x->p >= x->end || (*x->p != '*' && *x->p != '/')) return;
+        char op = *x->p++;
+        mv_value r, l;
+        mv_init(&r); mv_init(&l);
+        ie_factor(x, &r);
+        mv_copy(&l, dst);
+        ie_arith(dst, &l, &r, op);
+        mv_clear(&r); mv_clear(&l);
+    }
+}
+
+static void ie_expr(iexp *x, mv_value *dst) {
+    ie_term(x, dst);
+    for (;;) {
+        ie_ws(x);
+        if (x->p >= x->end || (*x->p != '+' && *x->p != '-')) return;
+        char op = *x->p++;
+        mv_value r, l;
+        mv_init(&r); mv_init(&l);
+        ie_term(x, &r);
+        mv_copy(&l, dst);
+        ie_arith(dst, &l, &r, op);
+        mv_clear(&r); mv_clear(&l);
+    }
+}
+
 /* Evaluate an I-descriptor `sp[0..sl)` against record `rec`. */
 static void ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
                   const char *sp, int64_t sl, int depth) {
+    ieval_ex(ctx, dst, rec, sp, sl, depth, NULL);
+}
+
+static void ieval_ex(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
+                     const char *sp, int64_t sl, int depth,
+                     const mv_value *dictf) {
     mv_set_str(dst, "", 0);
+    if (depth >= IEVAL_MAXDEPTH || sl <= 0) return;
+    /* TRANS(...) and DOCTAG(...) stay exactly as they were; anything else
+       now goes to the expression evaluator instead of returning "" (#121). */
+    if (!(sl >= 8 && sp[sl - 1] == ')' &&
+          (strncmp(sp, "TRANS(", 6) == 0 || strncmp(sp, "DOCTAG(", 7) == 0))) {
+        iexp x;
+        x.ctx = ctx; x.rec = rec; x.dictf = dictf; x.depth = depth;
+        x.p = sp; x.end = sp + sl; x.err = 0;
+        mv_value v;
+        mv_init(&v);
+        ie_expr(&x, &v);
+        ie_ws(&x);
+        if (!x.err && x.p == x.end) mv_copy(dst, &v);
+        else {
+            /* A spec this cannot parse is REPORTED, not silently blank --
+               the issue's third ask.  Once per spec per process, because a
+               LIST calls this for every record and a per-row diagnostic
+               would bury the report it is describing. */
+            ieval_complain(sp, sl, dictf == NULL);
+            mv_set_str(dst, "", 0);
+        }
+        mv_clear(&v);
+        return;
+    }
     if (depth >= IEVAL_MAXDEPTH || sl < 8 || sp[sl - 1] != ')') return;
     if (sl >= 9 && strncmp(sp, "DOCTAG(", 7) == 0) {
         ieval_doctag(dst, rec, sp + 7, sl - 8);
@@ -1083,11 +1394,14 @@ void mvx_trans(mvx_ctx *ctx, mv_value *dst, const mv_value *fname,
 /* IEVAL(rec, ispec): evaluate an I-descriptor against a record — the runtime
    evaluator exposed to the verbs (and to programs).  "" for an unknown spec. */
 void mvx_ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
-               const mv_value *spec) {
+               const mv_value *spec, const mv_value *dictf) {
     char sb[256];
     const char *sp;
     int64_t sl = mv_val_chars(spec, sb, sizeof sb, &sp);
-    ieval(ctx, dst, rec, sp, sl, 0);
+    /* dictf is the file's own DICT, so a bare name in the expression means
+       the sibling D-item it names.  NULL keeps the old two-argument
+       behaviour, where a name has nothing to resolve against. */
+    ieval_ex(ctx, dst, rec, sp, sl, 0, dictf);
 }
 
 /* Returns 0 on success, or -2 on a backend write failure when the caller

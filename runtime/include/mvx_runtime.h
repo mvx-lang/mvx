@@ -247,7 +247,7 @@ void    mvx_trans(mvx_ctx *ctx, mv_value *dst, const mv_value *fname,
 /* IEVAL(rec, ispec): evaluate an I-descriptor (TRANS/DOCTAG) against a record
    — the runtime I-type evaluator the query verbs share. */
 void    mvx_ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
-                  const mv_value *spec);
+                  const mv_value *spec, const mv_value *dictf);
 int64_t mvx_open(mvx_ctx *ctx, const mv_value *dict, const mv_value *spec,
                  mv_value *fvar);
 int64_t mvx_read(mvx_ctx *ctx, mv_value *rec, const mv_value *fvar,

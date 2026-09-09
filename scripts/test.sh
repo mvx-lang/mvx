@@ -756,6 +756,39 @@ check tcl-stack "$( \
   echo '--- .FOO is a verb, not a stack command'; \
   printf '.FOO\n' | stk | tail -1)"
 
+# Arithmetic and aggregate I-types (#121).  The evaluator used to handle TRANS
+# and DOCTAG only and returned "" for everything else, so the commonest kind of
+# I-type there is -- arithmetic over sibling attributes -- listed as a blank
+# column with nothing said.  Values are internal (24900 is $249.00 under MD2$),
+# which is what the arithmetic operates on.
+IACC="$TESTROOT/iacct"; mkdir -p "$IACC"
+"$TCL" -a "$IACC" -c 'CREATE-FILE IORD' >/dev/null 2>&1
+cat > "$TESTROOT/iseed.b" <<'IEOF'
+OPEN "IORD" TO F ELSE STOP
+WRITE "Acme":@AM:"4":@VM:"10":@VM:"3":@AM:"24900":@VM:"1250":@VM:"100" ON F, "1001"
+OPEN "DICT", "IORD" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Customer":@AM:"10L" ON D, "CUST"
+WRITE "D":@AM:"2":@AM:"":@AM:"Qty":@AM:"5R":@AM:"LINES" ON D, "QTY"
+WRITE "D":@AM:"3":@AM:"MD2$":@AM:"Price":@AM:"10R":@AM:"LINES" ON D, "PRICE"
+WRITE "I":@AM:"QTY * PRICE":@AM:"MD2$":@AM:"Ext":@AM:"10R":@AM:"LINES" ON D, "EPRICE"
+WRITE "I":@AM:"SUM(EPRICE)":@AM:"MD2$":@AM:"Total":@AM:"12R" ON D, "TOT"
+WRITE "I":@AM:"(QTY + 1) * 2":@AM:"":@AM:"Parens":@AM:"8R":@AM:"LINES" ON D, "PAR"
+WRITE "I":@AM:"0 - QTY":@AM:"":@AM:"Neg":@AM:"8R":@AM:"LINES" ON D, "NEG"
+WRITE "I":@AM:"QTY / 0":@AM:"":@AM:"DivZero":@AM:"8R":@AM:"LINES" ON D, "DZ"
+WRITE "I":@AM:"NOT AN EXPRESSION((":@AM:"":@AM:"Bad":@AM:"8L" ON D, "BAD"
+IEOF
+"$MVX" "$TESTROOT/iseed.b" -o "$TESTROOT/iseed" >/dev/null 2>&1
+(cd "$IACC" && MVXACCOUNT=. "$TESTROOT/iseed" >/dev/null 2>&1)
+check tcl-ityped "$( \
+  echo '--- per-value extension, and the SUM that folds it'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD QTY PRICE EPRICE TOT' 2>/dev/null; \
+  echo '--- parentheses, unary minus, and a divide by zero that does not abort'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD PAR NEG DZ' 2>/dev/null; \
+  echo '--- WITH selects on an arithmetic I-type'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD CUST TOT WITH TOT > "100000"' 2>/dev/null; \
+  echo '--- and a spec it cannot parse is REPORTED, not silently blank'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD CUST BAD' 2>&1 >/dev/null)"
+
 # TCL macros and the stack's macro forms (#177).  D3's model: a VOC item whose
 # attribute 1 is M (show each command for editing) or N (run it), one command
 # per attribute after that, and parameters typed after the name reaching the
