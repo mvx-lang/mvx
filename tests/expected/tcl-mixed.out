@@ -1,14 +1,14 @@
 [417] file LOCALF created
 [417] file SHARED created
 File                     Type
-LOCALF                   lmdb
-VOC                      lmdb
+LOCALF                   sqlite
+VOC                      sqlite
 SHARED                   lmdbnet
 3 file(s)
 local read: local data
 remote read: remote data
 File                     Type
-LOCALF                   lmdb
-VOC                      lmdb
+LOCALF                   sqlite
+VOC                      sqlite
 SHARED                   lmdbnet
 3 file(s)

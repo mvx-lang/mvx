@@ -39,7 +39,7 @@ TCL="$ROOT/build/bin/mvx"
 # "mvx broke", not "a package released this morning".
 PKG_VERSION_cmd=1.4.1
 PKG_VERSION_getopt=1.1.0
-PKG_VERSION_git=2.0.3
+PKG_VERSION_git=2.0.4
 PKG_ASSET_cmd=cmd
 PKG_ASSET_getopt=getopt
 PKG_ASSET_git=mvx-lang_git
@@ -350,9 +350,14 @@ EOF
 "$MVX" "$seed" -o "$TESTROOT/seedbin" 2>/dev/null
 (cd "$ACCT" && MVXACCOUNT=. "$TESTROOT/seedbin") >/dev/null
 
+# BY @ID on the WITH queries below: an unordered LIST returns records in
+# whatever order the backend keeps them -- lmdb by key, sqlite by rowid -- and
+# MV promises no order without one.  These fixtures were encoding lmdb's, so
+# they failed the moment the same file lived anywhere else.  What they are for
+# is WHICH records come back, not in what order (#187).
 check tcl-query "$(printf '%s\n' \
   'LIST PARTS NAME PRICE COLOR BY PRICE' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'SELECT PARTS WITH COLOR = blue' \
   'COUNT PARTS' \
   'COUNT PARTS' \
@@ -923,6 +928,77 @@ printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
 # packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# LISTF reports a file whatever local backend holds it (#187).  It asked lmdb
+# and only lmdb, so a file the account placed in sqlite was invisible -- and
+# because mvx-git finds an account's files through this same list, it committed
+# such an account WITHOUT ITS RECORDS (mv_git#240).  So this is not cosmetic:
+# the list is what another tool builds an account from.
+ENA="$TESTROOT/enumacct"
+"$ROOT/scripts/mkaccount.sh" "$ENA" >/dev/null 2>&1
+# lmdb, not sqlite: sqlite is the default now, so declaring it splits nothing
+# and this would silently stop testing two backends at once.
+sed -i.bak 's/^driver = .*/driver = lmdb/' "$ENA/.mvx" && rm -f "$ENA/.mvx.bak"
+check tcl-listf-backends "$( \
+  "$TCL" -a "$ENA" -c 'CREATE-FILE PARTS' 2>&1; \
+  echo '--- VOC on one backend, PARTS on the other, both listed'; \
+  "$TCL" -a "$ENA" -c 'LISTF' 2>&1 | grep -E '^(VOC|PARTS) ')"
+
+# CONVERT-FILE moves a file between backends, and when the file is VOC the
+# account's record of where VOC lives has to move with it -- VOC is the one
+# file nothing else can describe, so a stale `voc =` makes the account
+# unopenable rather than merely wrong.  Recorded by the runtime at creation,
+# so every route that changes VOC's backend is covered, not just this verb.
+#
+# Also asserts the conversion actually happens: `CONVERT-FILE x lmdb` used a
+# bare CREATEFILE, which takes the ACCOUNT default -- sqlite since #187 -- so
+# it reported success and left the file exactly where it was.
+CVA="$TESTROOT/cvtacct"
+"$ROOT/scripts/mkaccount.sh" "$CVA" >/dev/null 2>&1
+check tcl-convert-voc "$( \
+  echo "--- a new account starts on the default"; \
+  grep -E '^voc' "$CVA/.mvx"; \
+  "$TCL" -a "$CVA" -c 'CREATE-FILE T' 2>&1; \
+  echo '--- CONVERT-FILE really converts, it does not just say so'; \
+  "$TCL" -a "$CVA" -c 'CONVERT-FILE T lmdb' 2>&1; \
+  "$TCL" -a "$CVA" -c 'LISTF' 2>&1 | grep -E '^T  '; \
+  echo '--- and converting VOC updates the account record'; \
+  "$TCL" -a "$CVA" -c 'CONVERT-FILE VOC lmdb' 2>&1; \
+  grep -E '^voc' "$CVA/.mvx"; \
+  echo '--- which a FRESH process then resolves'; \
+  "$TCL" -a "$CVA" -c 'COUNT VOC' 2>&1; \
+  echo '--- with the policy lines in .mvx untouched'; \
+  grep -cE '^permit' "$CVA/.mvx")"
+
+# An account records which transport it uses (#187): `driver` for a file
+# nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
+# is the bootstrap file -- opened before anything that could describe it -- and
+# it need not match the default: an account keeps the VOC it was made with
+# while later files go elsewhere.  That split is the whole point, so it is what
+# is asserted, not just that the keys parse.
+#
+# `driver`, not `hash`: `hash` already means the default CREATE-FILE type
+# ("dir"), a different namespace, and overloading it turned a directory file
+# into an lmdb one.
+DCL="$TESTROOT/declacct"
+"$ROOT/scripts/mkaccount.sh" "$DCL" >/dev/null 2>&1
+# lmdb for the same reason: the split has to be against whatever the default
+# now is, or the test asserts nothing.
+sed -i.bak 's/^driver = .*/driver = lmdb/' "$DCL/.mvx" && rm -f "$DCL/.mvx.bak"
+printf 'OPEN "SPLITF" TO F ELSE PRINT "cannot open SPLITF" ; STOP\nWRITE "hi" ON F, "K1"\nREAD R FROM F, "K1" THEN PRINT "read back: ":R\n' \
+  > "$TESTROOT/splitf.b"
+"$MVX" "$TESTROOT/splitf.b" -o "$TESTROOT/splitf" >/dev/null 2>&1
+check tcl-account-transport "$( \
+  echo '--- a new account says what it uses'; \
+  grep -E '^(driver|voc) ' "$TESTROOT/declacct/.mvx" 2>/dev/null \
+    || grep -E '^(driver|voc)' "$DCL/.mvx"; \
+  echo '--- VOC follows voc= even when the default is something else'; \
+  "$TCL" -a "$DCL" -c 'CREATE-FILE SPLITF' 2>&1; \
+  "$TCL" -a "$DCL" -c 'LISTF' 2>&1 | grep -E '^VOC '; \
+  echo '--- and a file on the declared default is usable'; \
+  (cd "$DCL" && MVXACCOUNT=. "$TESTROOT/splitf") 2>&1; \
+  echo '--- VOC is still readable, which is what would break'; \
+  "$TCL" -a "$DCL" -c 'COUNT VOC' 2>&1)"
+
 # @SENTENCE, the spelling UniData and UniVerse populate (#97).  mvx had only
 # the SENTENCE() function, so portable code carried an $IFDEF MVX between the
 # two -- and @SENTENCE was not even reserved, so the U2 spelling compiled as an
@@ -1778,25 +1854,25 @@ check tcl-port "$(printf 'PORT-SOURCE BP CPORT\nCT BP CPORT.PORTED\n' | tclrun; 
 check tcl-index "$(printf '%s\n' \
   'CREATE-INDEX PARTS COLOR' \
   'LIST-INDEXES PARTS' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'COPY PARTS W100 TO W950' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'DELETE PARTS W950' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'ED PARTS G200' \
   '3' \
   'R/red/blue' \
   'FI' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'ED PARTS G200' \
   '3' \
   'R/blue/red' \
   'FI' \
-  'LIST PARTS NAME WITH COLOR = red' \
+  'LIST PARTS NAME WITH COLOR = red BY @ID' \
   'CREATE-INDEX PARTS NAME' \
   'DELETE-INDEX PARTS COLOR' \
   'LIST-INDEXES PARTS' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'DELETE-INDEX PARTS NAME' | tclrun)"
 
 # EXPORT/IMPORT: a hash file round-trips through a git-native
@@ -1840,7 +1916,7 @@ NSEOF
 # select lists crossing EXECUTE into a program
 prog="$TESTROOT/progsel.b"
 cat > "$prog" <<'EOF'
-EXECUTE "SELECT PARTS WITH COLOR = blue" CAPTURING X
+EXECUTE "SSELECT PARTS WITH COLOR = blue BY @ID" CAPTURING X
 DONE = 0
 LOOP
    READNEXT ID ELSE DONE = 1

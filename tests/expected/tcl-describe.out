@@ -1,2 +1,2 @@
-lmdb: no server-side query planner; the driver returns the id list (index lookup when available, else a sequential scan) and the verb applies any conditions and ordering
-lmdb: no server-side query planner; the driver returns the id list (index lookup when available, else a sequential scan) and the verb applies any conditions and ordering
+sqlite: SELECT id FROM "MWF" WHERE EXISTS (SELECT 1 FROM json_each(CASE WHEN json_type(doc,'$."1"') = 'array' THEN json_extract(doc,'$."1"') ELSE json_array(COALESCE(json_extract(doc,'$."1"'),'')) END) mv WHERE mv.value = ?1)
+sqlite: SELECT id FROM "MWF"; 1 condition(s) applied in the verb

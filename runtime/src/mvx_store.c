@@ -526,6 +526,87 @@ static int binding_for(const char *cspec, char *driver, size_t dcap,
     return 1;
 }
 
+static int fl_internal(const char *p, size_t n);
+
+/* THE DEFAULT FOR AN ACCOUNT THAT DECLARED NOTHING (#187).
+ *
+ * sqlite, not lmdb, because lmdb pushes nothing down -- no select_where,
+ * select_order, count_where, sum_where, join or explain -- so every WITH
+ * streams the whole id list to the verb and filters there.  sqlite answers
+ * those in SQL, and is the same deal for the operator: one local file, no
+ * server.
+ *
+ * EXCEPT WHERE AN ACCOUNT ALREADY HOLDS LMDB FILES.  Accounts made before
+ * `driver` existed declare nothing, so they resolve through this; answering
+ * sqlite for them would make their files unreachable.  An account that already
+ * has lmdb files keeps getting lmdb, and only an account with none -- a new
+ * one, or one that has said what it wants -- gets sqlite.
+ *
+ * The probe asks the driver for its file list rather than looking for
+ * mvxdata.lmdb on disk: that path is created merely by enumerating through the
+ * driver, so its presence says nothing about whether anything is in it.
+ *
+ * Answered once per process; this is on the open path.
+ */
+/* Does `drv` hold a file called `name` in this account?  The honest way to
+   ask which backend an account's VOC is in, without opening it (#187). */
+int mvx_backend_has_file(const char *drv, const char *name) {
+    if (!drv || !name || !mvx_driver_available(drv)) return 0;
+    const mvx_driver *d = driver_load(drv);
+    if (!d || !d->names) return 0;
+    int found = 0;
+    mv_value names;
+    mv_init(&names);
+    char err[256] = "";
+    if (d->names(NULL, &names, err, sizeof err) &&
+        names.tag == MV_STR && names.s->len > 0) {
+        size_t want = strlen(name);
+        const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
+        while (p < end && !found) {
+            const char *am = memchr(p, '\xFE', (size_t)(end - p));
+            size_t n = (am ? am : end) - p;
+            if (n == want && memcmp(p, name, n) == 0) found = 1;
+            p = am ? am + 1 : end;
+        }
+    }
+    mv_clear(&names);
+    return found;
+}
+
+static const char *undeclared_default(void) {
+    static char cached[64];
+    static int  done;
+    if (done) return cached;
+    done = 1;
+
+    snprintf(cached, sizeof cached, "sqlite");
+    if (!mvx_driver_available("sqlite")) {
+        snprintf(cached, sizeof cached, "lmdb");
+        return cached;
+    }
+    const mvx_driver *l = driver_load("lmdb");
+    if (l && l->names) {
+        mv_value names;
+        mv_init(&names);
+        char err[256] = "";
+        if (l->names(NULL, &names, err, sizeof err) &&
+            names.tag == MV_STR && names.s->len > 0) {
+            const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
+            while (p < end) {
+                const char *am = memchr(p, '\xFE', (size_t)(end - p));
+                size_t n = (am ? am : end) - p;
+                if (n > 0 && !fl_internal(p, n)) {
+                    snprintf(cached, sizeof cached, "lmdb");
+                    break;
+                }
+                p = am ? am + 1 : end;
+            }
+        }
+        mv_clear(&names);
+    }
+    return cached;
+}
+
 /* Resolve a spec to its driver, and derive the dictionary spec when
    asked: DICT.<spec> as a sibling LMDB named DB, and <spec>.DICT as a
    sibling directory for directory files — so a directory file NAME and
@@ -559,7 +640,18 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
         return driver_load(driver);
     }
     snprintf(outspec, cap, want_dict ? "DICT.%s" : "%s", cspec);
-    return driver_load("lmdb");
+    /* VOC may name its own backend, because it is opened before anything that
+       could describe it (#187).  Only VOC: every other file is either bound or
+       takes the account default. */
+    if (cspec && strcasecmp(cspec, "VOC") == 0) {
+        char vd[64];
+        mvx_account_voc(vd, sizeof vd);
+        if (vd[0] && mvx_driver_available(vd)) return driver_load(vd);
+    }
+    char ad[64];
+    mvx_account_driver(ad, sizeof ad);
+    if (ad[0] && mvx_driver_available(ad)) return driver_load(ad);
+    return driver_load(undeclared_default());
 }
 
 int64_t mvx_open(mvx_ctx *ctx, const mv_value *dict, const mv_value *spec,
@@ -3268,18 +3360,28 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
     }
     free(ents);
 
-    const mvx_driver *lmdb = driver_load("lmdb");
-    if (lmdb->names) {
+    /* Local unbound files live in whichever embedded backend made them, and
+       an account can now say which that is (#187: `driver` in .mvx).  Ask
+       BOTH and label each file with the driver that holds it.
+       This is not hypothetical tidiness: a file the account placed in sqlite
+       was invisible here, so LISTF under-reported it and mvx-git -- which
+       finds an account's files through this same list -- committed the
+       account without its records (mv_git#240). */
+    static const char *local_drv[] = {"lmdb", "sqlite"};
+    for (size_t li = 0; li < sizeof local_drv / sizeof local_drv[0]; li++) {
+        if (!mvx_driver_available(local_drv[li])) continue;
+        const mvx_driver *ld = driver_load(local_drv[li]);
+        if (!ld || !ld->names) continue;
         mv_value names;
         mv_init(&names);
         char err[256] = "";
-        if (lmdb->names(NULL, &names, err, sizeof err) &&
+        if (ld->names(NULL, &names, err, sizeof err) &&
             names.tag == MV_STR && names.s->len > 0) {
             const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
             while (p < end) {
                 const char *am = memchr(p, '\xFE', (size_t)(end - p));
                 size_t n = (am ? am : end) - p;
-                if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, "lmdb");
+                if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, local_drv[li]);
                 p = am ? am + 1 : end;
             }
         }
@@ -3619,7 +3721,7 @@ static void voc_unregister(const char *name) {
    `USING postgres @pgmain`.  Empty ⇒ the built-in default (local lmdb).  Lets an
    account pick a default hash backend for new files while still allowing an
    explicit type per CREATE-FILE. */
-void mvx_account_hash(char *buf, size_t cap) {
+static void account_field(const char *key, char *buf, size_t cap) {
     if (cap) buf[0] = '\0';
     const char *acct = getenv("MVXACCOUNT");
     if (!acct || !acct[0]) acct = ".";
@@ -3637,7 +3739,8 @@ void mvx_account_hash(char *buf, size_t cap) {
             while (*k == ' ' || *k == '\t') k++;
             char *ke = eq;
             while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
-            if ((size_t)(ke - k) != 4 || strncasecmp(k, "hash", 4) != 0)
+            size_t klen = strlen(key);
+            if ((size_t)(ke - k) != klen || strncasecmp(k, key, klen) != 0)
                 continue;
             char *v = eq + 1;
             while (*v == ' ' || *v == '\t') v++;
@@ -3652,6 +3755,94 @@ void mvx_account_hash(char *buf, size_t cap) {
         }
         fclose(f);
     }
+}
+
+/* Set (or replace) one key in this account's .mvx.
+ *
+ * Rewrites the file, keeping every other line as it stands -- comments and
+ * permit/deny rules included, since they are policy and losing them silently
+ * would be far worse than the thing this is recording. */
+static void account_set_field(const char *key, const char *val) {
+    const char *acct = getenv("MVXACCOUNT");
+    if (!acct || !acct[0]) acct = ".";
+    char path[4200];
+    snprintf(path, sizeof path, "%s/.mvx", acct);
+    FILE *in = fopen(path, "r");
+    if (!in) return;                          /* not an account: nothing to say */
+
+    char *buf = NULL;
+    size_t cap = 0, len = 0;
+    char line[1024];
+    int replaced = 0;
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof line, in)) {
+        const char *k = line;
+        while (*k == ' ' || *k == '\t') k++;
+        const char *eq = strchr(k, '=');
+        int iskey = 0;
+        if (eq) {
+            const char *ke = eq;
+            while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+            iskey = (size_t)(ke - k) == klen && strncasecmp(k, key, klen) == 0;
+        }
+        char out[1200];
+        int n = iskey ? snprintf(out, sizeof out, "%s = %s\n", key, val)
+                      : snprintf(out, sizeof out, "%s", line);
+        if (iskey) replaced = 1;
+        if (len + (size_t)n + 1 > cap) {
+            cap = (len + (size_t)n + 1) * 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); fclose(in); return; }
+            buf = nb;
+        }
+        memcpy(buf + len, out, (size_t)n);
+        len += (size_t)n;
+    }
+    fclose(in);
+    if (!replaced) {                          /* not there yet: append it */
+        char out[1200];
+        int n = snprintf(out, sizeof out, "%s = %s\n", key, val);
+        if (len + (size_t)n + 1 > cap) {
+            cap = len + (size_t)n + 1;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return; }
+            buf = nb;
+        }
+        memcpy(buf + len, out, (size_t)n);
+        len += (size_t)n;
+    }
+    FILE *o = fopen(path, "w");
+    if (o) { fwrite(buf, 1, len, o); fclose(o); }
+    free(buf);
+}
+
+/* The account's default backend: what a file gets when neither CREATE-FILE nor
+   a binding said otherwise. */
+void mvx_account_hash(char *buf, size_t cap) {
+    account_field("hash", buf, cap);
+}
+
+/* THE ACCOUNT'S DEFAULT TRANSPORT -- which driver holds a file nothing else
+   placed (#187).
+   NOT `hash`: that key already means the default CREATE-FILE *type* ("dir", a
+   hash type), which is a different namespace.  Overloading it turned a
+   directory file into an lmdb one, which the suite caught. */
+void mvx_account_driver(char *buf, size_t cap) {
+    account_field("driver", buf, cap);
+}
+
+/* VOC's OWN transport, declared separately from the default (#187).
+ *
+ * VOC is the bootstrap file -- it has to be opened before anything else can be
+ * resolved, so it cannot be described by a record inside itself -- and it need
+ * not match the default: an account whose VOC was created under one backend
+ * keeps it while later files go to another.  Without this the two are assumed
+ * equal, which is only true until the default changes under an existing
+ * account.
+ *
+ * Empty means undeclared, and then VOC follows the default exactly as before. */
+void mvx_account_voc(char *buf, size_t cap) {
+    account_field("voc", buf, cap);
 }
 
 /* --- when the backend a file names is not on this host (mvx#113) -----------
@@ -3858,6 +4049,12 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
         }
         write_file_meta(drv, dictspec, drvname, ap);
         voc_register(cspec);
+        /* If this was VOC, the account's record of where VOC lives is now
+           stale, and VOC is the one file nothing else can describe -- it has
+           to be opened before anything that could (#187).  CONVERT-FILE goes
+           through here, so changing VOC's backend updates .mvx by itself
+           rather than leaving the operator to remember. */
+        if (strcasecmp(cspec, "VOC") == 0) account_set_field("voc", drvname);
         return 1;
     }
 

@@ -3,5 +3,5 @@ no .mv-account on disk
 records in backend, not on disk
 disk %FILE%: native
 PARTS                    dir
-ORDERS                   lmdb
+ORDERS                   sqlite
 W1           Widget      

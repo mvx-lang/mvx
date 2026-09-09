@@ -88,7 +88,10 @@ BEGIN CASE
 CASE NT = "dir"
    XC = CREATEFILE(TGT, "DIR")
 CASE NT = "lmdb"
-   XC = CREATEFILE(TGT)
+*  USING lmdb, not a bare CREATEFILE.  A bare one takes the ACCOUNT'S
+*  default, which is sqlite now (#187), so `CONVERT-FILE x lmdb` reported
+*  success and left the file exactly where it was.
+   XC = CREATEFILE(TGT, "USING lmdb")
 CASE CONN # ""
    XC = CREATEFILE(TGT, "USING ":NT:" ":CONN)
 CASE 1

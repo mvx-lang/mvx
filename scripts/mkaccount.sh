@@ -28,8 +28,24 @@ MVX="${MVX:-$ROOT/build/bin/mvx}"
 [ -x "$MVX" ] || command -v "$MVX" >/dev/null 2>&1 || MVX="$(command -v mvx || true)"
 [ -n "$MVX" ] || { echo "mkaccount: no mvx (set \$MVX or put it on PATH)" >&2; exit 1; }
 "$MVX" -a "$ACCT" -c "CREATE-FILE VOC" >/dev/null
-printf '# MVX account descriptor\nname = %s\nversion = 1\n' \
-  "$(basename "$ACCT")" > "$ACCT/.mvx"
+# WHICH BACKEND THIS ACCOUNT USES, RECORDED RATHER THAN ASSUMED (#187).
+#
+#   driver  the default transport for a file nothing else placed
+#   voc     VOC's own, declared separately because VOC is the bootstrap file:
+#           it must be opened before anything that could describe it, and it
+#           need not match the default -- an account keeps the VOC it was made
+#           with while later files can go elsewhere.
+#
+# `driver`, not `hash`: `hash` already means the default CREATE-FILE type
+# ("dir", a hash type), which is a different thing entirely.
+#
+# Both say what this account ACTUALLY used, so the answer survives the
+# compiled-in default changing underneath it.
+HASHDRV="$("$MVX" -a "$ACCT" -c 'LISTF' 2>/dev/null \
+  | awk '$1 == "VOC" { print $2; exit }')"
+[ -n "$HASHDRV" ] || HASHDRV=lmdb
+printf '# MVX account descriptor\nname = %s\nversion = 1\ndriver = %s\nvoc = %s\n' \
+  "$(basename "$ACCT")" "$HASHDRV" "$HASHDRV" > "$ACCT/.mvx"
 
 # Seed the account's default OS-command permissions from the system account's
 # .mvx (its `permit`/`deny` lines), so a new account starts with the site
