@@ -354,7 +354,11 @@ UNTIL DONE DO
          CASE WANOS<K> = 0
             RV = ID
          CASE WANOS<K> = -1
-            RV = IEVAL(R, WSPECS<K>)
+            IF DOPEN THEN
+               RV = IEVAL(R, WSPECS<K>, DC)
+            END ELSE
+               RV = IEVAL(R, WSPECS<K>)
+            END
          CASE 1
             RV = R<WANOS<K>>
          END CASE
@@ -398,7 +402,11 @@ UNTIL DONE DO
          CASE BANO = 0
             K = ID
          CASE BANO = -1
-            K = IEVAL(R, BSPEC)
+            IF DOPEN THEN
+               K = IEVAL(R, BSPEC, DC)
+            END ELSE
+               K = IEVAL(R, BSPEC)
+            END
          CASE 1
             K = R<BANO>
          END CASE
@@ -433,7 +441,11 @@ FOR K = 1 TO N
       CASE ANOS<C> = 0
          V = ID
       CASE ANOS<C> = -1
-         V = IEVAL(R, ISPECS<C>)
+         IF DOPEN THEN
+            V = IEVAL(R, ISPECS<C>, DC)
+         END ELSE
+            V = IEVAL(R, ISPECS<C>)
+         END
       CASE 1
          V = R<ANOS<C>>
       END CASE

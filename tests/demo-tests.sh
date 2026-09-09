@@ -125,17 +125,15 @@ sel="$(V LIST ORDERS CLIENT_NAME WITH REGION = 'West')"
 t "WITH on an I-type selects"   "Ella Brooks"      "$sel"
 nt "WITH on an I-type excludes" "Alice Nguyen"     "$sel"
 
-say "-- arithmetic I-types: where the platforms differ (mvx#121) --"
-# QTY * PRICE and SUM(EPRICE) are ordinary on UniData and UniVerse; MVX's
-# evaluator handles TRANS and DOCTAG only and returns empty.  Asserted per
-# platform rather than skipped — the divergence IS the finding, and a suite
-# that only checked what all three agree on would pass forever saying nothing.
+say "-- arithmetic I-types --"
+# QTY * PRICE and SUM(EPRICE).  This used to be asserted per platform, with
+# MVX expected to return BLANK, because its evaluator handled TRANS and DOCTAG
+# only (mvx#121).  It evaluates them now, so the three platforms agree and the
+# assertion is the same one everywhere -- which is the point the inverted
+# version was holding open.
 ext="$(V LIST ORDERS EPRICE WITH @ID = '1001')"
-if [ "$PLATFORM" = mvx ]; then
-  nt "EPRICE is blank here (mvx#121)"  '$996.00'  "$ext"
-else
-  t  "EPRICE evaluates"                '$996.00'  "$ext"
-fi
+t "EPRICE evaluates"        '$996.00'   "$ext"
+t "SUM folds the extension" '$1895.00'  "$(V LIST ORDERS ORDER_TOTAL WITH @ID = '1001')"
 
 say "== $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

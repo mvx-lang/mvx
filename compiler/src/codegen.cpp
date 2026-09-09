@@ -1073,10 +1073,18 @@ private:
                    {ctxArg_, dest, evalPtr(*e.args[0]), evalPtr(*e.args[1]),
                     evalPtr(*e.args[2]), evalPtr(*e.args[3])});
             return; }
-        if (f == "IEVAL") { need(2);
+        if (f == "IEVAL") {
+            /* IEVAL(rec, spec) still works; IEVAL(rec, spec, DICT) resolves
+               the bare names in an arithmetic I-type against that
+               dictionary (#121). */
+            if (e.args.size() != 2 && e.args.size() != 3)
+                err(e.line, "IEVAL takes 2 or 3 arguments");
+            llvm::Value *dv = e.args.size() == 3
+                                ? evalPtr(*e.args[2])
+                                : llvm::ConstantPointerNull::get(ptrTy_);
             callRt("mvx_ieval", voidTy_,
-                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_},
-                   {ctxArg_, dest, evalPtr(*e.args[0]), evalPtr(*e.args[1])});
+                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_, ptrTy_},
+                   {ctxArg_, dest, evalPtr(*e.args[0]), evalPtr(*e.args[1]), dv});
             return; }
         if (f == "QUERYSUM") { need(6);
             callRt("mvx_querysum", voidTy_,
