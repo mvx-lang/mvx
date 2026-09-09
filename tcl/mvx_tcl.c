@@ -345,6 +345,9 @@ static int run_verb(const char *path, const char *line) {
  * documented shell escape here, and silently changing it would break the
  * thing an operator is most likely to have in a script. */
 
+static int  macro_run(mv_value *f, const char *name, const char *args);
+static int  macro_create(const char *name, const char *list, int overwrite);
+
 #define STACK_MAX 500
 static char *g_stack[STACK_MAX];
 static int   g_nstack;                /* g_stack[0] is entry 1, the top */
@@ -500,7 +503,11 @@ static void stack_help(void) {
       ".DE n/str       delete any of the top n entries containing str\n"
       ".X              execute the top entry\n"
       ".X n{,n}        execute entry n (and it moves to the top)\n"
-      ".n{,n}          same as .X n\n");
+      ".n{,n}          same as .X n\n"
+      ".X name         execute macro `name` from VOC\n"
+      ".X file name    execute macro `name` from `file`\n"
+      ".C name n{,n}   make a macro from those stack entries\n"
+      ".CO name n{,n}  the same, replacing one that exists\n");
     fflush(stdout);
 }
 
@@ -572,9 +579,60 @@ static int stack_command(const char *line, int *rc) {
         return 1;
     }
 
+    if (strcmp(op, "C") == 0 || strcmp(op, "CO") == 0) {
+        /* .C name n{,n} -- the manual's table writes this as ".C n{,n}" and
+           omits the name, but create-macro takes one and .X needs one to
+           call, so the name comes first here.  Stated rather than guessed
+           at silently (#177). */
+        char nm[128] = "";
+        int k = 0;
+        while (*p && *p != ' ' && k < (int)sizeof nm - 1) nm[k++] = *p++;
+        nm[k] = '\0';
+        while (*p == ' ') p++;
+        if (!nm[0] || !*p) {
+            printf("[1311] .%s takes a macro name and stack entries\n", op);
+            *rc = 2; return 1;
+        }
+        *rc = macro_create(nm, p, strcmp(op, "CO") == 0);
+        return 1;
+    }
+
     /* .X, .X n{,n} and the bare .n{,n} the manual writes as .{X} n{,n} */
     int isx = strcmp(op, "X") == 0;
     if (!isx && op[0] != '\0') return 0;      /* .SOMETHINGELSE is not ours */
+
+    /* .X name, and .X file name -- an argument that is not a number is a
+       macro, not a stack entry. */
+    if (isx && *p && !isdigit((unsigned char)*p)) {
+        char w1[256] = "", w2[256] = "";
+        int k = 0;
+        while (*p && *p != ' ' && k < (int)sizeof w1 - 1) w1[k++] = *p++;
+        w1[k] = '\0';
+        while (*p == ' ') p++;
+        k = 0;
+        while (*p && *p != ' ' && k < (int)sizeof w2 - 1) w2[k++] = *p++;
+        w2[k] = '\0';
+        mv_value f;
+        const char *nm;
+        if (w2[0]) {                       /* .X file name */
+            if (voc_open(&f, w1) <= 0) {
+                printf("[1325] cannot open file \"%s\"\n", w1);
+                *rc = 2; return 1;
+            }
+            nm = w2;
+        } else {
+            if (g_voc_state == 0) g_voc_state = voc_open(&g_voc, "VOC");
+            if (g_voc_state <= 0) { printf("[1323] no VOC in this account\n");
+                                    *rc = 2; return 1; }
+            f = g_voc;
+            nm = w1;
+        }
+        int r = macro_run(&f, nm, NULL);
+        if (w2[0]) mv_clear(&f);
+        if (r < 0) { printf("[1326] no macro \"%s\"\n", nm); *rc = 2; }
+        else *rc = r;
+        return 1;
+    }
     if (g_stack_depth > 8) {
         printf("[1313] the stack is executing itself; stopping\n");
         *rc = 2; return 1;
@@ -606,6 +664,173 @@ static int stack_command(const char *line, int *rc) {
         if (*q == ',') q++;
     }
     return 1;
+}
+
+
+/* ------------------------------------------------------------ #177
+ * TCL macros.
+ *
+ * D3's model, from the Pick Systems Reference Manual entries "macros" and
+ * "create-macro":
+ *
+ *   001  M{ comment}   or   N{ comment}
+ *   002  <a TCL command>
+ *   003  <another>
+ *
+ * Stored in the master dictionary -- VOC here -- under the macro's own name,
+ * and run by typing that name.  `N` (non-stop) runs each command straight
+ * off; `M` (modify) shows each one at the prompt first so it can be edited
+ * before it goes, which is the whole point of the type.  Parameters typed
+ * after the name are appended to the FIRST command only; the manual is
+ * explicit that they do not reach the others.
+ *
+ * Not implemented: the manual also says additional VALUES in an attribute
+ * are stacked input to that attribute's command.  Feeding a verb its stdin
+ * means a pipe through the fork/exec path, which is a separate mechanism
+ * from anything here, so a macro with multivalued attributes runs value 1
+ * and says so rather than quietly dropping the rest. */
+
+#define MACRO_MAXCMD 64
+static char *g_mqueue[MACRO_MAXCMD];    /* an M macro's pending commands */
+static int   g_mqn, g_mqi;
+
+/* Read `name` from `f` and, if it is a macro, hand back its record and mode.
+   Returns 'M', 'N', or 0 when the item is missing or is not a macro. */
+static char macro_read(mv_value *f, const char *name, mv_value *rec) {
+    mv_value id, a1;
+    mv_init(&id); mv_init(&a1);
+    mv_set_str(&id, name, (int64_t)strlen(name));
+    char mode = 0;
+    if (mvx_read(g_ctx, rec, f, &id, 0)) {
+        mv_extract_fn(&a1, rec, 1, 0, 0);
+        char nb[64];
+        const char *p;
+        int64_t n = mv_val_chars(&a1, nb, sizeof nb, &p);
+        /* "M" or "N", optionally followed by a blank and a comment. */
+        if (n >= 1 && (n == 1 || p[1] == ' ')) {
+            char c = (char)toupper((unsigned char)p[0]);
+            if (c == 'M' || c == 'N') mode = c;
+        }
+    }
+    mv_clear(&id); mv_clear(&a1);
+    return mode;
+}
+
+/* Queue an M macro's commands so each is offered at a prompt in turn. */
+static void macro_queue(char **cmds, int n) {
+    for (int i = 0; i < g_mqn; i++) free(g_mqueue[i]);
+    g_mqn = g_mqi = 0;
+    for (int i = 0; i < n && i < MACRO_MAXCMD; i++)
+        g_mqueue[g_mqn++] = strdup(cmds[i]);
+}
+
+/* Run a macro.  `args` is whatever followed the name and goes on the first
+   command; `f` is the file it came from. */
+static int macro_run(mv_value *f, const char *name, const char *args) {
+    mv_value rec;
+    mv_init(&rec);
+    char mode = macro_read(f, name, &rec);
+    if (!mode) { mv_clear(&rec); return -1; }
+
+    char *cmds[MACRO_MAXCMD];
+    int n = 0, truncated = 0, stacked = 0;
+    for (int64_t a = 2; n < MACRO_MAXCMD; a++) {
+        mv_value at, v1;
+        mv_init(&at); mv_init(&v1);
+        mv_extract_fn(&at, &rec, a, 0, 0);
+        char nb[64];
+        const char *p;
+        int64_t ln = mv_val_chars(&at, nb, sizeof nb, &p);
+        if (ln <= 0) { mv_clear(&at); mv_clear(&v1); break; }
+        mv_extract_fn(&v1, &rec, a, 1, 0);      /* value 1 is the command */
+        mv_value vm;                            /* is there stacked input? */
+        mv_init(&vm);
+        mv_extract_fn(&vm, &rec, a, 2, 0);
+        char vb[8];
+        const char *vp;
+        if (mv_val_chars(&vm, vb, sizeof vb, &vp) > 0) stacked = 1;
+        mv_clear(&vm);
+        char cb[4096];
+        const char *cp;
+        int64_t cl = mv_val_chars(&v1, cb, sizeof cb, &cp);
+        char *cmd = malloc((size_t)cl + (args ? strlen(args) : 0) + 2);
+        if (cmd) {
+            memcpy(cmd, cp, (size_t)cl);
+            cmd[cl] = '\0';
+            /* the manual: parameters reach the first command and no other */
+            if (n == 0 && args && args[0]) { strcat(cmd, " "); strcat(cmd, args); }
+            cmds[n++] = cmd;
+        }
+        mv_clear(&at); mv_clear(&v1);
+        if (n == MACRO_MAXCMD) truncated = 1;
+    }
+    mv_clear(&rec);
+    if (n == 0) { printf("[1320] macro \"%s\" has no commands\n", name); return 2; }
+    if (stacked)
+        printf("[1321] \"%s\": stacked input (extra values) is not run\n", name);
+    if (truncated)
+        printf("[1322] \"%s\": only the first %d commands were taken\n",
+               name, MACRO_MAXCMD);
+
+    int rc = 0;
+    if (mode == 'M' && isatty(0)) {
+        macro_queue(cmds, n);               /* offered at the prompt, in turn */
+    } else {
+        /* N, or M with nothing to display into: run them.  An M macro off a
+           terminal still says what it is running, since that is the half of
+           "display then execute" that survives without a prompt. */
+        for (int i = 0; i < n; i++) {
+            if (mode == 'M') { printf("%s\n", cmds[i]); fflush(stdout); }
+            char *cp = strdup(cmds[i]);
+            rc = command(cp);
+            free(cp);
+        }
+    }
+    for (int i = 0; i < n; i++) free(cmds[i]);
+    return rc;
+}
+
+/* Build a macro from stack entries and file it in VOC. */
+static int macro_create(const char *name, const char *list, int overwrite) {
+    if (g_voc_state == 0) g_voc_state = voc_open(&g_voc, "VOC");
+    if (g_voc_state <= 0) { printf("[1323] no VOC in this account\n"); return 2; }
+    mv_value existing;
+    mv_init(&existing);
+    char had = macro_read(&g_voc, name, &existing);
+    mv_clear(&existing);
+    if (had && !overwrite) {
+        printf("[415] '%s' exists on file.\n", name);   /* D3's own message */
+        return 2;
+    }
+    mv_value rec, part;
+    mv_init(&rec); mv_init(&part);
+    mv_set_str(&rec, "M", 1);              /* create-macro's default type */
+    int64_t a = 2;
+    for (const char *q = list; *q; ) {
+        int nth = 0;
+        if (sscanf(q, "%d", &nth) != 1 || nth < 1 || nth > g_nstack) {
+            printf("[1310] no such stack entry\n");
+            mv_clear(&rec); mv_clear(&part);
+            return 2;
+        }
+        mv_set_str(&part, g_stack[nth - 1], (int64_t)strlen(g_stack[nth - 1]));
+        mv_replace_fn(&rec, &rec, a++, 0, 0, &part);
+        while (*q && *q != ',') q++;
+        if (*q == ',') q++;
+    }
+    if (a == 2) { printf("[1311] .C needs at least one stack entry\n");
+                  mv_clear(&rec); mv_clear(&part); return 2; }
+    mv_value id;
+    mv_init(&id);
+    mv_set_str(&id, name, (int64_t)strlen(name));
+    /* mvx_write answers 0 for success and -2 for failure, so a plain
+       truthiness test reads it exactly backwards -- it reported a failure
+       for every macro it had just filed correctly. */
+    int ok = mvx_write(g_ctx, &rec, &g_voc, &id, 0, 1) >= 0;
+    mv_clear(&id); mv_clear(&rec); mv_clear(&part);
+    if (!ok) { printf("[1324] could not file macro \"%s\"\n", name); return 2; }
+    printf("%s created\n", name);          /* D3's own wording */
+    return 0;
 }
 
 static int command(char *line) {
@@ -674,6 +899,27 @@ static int command(char *line) {
     int r = voc_lookup(verb, path, sizeof path);
     if (r > 0)
         return run_verb(path, line);
+
+    /* Not a verb -- but the same VOC name may be a macro, which is how a
+       macro is activated in D3: you type its name.  D3 additionally makes
+       an M-type name need quotes; we accept the quoted form so that habit
+       still works, and the bare one too, because the quoting rule is an
+       artefact of D3's parser rather than something worth reproducing. */
+    if (g_voc_state == 0) g_voc_state = voc_open(&g_voc, "VOC");
+    if (g_voc_state > 0) {
+        char mname[128];
+        const char *mp = line;
+        size_t mn = 0;
+        int quoted = (*mp == '"');
+        if (quoted) mp++;
+        while (*mp && (quoted ? *mp != '"' : (*mp != ' ' && *mp != '\t')) &&
+               mn < sizeof mname - 1)
+            mname[mn++] = *mp++;
+        mname[mn] = '\0';
+        if (quoted && *mp == '"') mp++;
+        while (*mp == ' ' || *mp == '\t') mp++;
+        if (mn && macro_run(&g_voc, mname, mp) >= 0) return 0;
+    }
     if (r < 0)
         fprintf(stderr, "mvx: no VOC found in this account or the "
                         "system account (%s); only builtins are "
@@ -814,6 +1060,12 @@ int main(int argc, char **argv) {
     for (;;) {
 #ifdef HAVE_EDITLINE
         if (tty) {
+            /* An M macro's commands wait here: each is typed into the
+               prompt in turn so it can be edited before it goes, which is
+               what the M type is for (#177). */
+            if (g_mqi < g_mqn) el_push(g_el, g_mqueue[g_mqi++]);
+            else if (g_mqn) { for (int i = 0; i < g_mqn; i++) free(g_mqueue[i]);
+                              g_mqn = g_mqi = 0; }
             int eln = 0;
             const char *l = el_gets(g_el, &eln);
             if (!l || eln <= 0) break;
