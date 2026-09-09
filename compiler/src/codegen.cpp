@@ -77,7 +77,7 @@ const std::set<std::string> kIntIntrinsics = {
     "LEN", "COUNT", "DCOUNT", "SEQ", "INDEX", "NUM", "STATUS", "ALPHA", "CATALOGED",
     "CREATEFILE", "DELETEFILE", "COMPILE", "DATE",
     "INDEXBUILD", "INDEXDROP", "INDEXSELECT", "RND", "MAPBUILD", "MAPDROP",
-    "MAPCHECK", "QUERYSELECT", "TRANSSELECT", "QUERYCOUNT", "ORDERSELECT",
+    "MAPCHECK", "MAPRESTORE", "QUERYSELECT", "TRANSSELECT", "QUERYCOUNT", "ORDERSELECT",
     "MULTISELECT", "TRANSORDERSELECT",
     "OSWRITE", "OSDELETE", "OSEXEC", "MKDIR", "RMTREE", "UNTAR",
     "EDITFILE", "SETCRED", "SETCONN",
@@ -760,6 +760,11 @@ private:
                                    : ConstantInt::get(i64Ty_, 0)});
             if (f == "MAPDROP" && e.args.size() == 2)
                 return callRt("mvx_mapdrop", i64Ty_,
+                              {ptrTy_, ptrTy_, ptrTy_},
+                              {ctxArg_, evalPtr(*e.args[0]),
+                               evalPtr(*e.args[1])});
+            if (f == "MAPRESTORE" && e.args.size() == 2)
+                return callRt("mvx_maprestore", i64Ty_,
                               {ptrTy_, ptrTy_, ptrTy_},
                               {ctxArg_, evalPtr(*e.args[0]),
                                evalPtr(*e.args[1])});

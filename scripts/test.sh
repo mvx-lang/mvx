@@ -2953,6 +2953,53 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# NATIVE MODE STORES A MAPPED ATTRIBUTE ONCE.
+#
+# The column is authoritative there and map_recompose reads it back from the
+# column unconditionally, so keeping it in the document as well is a second
+# copy that is never read and can only drift (#157).  Going BACK to mirror has
+# to put them into the documents again, because mirror reads the document and
+# never consults the columns — without that every record would read with its
+# mapped attributes empty while the values sat in columns nobody looks at.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== native mode stores a mapped attribute once"
+  NDA="$TESTROOT/ndacct"; mkdir -p "$NDA"
+  printf '# MVX account descriptor\nname=nd\nversion=1\n' > "$NDA/.mvx"
+  printf '* sqlite %s/nd.sqlite\n' "$NDA" > "$NDA/BINDINGS"
+  "$TCL" -a "$NDA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/nd.b" <<'NDEOF'
+OPEN "CUST" TO F ELSE STOP
+OPEN "DICT", "CUST" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L" ON D, "CITY"
+WRITE "Ada":@AM:"London":@AM:"unmapped-extra" ON F, "C1"
+NDEOF
+  "$MVX" "$TESTROOT/nd.b" -o "$TESTROOT/ndbin" 2>/dev/null
+  (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndbin")
+  cat > "$TESTROOT/ndrw.b" <<'NDWEOF'
+OPEN "CUST" TO F ELSE STOP
+WRITE "Ada":@AM:"London":@AM:"unmapped-extra" ON F, "C1"
+READ R FROM F, "C1" THEN
+   PRINT "record: [":R<1>:"][":R<2>:"][":R<3>:"]"
+END ELSE PRINT "LOST"
+NDWEOF
+  "$MVX" "$TESTROOT/ndrw.b" -o "$TESTROOT/ndrwbin" 2>/dev/null
+  "$TCL" -a "$NDA" -c 'CREATE-MAP CUST NAME CITY' >/dev/null 2>&1
+  printf 'y\n' | "$TCL" -a "$NDA" -c 'MAP-MODE CUST native' >/dev/null 2>&1
+  (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") >/dev/null 2>&1
+  # the document holds ONLY the un-mapped attribute; the record still reads whole
+  NDDOC=$(sqlite3 "$NDA/nd.sqlite" 'SELECT doc FROM CUST;' 2>/dev/null)
+  NDREAD=$( (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") 2>&1 | tail -1)
+  "$TCL" -a "$NDA" -c 'MAP-MODE CUST mirror' >/dev/null 2>&1
+  NDDOC2=$(sqlite3 "$NDA/nd.sqlite" 'SELECT doc FROM CUST;' 2>/dev/null)
+  NDREAD2=$( (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") 2>&1 | tail -1)
+  check tcl-native-onecopy "$(printf '%s\n' \
+    "native  doc: $NDDOC" \
+    "native  $NDREAD" \
+    "mirror  doc: $NDDOC2" \
+    "mirror  $NDREAD2")"
+fi
+
 # A LONG MAPPED VALUE SURVIVES NATIVE MODE.
 #
 # In native mode a mapped attribute is read back from its COLUMN, so anything

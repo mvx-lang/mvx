@@ -308,6 +308,10 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
 int64_t mvx_mapdrop(mvx_ctx *ctx, const mv_value *fvar,
                     const mv_value *spec);
 /* Count records failing native validation (0 = clean), -2 unsupported. */
+/* Rewrite each record's document with its mapped attributes filled in from
+   the columns — what going back from native to mirror needs (#157). */
+int64_t mvx_maprestore(mvx_ctx *ctx, const mv_value *fvar,
+                       const mv_value *spec);
 int64_t mvx_mapcheck(mvx_ctx *ctx, const mv_value *fvar,
                      const mv_value *spec);
 int     mvx_openaccount(void);   /* open account format on? ($MVX_OPENACCOUNT) */

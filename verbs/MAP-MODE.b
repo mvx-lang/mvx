@@ -36,6 +36,32 @@ END
 MODE = OCONV(MODE, "MCL")
 BEGIN CASE
 CASE MODE = "mirror"
+   * GOING BACK NEEDS THE RECORDS PUT BACK TOGETHER FIRST.
+   *
+   * Native stores a mapped attribute ONCE, in its column, and leaves it out
+   * of the document (mvx#157).  Mirror reads the document and does not
+   * consult the columns -- that is the difference between the modes -- so
+   * flipping the flag alone would make every existing record read back with
+   * its mapped attributes EMPTY, while the values sit untouched in columns
+   * nobody looks at any more.  Measured: [Ada][London][extra] became
+   * [][][extra].
+   *
+   * Restoring them is a pass over the file, reading each record while native
+   * (so the columns are still consulted) and rewriting it once mirror -- a
+   * runtime primitive, because the mode is global and BASIC cannot read one
+   * record in one mode and write it in the other.  Until that exists the
+   * switch is refused rather than silently emptying the records.
+   IF CUR = "native" THEN
+      OPEN FN TO F ELSE
+         PRINT "cannot open ":FN
+         STOP
+      END
+      RN = MAPRESTORE(F, SPEC)
+      IF RN < 0 THEN
+         PRINT FN:" cannot be restored on this backend; still native"
+         STOP
+      END
+   END
    WRITE "mirror" ON DD, "%MAPMODE%"
    PRINT FN:" mapping mode: mirror"
 CASE MODE = "native"

@@ -1141,14 +1141,44 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
     if (o && o->map.nf > 0 && b->driver->bulk_begin && b->driver->bulk_commit)
         txn = b->driver->bulk_begin(f);
 
+    /* NATIVE MODE STORES THE RECORD ONCE.  A mapped attribute lives in its
+       column, and map_recompose reads it back from there unconditionally — so
+       keeping it in the document as well is a second copy that is never read
+       and can only drift (#157).  Strip those attributes from what is stored;
+       the FULL record still goes to ix_diff and map_project below, which is
+       what the index and the columns are built from.
+       Mirror mode keeps everything: there the document is the authority and
+       the columns are the derived copy, which is the whole difference between
+       the two modes. */
+    mv_value stored;
+    const mv_value *towrite = rec;
+    int stripped = 0;
+    if (o && o->map.nf > 0 && o->map.native) {
+        char nb[64];
+        const char *rp;
+        int64_t rl = mv_val_chars((mv_value *)rec, nb, sizeof nb, &rp);
+        mv_init(&stored);
+        mv_set_str(&stored, rl > 0 ? rp : "", rl > 0 ? rl : 0);
+        mv_value empty;
+        mv_init(&empty);
+        mv_set_str(&empty, "", 0);
+        for (int i = 0; i < o->map.nf; i++)
+            if (o->map.anos[i] > 0)
+                mv_replace_fn(&stored, &stored, o->map.anos[i], 0, 0, &empty);
+        mv_clear(&empty);
+        towrite = &stored;
+        stripped = 1;
+    }
+
     if (o && o->ix.n > 0 && b->driver->write_ix) {
         mvx_ixop ops[IX_MAX_ITEMS * IX_MAX_VALS * 2];
         static ixvals pool[IX_MAX_ITEMS * 2];
         int nops = ix_diff(o, &old, had_old, rec, ops, pool);
-        ok = b->driver->write_ix(f, ip, idlen, rec, ops, nops);
+        ok = b->driver->write_ix(f, ip, idlen, towrite, ops, nops);
     } else {
-        ok = b->driver->write(f, ip, idlen, rec);
+        ok = b->driver->write(f, ip, idlen, towrite);
     }
+    if (stripped) mv_clear(&stored);
     if (!ok) {
         if (txn && b->driver->rollback) b->driver->rollback(f);
         if (need_old) mv_clear(&old);
@@ -1892,6 +1922,55 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
     mv_clear(&rid); mv_clear(&rec);
     free(m.buf);
     return rc < 0 ? rc : count;
+}
+
+/* Put the mapped attributes back INTO the documents.
+ *
+ * Native mode stores a mapped attribute once, in its column, and leaves it out
+ * of the document (#157).  Mirror reads the document and never consults the
+ * columns — that is the difference between the modes — so going back without
+ * this every record would read with its mapped attributes EMPTY while the
+ * values sat untouched in columns nobody looks at any more.
+ *
+ * Deliberately independent of the mode flag: it reads the stored document,
+ * fills the mapped attributes from the columns itself, and writes the whole
+ * record back through the driver.  So it is correct run before or after the
+ * flip, which BASIC could not manage — the mode is global, and one record
+ * cannot be read in one mode and written in the other.
+ *
+ * Returns the number of records rewritten, or -2 if the backend cannot
+ * enumerate. */
+int64_t mvx_maprestore(mvx_ctx *ctx, const mv_value *fvar,
+                       const mv_value *spec) {
+    mvx_file *f = file_of(fvar, "MAPRESTORE");
+    mvx_file_base *b = (mvx_file_base *)f;
+    if (!b->driver->select_begin || !b->driver->read || !b->driver->write)
+        return -2;
+    char nb[40];
+    const char *sp;
+    int64_t slen = mv_val_chars(spec, nb, sizeof nb, &sp);
+    mapmeta m;
+    memset(&m, 0, sizeof m);
+    map_parse(sp, slen, &m);
+    if (m.nf == 0) { free(m.buf); return 0; }
+
+    mvx_cursor *c = b->driver->select_begin(f);
+    if (!c) { free(m.buf); return -2; }
+    int64_t n = 0;
+    mv_value id, rec;
+    mv_init(&id); mv_init(&rec);
+    while (b->driver->select_next(c, &id)) {
+        char ib[40];
+        const char *ip;
+        int64_t il = mv_val_chars(&id, ib, sizeof ib, &ip);
+        if (!b->driver->read(f, ip, il, &rec)) continue;
+        map_recompose(ctx, f, &m, ip, il, &rec);
+        if (b->driver->write(f, ip, il, &rec)) n++;
+    }
+    mv_clear(&id); mv_clear(&rec);
+    if (b->driver->select_end) b->driver->select_end(c);
+    free(m.buf);
+    return n;
 }
 
 /* Count records that would fail native (strict) validation against spec,

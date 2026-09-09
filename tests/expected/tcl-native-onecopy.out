@@ -1,0 +1,4 @@
+native  doc: {"3":"unmapped-extra"}
+native  record: [Ada][London][unmapped-extra]
+mirror  doc: {"1":"Ada","2":"London","3":"unmapped-extra"}
+mirror  record: [Ada][London][unmapped-extra]
