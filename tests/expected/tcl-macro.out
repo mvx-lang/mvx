@@ -1,6 +1,6 @@
 --- N runs each command; the parameter reaches only the first
 3 record(s) counted
-VOC                      lmdb
+VOC                      sqlite
 --- M shows each command before running it
 COUNT VOC
 3 record(s) counted

@@ -4,8 +4,8 @@ BP                       dir
 CATALOG                  dir
 CATALOG.DICT             dir
 PARTS.DICT               dir
-PARTS                    lmdb
-VOC                      lmdb
+PARTS                    sqlite
+VOC                      sqlite
 6 file(s)
 @ID          Type Attr     Conv  Heading          Format S/M Assoc       
 NAME         D    1              Name             20L                    

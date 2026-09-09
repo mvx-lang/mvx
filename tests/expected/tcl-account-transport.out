@@ -1,9 +1,9 @@
 --- a new account says what it uses
-driver = sqlite
-voc = lmdb
+driver = lmdb
+voc = sqlite
 --- VOC follows voc= even when the default is something else
 [417] file SPLITF created
-VOC                      lmdb
+VOC                      sqlite
 --- and a file on the declared default is usable
 read back: hi
 --- VOC is still readable, which is what would break
