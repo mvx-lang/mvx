@@ -923,6 +923,34 @@ printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
 # packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# An account records which transport it uses (#187): `driver` for a file
+# nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
+# is the bootstrap file -- opened before anything that could describe it -- and
+# it need not match the default: an account keeps the VOC it was made with
+# while later files go elsewhere.  That split is the whole point, so it is what
+# is asserted, not just that the keys parse.
+#
+# `driver`, not `hash`: `hash` already means the default CREATE-FILE type
+# ("dir"), a different namespace, and overloading it turned a directory file
+# into an lmdb one.
+DCL="$TESTROOT/declacct"
+"$ROOT/scripts/mkaccount.sh" "$DCL" >/dev/null 2>&1
+sed -i.bak 's/^driver = .*/driver = sqlite/' "$DCL/.mvx" && rm -f "$DCL/.mvx.bak"
+printf 'OPEN "SPLITF" TO F ELSE PRINT "cannot open SPLITF" ; STOP\nWRITE "hi" ON F, "K1"\nREAD R FROM F, "K1" THEN PRINT "read back: ":R\n' \
+  > "$TESTROOT/splitf.b"
+"$MVX" "$TESTROOT/splitf.b" -o "$TESTROOT/splitf" >/dev/null 2>&1
+check tcl-account-transport "$( \
+  echo '--- a new account says what it uses'; \
+  grep -E '^(driver|voc) ' "$TESTROOT/declacct/.mvx" 2>/dev/null \
+    || grep -E '^(driver|voc)' "$DCL/.mvx"; \
+  echo '--- VOC follows voc= even when the default is something else'; \
+  "$TCL" -a "$DCL" -c 'CREATE-FILE SPLITF' 2>&1; \
+  "$TCL" -a "$DCL" -c 'LISTF' 2>&1 | grep -E '^VOC '; \
+  echo '--- and a file on the declared default is usable'; \
+  (cd "$DCL" && MVXACCOUNT=. "$TESTROOT/splitf") 2>&1; \
+  echo '--- VOC is still readable, which is what would break'; \
+  "$TCL" -a "$DCL" -c 'COUNT VOC' 2>&1)"
+
 # @SENTENCE, the spelling UniData and UniVerse populate (#97).  mvx had only
 # the SENTENCE() function, so portable code carried an $IFDEF MVX between the
 # two -- and @SENTENCE was not even reserved, so the U2 spelling compiled as an
