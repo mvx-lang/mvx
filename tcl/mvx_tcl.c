@@ -33,6 +33,7 @@
  * $MVX_SENTENCE (the SENTENCE() intrinsic).
  */
 #include "mvx_runtime.h"
+#include "mvx_driver.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -938,8 +939,14 @@ int main(int argc, char **argv) {
             acct = argv[++i];
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc)
             one_cmd = argv[++i];
+        else if (strcmp(argv[i], "--version") == 0) {
+            /* The ABI belongs beside the version: it is what decides
+               whether a compiled artifact still loads (#117). */
+            printf("mvx %s (driver ABI %d)\n", mvx_version(), MVX_DRIVER_ABI);
+            return 0;
+        }
         else {
-            fprintf(stderr, "usage: mvx [-a account] [-c command]\n");
+            fprintf(stderr, "usage: mvx [-a account] [-c command] [--version]\n");
             return 2;
         }
     }
