@@ -3167,11 +3167,19 @@ ag_seed() { # ag_seed <dir> [create-args]
 AG_BIND="" ag_seed "$AGACC/lmdb"
 REF=$(ag_answers "$AGACC/lmdb")
 AGOUT="verb (reference)  $REF"
+AGN=0                                 # backends actually compared
+AGBAD=0                               # ...and how many disagreed
+# ag_row <label> <answers> — add a row, count it, flag a disagreement
+ag_row() {
+  AGN=$((AGN + 1))
+  [ "$2" = "$REF" ] || AGBAD=$((AGBAD + 1))
+  AGOUT="$AGOUT
+$1$2$([ "$2" = "$REF" ] || echo '   <-- DISAGREES')"
+}
 if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
   AG_BIND="* sqlite $AGACC/sq.sqlite" ag_seed "$AGACC/sqlite"
   G=$(ag_answers "$AGACC/sqlite")
-  AGOUT="$AGOUT
-sqlite            $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+  ag_row "sqlite            " "$G"
 fi
 if [ -n "${MVX_PG:-}" ]; then
   psql_ext "DROP SCHEMA IF EXISTS agree CASCADE" >/dev/null 2>&1
@@ -3180,8 +3188,7 @@ if [ -n "${MVX_PG:-}" ]; then
     "$TCL" -a "$AGACC/pg" >/dev/null 2>&1
   AG_BIND="CUST @cn" ag_seed "$AGACC/pg" "USING @cn"
   G=$(ag_answers "$AGACC/pg")
-  AGOUT="$AGOUT
-postgres          $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+  ag_row "postgres          " "$G"
 fi
 if [ -n "${MVX_MONGO:-}" ]; then
   mkdir -p "$AGACC/mg"
@@ -3190,14 +3197,12 @@ if [ -n "${MVX_MONGO:-}" ]; then
     "$TCL" -a "$AGACC/mg" >/dev/null 2>&1
   AG_BIND="CUST @cn" ag_seed "$AGACC/mg" "USING @cn"
   G=$(ag_answers "$AGACC/mg")
-  AGOUT="$AGOUT
-mongo             $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+  ag_row "mongo             " "$G"
 fi
 if [ -n "${MVX_MYSQL:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 2>&1; then
   AG_BIND="* mysql $MVX_MYSQL" ag_seed "$AGACC/my"
   G=$(ag_answers "$AGACC/my")
-  AGOUT="$AGOUT
-mysql             $G$([ "$G" = "$REF" ] || echo '   <-- DISAGREES')"
+  ag_row "mysql             " "$G"
 fi
 # AND THE INDEX MUST NOT CHANGE THE ANSWER.  This is the axis the comparison
 # above cannot see: the scan and all four push-downs agreed with each other
@@ -3212,7 +3217,25 @@ IXAFTER=$(ag_answers "$AGACC/ix")
 AGOUT="$AGOUT
 unindexed         $IXBEFORE
 indexed           $IXAFTER$([ "$IXAFTER" = "$IXBEFORE" ] || echo '   <-- INDEX CHANGED THE ANSWER')"
-check tcl-backends-agree "$AGOUT"
+# Assert the agreement, do not diff a transcript of it.  Which backends are
+# present depends on the environment -- CI has postgres and mongo but no mysql,
+# a laptop may have none of them -- so a blessed transcript encodes the machine
+# it was blessed on and fails everywhere else.  What this test actually claims
+# is that every backend that DID run agrees with the verb, and that is true
+# whatever ran.
+if [ "$AGN" -lt 1 ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL backends agree: no backend was compared (sqlite should always be)"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+elif [ "$AGBAD" -ne 0 ] || [ "$IXAFTER" != "$IXBEFORE" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL backends agree: $AGBAD of $AGN disagreed with the verb"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+else
+  PASS=$((PASS + 1))
+  echo "  $AGN backend(s) agree with the verb, indexed and not"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+fi
 
 echo "== byte accessor discipline"
 stray=$(grep -rn -- '->data' "$ROOT"/runtime/src/*.c 2>/dev/null \
