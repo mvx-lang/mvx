@@ -952,7 +952,7 @@ private:
             return t;
         }
         if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0 &&
-            e.sval != "@USER.TYPE")
+            e.sval != "@USER.TYPE" && e.sval != "@SENTENCE")
             return getScalar(e.sval, e.line);
         if (e.kind == Expr::K::Paren && arrayNames_.count(e.sval))
             return arrayElemPtr(e);
@@ -981,6 +981,17 @@ private:
                     ConstantInt::get(i64Ty_, (int64_t)e.sval.size())});
             return;
         case Expr::K::Var: {
+            if (e.sval == "@SENTENCE") {
+                /* @SENTENCE is what UniData and UniVerse populate; mvx had
+                   only the SENTENCE() function, so portable code needed an
+                   $IFDEF MVX between the two spellings (#97).  Same source,
+                   so they cannot disagree -- and it was not even reserved
+                   before, so a program using the U2 spelling got an ordinary
+                   unassigned variable and silently read nothing. */
+                callRt("mv_sentence", voidTy_, {ptrTy_, ptrTy_},
+                       {ctxArg_, dest});
+                return;
+            }
             if (e.sval == "@USER.TYPE") {          // session type (0 = interactive)
                 callRt("mv_user_type", voidTy_, {ptrTy_, ptrTy_},
                        {ctxArg_, dest});
