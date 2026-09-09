@@ -559,6 +559,17 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
         return driver_load(driver);
     }
     snprintf(outspec, cap, want_dict ? "DICT.%s" : "%s", cspec);
+    /* VOC may name its own backend, because it is opened before anything that
+       could describe it (#187).  Only VOC: every other file is either bound or
+       takes the account default. */
+    if (cspec && strcasecmp(cspec, "VOC") == 0) {
+        char vd[64];
+        mvx_account_voc(vd, sizeof vd);
+        if (vd[0] && mvx_driver_available(vd)) return driver_load(vd);
+    }
+    char ad[64];
+    mvx_account_driver(ad, sizeof ad);
+    if (ad[0] && mvx_driver_available(ad)) return driver_load(ad);
     return driver_load("lmdb");
 }
 
@@ -3619,7 +3630,7 @@ static void voc_unregister(const char *name) {
    `USING postgres @pgmain`.  Empty ⇒ the built-in default (local lmdb).  Lets an
    account pick a default hash backend for new files while still allowing an
    explicit type per CREATE-FILE. */
-void mvx_account_hash(char *buf, size_t cap) {
+static void account_field(const char *key, char *buf, size_t cap) {
     if (cap) buf[0] = '\0';
     const char *acct = getenv("MVXACCOUNT");
     if (!acct || !acct[0]) acct = ".";
@@ -3637,7 +3648,8 @@ void mvx_account_hash(char *buf, size_t cap) {
             while (*k == ' ' || *k == '\t') k++;
             char *ke = eq;
             while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
-            if ((size_t)(ke - k) != 4 || strncasecmp(k, "hash", 4) != 0)
+            size_t klen = strlen(key);
+            if ((size_t)(ke - k) != klen || strncasecmp(k, key, klen) != 0)
                 continue;
             char *v = eq + 1;
             while (*v == ' ' || *v == '\t') v++;
@@ -3652,6 +3664,35 @@ void mvx_account_hash(char *buf, size_t cap) {
         }
         fclose(f);
     }
+}
+
+/* The account's default backend: what a file gets when neither CREATE-FILE nor
+   a binding said otherwise. */
+void mvx_account_hash(char *buf, size_t cap) {
+    account_field("hash", buf, cap);
+}
+
+/* THE ACCOUNT'S DEFAULT TRANSPORT -- which driver holds a file nothing else
+   placed (#187).
+   NOT `hash`: that key already means the default CREATE-FILE *type* ("dir", a
+   hash type), which is a different namespace.  Overloading it turned a
+   directory file into an lmdb one, which the suite caught. */
+void mvx_account_driver(char *buf, size_t cap) {
+    account_field("driver", buf, cap);
+}
+
+/* VOC's OWN transport, declared separately from the default (#187).
+ *
+ * VOC is the bootstrap file -- it has to be opened before anything else can be
+ * resolved, so it cannot be described by a record inside itself -- and it need
+ * not match the default: an account whose VOC was created under one backend
+ * keeps it while later files go to another.  Without this the two are assumed
+ * equal, which is only true until the default changes under an existing
+ * account.
+ *
+ * Empty means undeclared, and then VOC follows the default exactly as before. */
+void mvx_account_voc(char *buf, size_t cap) {
+    account_field("voc", buf, cap);
 }
 
 /* --- when the backend a file names is not on this host (mvx#113) -----------

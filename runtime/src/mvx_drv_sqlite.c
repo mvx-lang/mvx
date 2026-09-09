@@ -120,7 +120,19 @@ static void fn_mvx_vm_has(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
 /* Open (once per database file) and cache.  Every table in this file is
    an MV file of the same account, which is what keeps joins co-located. */
 static sqlite3 *sq_connect(const char *path, char *err, size_t errlen) {
+    /* NO PATH MEANS THE ACCOUNT'S OWN DATABASE (#187).  An account can now
+       declare sqlite as its default backend, and a default has to know where
+       to put things without being told -- lmdb has always defaulted to
+       <account>/mvxdata.lmdb for exactly this reason.  Same shape, same
+       place. */
+    char dflt[4096];
     if (!path || !path[0]) {
+        const char *acct = getenv("MVXACCOUNT");
+        if (!acct || !acct[0]) acct = ".";
+        snprintf(dflt, sizeof dflt, "%s/mvxdata.sqlite", acct);
+        path = dflt;
+    }
+    if (!path[0]) {
         snprintf(err, errlen, "sqlite: no database path in the binding");
         return NULL;
     }
