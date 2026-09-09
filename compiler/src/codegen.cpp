@@ -1486,9 +1486,19 @@ private:
             break;
         case Stmt::K::Stop:
             if (s.value) {
-                // STOP <code>: end the whole program with a process exit status.
-                Value *code = b_.CreateTrunc(asI64(*s.value), i32Ty_);
-                callRt("mvx_exit", voidTy_, {i32Ty_}, {code});
+                // STOP/ABORT <expr>.  The operand is passed as a VALUE, not
+                // forced to a number here: an MV value has no compile-time
+                // type, and asI64 on a concatenation emitted invalid IR that
+                // aborted inside LLVM (#120).  The runtime decides -- numeric
+                // is an exit status, anything else is a message.
+                callRt("mvx_stop_value", voidTy_, {ptrTy_, i32Ty_},
+                       {evalPtr(*s.value),
+                        llvm::ConstantInt::get(i32Ty_, s.isAbort ? 1 : 0)});
+                b_.CreateUnreachable();
+            } else if (s.isAbort) {
+                callRt("mvx_stop_value", voidTy_, {ptrTy_, i32Ty_},
+                       {llvm::ConstantPointerNull::get(ptrTy_),
+                        llvm::ConstantInt::get(i32Ty_, 1)});
                 b_.CreateUnreachable();
             } else if (prog_.isSubroutine) {
                 // STOP ends the whole program, not just the subroutine.
