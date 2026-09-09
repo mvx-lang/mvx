@@ -71,6 +71,20 @@ UNTIL QUEUE = "" DO
       GOSUB 9000
       * the manifest's systems field (attr 4) lists the MV platforms the
       * package targets; refuse one that declares systems but not this one.
+      * The declared runtime requirement, checked BEFORE anything is linked.
+      * Refusing is the whole point: without this the install succeeds and the
+      * failure arrives later as an undefined symbol at dlopen, a long way
+      * from what caused it (#117).
+      NRQ = DCOUNT(PREQ, @AM)
+      FOR RI = 1 TO NRQ
+         RQ = PREQ<RI>
+         GOSUB 9300
+         IF REQOK = 0 THEN
+            PRINT CUR:" needs ":RQNAME:" ":RQOP:RQWANT:
+            PRINT ", but this is ":RQHAVE
+            STOP
+         END
+      NEXT RI
       IF PSYS # "" THEN
          OKSYS = 0
          NSY = DCOUNT(PSYS, " ")
@@ -132,11 +146,69 @@ NEXT LI
 STOP
 
 * ---- 9000: manifest of CUR -> PNAME, PVER, PDEPS -----------------------
+* 9300: is requirement RQ satisfied?  RQ is "mvx>=0.1.2" or "mvx-abi>=14".
+* Sets REQOK, and RQNAME/RQOP/RQWANT/RQHAVE for the message.
+*
+* Only >= is honoured, and a bare version means >=.  A package saying it needs
+* at least some version is the case that matters; the rest of a range grammar
+* would be more parser than the problem has earned, and guessing at "<" or "~"
+* semantics is how a check starts refusing things it should not.
+9300
+   REQOK = 1
+   RQOP = ">="
+   RQNAME = RQ
+   RQWANT = ""
+   P = INDEX(RQ, ">=", 1)
+   IF P > 0 THEN
+      RQNAME = RQ[1, P - 1]
+      RQWANT = RQ[P + 2, LEN(RQ)]
+   END ELSE
+      P = INDEX(RQ, "=", 1)
+      IF P > 0 THEN
+         RQNAME = RQ[1, P - 1]
+         RQWANT = RQ[P + 1, LEN(RQ)]
+      END
+   END
+   IF RQWANT = "" THEN RETURN        ;* nothing asked for
+   BEGIN CASE
+   CASE RQNAME = "mvx-abi"
+      RQHAVE = SYSTEM(1001)
+      IF RQHAVE < RQWANT THEN REQOK = 0
+   CASE RQNAME = "mvx"
+      RQHAVE = MVXVERSION()
+      GOSUB 9400
+      IF VCMP < 0 THEN REQOK = 0
+   CASE 1
+      RETURN                         ;* a requirement we do not know: ignore
+   END CASE
+   RETURN
+
+* 9400: compare RQHAVE against RQWANT as dotted numbers -> VCMP (-1/0/1).
+* Only the numeric x.y.z prefix is compared: a develop build describes itself
+* as 0.1.4-27-gabc1234, and what that means for a ">=0.1.4" test is that it is
+* newer than 0.1.4, so the suffix is dropped rather than parsed.
+9400
+   VCMP = 0
+   HV = FIELD(RQHAVE, "-", 1)
+   WV = RQWANT
+   FOR VI = 1 TO 3
+      HP = FIELD(HV, ".", VI)
+      WP = FIELD(WV, ".", VI)
+      IF HP = "" THEN HP = 0
+      IF WP = "" THEN WP = 0
+      IF VCMP = 0 THEN
+         IF HP + 0 < WP + 0 THEN VCMP = -1
+         IF HP + 0 > WP + 0 THEN VCMP = 1
+      END
+   NEXT VI
+   RETURN
+
 9000
 PNAME = ""
 PVER = ""
 PSYS = ""
 PDEPS = ""
+PREQ = ""
 OPEN CUR TO MPD THEN
    READ MF FROM MPD, "PKG" THEN
       PNAME = MF<1>
@@ -145,7 +217,17 @@ OPEN CUR TO MPD THEN
       MN = DCOUNT(MF, @AM)
       FOR MI = 5 TO MN
          IF MF<MI> # "" THEN
-            PDEPS<-1> = MF<MI>
+            * '!' marks a RUNTIME requirement rather than a package
+            * dependency: !mvx>=0.1.2 says which mvx this package needs.
+            * A prefix, because dependencies run from attribute 5 to the end
+            * of the record and a fixed attribute number would collide with
+            * them -- the manifest already uses '?' for optional and '+' for
+            * build-only, so this follows the grammar that is there (#117).
+            IF MF<MI>[1, 1] = "!" THEN
+               PREQ<-1> = MF<MI>[2, LEN(MF<MI>)]
+            END ELSE
+               PDEPS<-1> = MF<MI>
+            END
          END
       NEXT MI
    END

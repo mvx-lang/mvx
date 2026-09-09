@@ -30,6 +30,8 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
+
+#include "mvx_driver.h"   /* MVX_DRIVER_ABI, stamped into every artifact */
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -1187,6 +1189,9 @@ private:
         if (f == "MOUSE") { need(0);
             callRt("mv_mouse", voidTy_, {ptrTy_, ptrTy_},
                    {ctxArg_, dest});
+            return; }
+        if (f == "MVXVERSION") { need(0);
+            callRt("mv_mvx_version", voidTy_, {ptrTy_}, {dest});
             return; }
         if (f == "SENTENCE") { need(0);
             callRt("mv_sentence", voidTy_, {ptrTy_, ptrTy_},
@@ -2565,6 +2570,29 @@ void CodeGen::run(const std::string &outPath) {
     mod_.addModuleFlag(Module::Warning, "Debug Info Version",
                        DEBUG_METADATA_VERSION);
     mod_.addModuleFlag(Module::Warning, "Dwarf Version", 4);
+
+    /* STAMP THE ARTIFACT WITH WHAT BUILT IT (#117).
+       The binary is the thing with the hard dependency, not the source, so
+       the answer has to travel inside it -- a sidecar file gets separated
+       from the .dylib it describes on the first copy.  Two symbols, readable
+       by dlsym at load time and by `nm` from a shell:
+
+         mvx_built_abi      the driver ABI this was compiled against
+         mvx_built_version  the release it was compiled by
+
+       weak_odr, because linking several objects into one program would
+       otherwise be a duplicate-symbol error; identical values merge. */
+    {
+        auto *abi = new GlobalVariable(
+            mod_, i32Ty_, true, GlobalValue::WeakODRLinkage,
+            ConstantInt::get(i32Ty_, MVX_DRIVER_ABI), "mvx_built_abi");
+        abi->setVisibility(GlobalValue::DefaultVisibility);
+        Constant *vs = ConstantDataArray::getString(llctx_, MVX_VERSION, true);
+        auto *ver = new GlobalVariable(
+            mod_, vs->getType(), true, GlobalValue::WeakODRLinkage, vs,
+            "mvx_built_version");
+        ver->setVisibility(GlobalValue::DefaultVisibility);
+    }
 
     buildFunction();
 

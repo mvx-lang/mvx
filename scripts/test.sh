@@ -923,6 +923,84 @@ printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
 # packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# The toolchain says what it is, and a package can say what it needs (#117).
+# Two numbers answering different questions: the VERSION is which release, and
+# is what a `requires` range is matched against; the DRIVER ABI is what decides
+# whether a compiled artifact can be loaded at all.
+#
+# The version is a git describe, so it differs per checkout -- these assert the
+# SHAPE and the decisions, never the value.
+VER="$("$TCL" -c 'VERSION SHORT' 2>&1)"
+ABI="$("$TCL" -c 'VERSION ABI' 2>&1)"
+case "$VER" in
+  [0-9]*.[0-9]*) PASS=$((PASS+1)); echo "  VERSION reports a dotted version" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL VERSION SHORT: '$VER'" ;;
+esac
+case "$ABI" in
+  [0-9]*) PASS=$((PASS+1)); echo "  VERSION ABI reports a number" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL VERSION ABI: '$ABI'" ;;
+esac
+# the CLI and the verb must agree -- two places to report one fact is two
+# places for it to drift
+CLIV="$("$TCL" --version 2>&1)"
+case "$CLIV" in
+  *"$VER"*"$ABI"*) PASS=$((PASS+1)); echo "  --version agrees with the verb" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL --version '$CLIV' vs verb '$VER'/'$ABI'" ;;
+esac
+# every compiled artifact carries what built it, so the binary answers the
+# question rather than a sidecar file that gets separated from it
+printf 'SUBROUTINE STAMPED(X)\nX = "hi"\n' > "$TESTROOT/stamped.b"
+"$MVX" -shared "$TESTROOT/stamped.b" -o "$TESTROOT/stamped.lib" >/dev/null 2>&1
+if nm -g "$TESTROOT/stamped.lib" 2>/dev/null | grep -q "mvx_built_abi"; then
+  PASS=$((PASS+1)); echo "  a compiled artifact is stamped with its ABI"
+else
+  FAIL=$((FAIL+1)); echo "FAIL no mvx_built_abi in a compiled artifact"
+fi
+# and a library needing a NEWER ABI is refused, by name, instead of loading and
+# failing later as an undefined symbol
+STA="$TESTROOT/stampacct"; mkdir -p "$STA/LIB"
+"$ROOT/scripts/mkaccount.sh" "$STA" >/dev/null 2>&1
+printf 'const int mvx_built_abi = 99;\nconst char mvx_built_version[] = "9.9.9";\nvoid mvx_sub_FAKE(void) {}\n' \
+  > "$TESTROOT/fakeabi.c"
+# .dylib on macOS, .so elsewhere -- the loader scans for its own suffix
+LIBSFX=.so
+[ "$(uname)" = Darwin ] && LIBSFX=.dylib
+if cc -shared -o "$STA/LIB/FAKE$LIBSFX" "$TESTROOT/fakeabi.c" 2>/dev/null; then
+  printf 'CALL NOSUCHSUB\n' > "$TESTROOT/callit.b"
+  "$MVX" "$TESTROOT/callit.b" -o "$TESTROOT/callit" >/dev/null 2>&1
+  ab="$( (cd "$STA" && MVXACCOUNT=. "$TESTROOT/callit") 2>&1 | head -1)"
+  case "$ab" in
+    *"needs driver ABI 99"*"speaks"*) PASS=$((PASS+1))
+      echo "  a too-new library is refused, naming both ABIs" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL too-new library: $ab" ;;
+  esac
+else
+  echo "  (skipping the ABI-stamp refusal — no cc)"
+fi
+# a package declares what it needs, and LINK-PKG refuses rather than letting the
+# failure arrive later as an undefined symbol
+RQP="$TESTROOT/reqpkg"; mkdir -p "$RQP"
+printf '# MVX account descriptor\nname=reqpkg\nversion=1\n' > "$RQP/.mvx"
+reqtest() { # reqtest <manifest-requirement> -> the LINK-PKG line
+  printf 'reqpkg\n1.0.0\ndesc\nmvx\n%s\n' "$1" > "$RQP/PKG"
+  d="$TESTROOT/rq$2"; mkdir -p "$d"
+  "$ROOT/scripts/mkaccount.sh" "$d" >/dev/null 2>&1
+  # The refusal names what this runtime IS, and that changes with every commit
+  # (the version is a git describe) and on every ABI bump.  Blessing either
+  # would make this test fail on the next commit rather than on a regression,
+  # so both are tokenised -- what is asserted is that it refused and said what
+  # it wanted, not which build happened to run it.
+  "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1 | head -1 | normalise \
+    | sed -E -e 's/(but this is ).*/\1@RUNTIME@/'
+}
+check tcl-requires "$( \
+  echo '--- a version this runtime has'; reqtest '!mvx>=0.1.0' a; \
+  echo '--- one it has not'; reqtest '!mvx>=9.9.9' b; \
+  echo '--- an ABI it has'; reqtest '!mvx-abi>=1' c; \
+  echo '--- one it has not'; reqtest '!mvx-abi>=99' d; \
+  echo '--- and a requirement it does not understand is ignored, not fatal'; \
+  reqtest '!something-else>=3' e)"
+
 # A package can export a FUNCTION, and a DEFFUN'd caller resolves it across the
 # package boundary (#101).  BUILD-PKG and CATALOG classified only SUBROUTINE as
 # library-producing, so a FUNCTION was compiled as a PROGRAM and the link failed

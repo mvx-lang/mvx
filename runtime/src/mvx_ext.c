@@ -17,6 +17,7 @@
  * any lib exporting mvx_ext_entry it registers that lib's function table. */
 
 #include "mvx_ext.h"
+#include "mvx_driver.h"   /* MVX_DRIVER_ABI, checked against an artifact stamp */
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -77,7 +78,32 @@ static void load_dir(const char *dir) {
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */
-        if (!h) continue;                                 /* failure: symbols stay absent */
+        if (!h) {
+            /* SAY WHY (#117).  This used to fail silently, so a library built
+               against a newer runtime just never loaded and the user met it
+               later as "subroutine is not cataloged" -- a long way from the
+               cause.  The message names the file and what the loader said. */
+            const char *why = dlerror();
+            fprintf(stderr, "mvx: cannot load %s: %s\n", path,
+                    why ? why : "unknown error");
+            continue;
+        }
+        /* What was this compiled against?  mvx-basic stamps every artifact
+           with the driver ABI it saw (#117).  An older stamp is fine -- the
+           ABI only breaks forward -- but a NEWER one means this runtime does
+           not have what the library was built to call, and loading it would
+           trade a clear message here for an undefined symbol later. */
+        const int32_t *built = (const int32_t *)dlsym(h, "mvx_built_abi");
+        if (built && *built > MVX_DRIVER_ABI) {
+            const char *bv = (const char *)dlsym(h, "mvx_built_version");
+            fprintf(stderr,
+                    "mvx: %s needs driver ABI %d but this runtime speaks %d"
+                    "%s%s%s -- rebuild it, or upgrade mvx\n",
+                    path, (int)*built, MVX_DRIVER_ABI,
+                    bv ? " (built by mvx " : "", bv ? bv : "", bv ? ")" : "");
+            dlclose(h);
+            continue;
+        }
         mvx_ext_entry_fn entry = (mvx_ext_entry_fn)dlsym(h, "mvx_ext_entry");
         if (entry) {
             const mvx_ext *ext = entry(MVX_EXT_ABI);

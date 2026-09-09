@@ -1,0 +1,10 @@
+--- a version this runtime has
+linked @TESTROOT@/reqpkg
+--- one it has not
+@TESTROOT@/reqpkg needs mvx >=9.9.9, but this is @RUNTIME@
+--- an ABI it has
+linked @TESTROOT@/reqpkg
+--- one it has not
+@TESTROOT@/reqpkg needs mvx-abi >=99, but this is @RUNTIME@
+--- and a requirement it does not understand is ignored, not fatal
+linked @TESTROOT@/reqpkg

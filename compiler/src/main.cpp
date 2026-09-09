@@ -20,6 +20,8 @@
 // Errors go to stderr as "item:line: message" — parseable; the BASIC verb
 // will consume this later, so treat the format as an interface.
 
+#include "mvx_driver.h"   /* MVX_DRIVER_ABI, reported by --version */
+
 #include "codegen.h"
 #include "parser.h"
 #include "preprocess.h"
@@ -76,6 +78,7 @@ fs::path runtimeLibDir() {
 int usage() {
     std::cerr <<
         "usage: mvx-basic [options] file.b [file.b|file.o ...]\n"
+        "  --version    print the toolchain version and exit\n"
         "  -c           compile to object only (no link)\n"
         "  -o <path>    output path\n"
         "  -shared      produce a shared subroutine library\n"
@@ -143,6 +146,12 @@ std::string shellQuote(const std::string &s) {
 } // namespace
 
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++)
+        if (std::string(argv[i]) == "--version") {   /* #117 */
+            std::printf("mvx-basic %s (driver ABI %d)\n",
+                        MVX_VERSION, MVX_DRIVER_ABI);
+            return 0;
+        }
     bool compileOnly = false, shared = false;
     mvx::CodegenOptions cg;
     std::string outPath;

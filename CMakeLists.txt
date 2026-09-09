@@ -1,6 +1,29 @@
 cmake_minimum_required(VERSION 3.24)
 project(mvx LANGUAGES C CXX)
 
+# The toolchain's own version, so a package can say which mvx it needs and
+# something can check it (#117).  Taken from the git tag, because the tag is
+# what a release IS -- a VERSION file would be a second place to forget.  A
+# checkout with no tags, or a source tarball, reports 0.0.0-dev, which no
+# `requires` range will satisfy: better to say "unknown" out loud than to
+# claim a version the binary may not have.
+find_package(Git QUIET)
+set(MVX_VERSION "0.0.0-dev")
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+  # --match v*: the release workflow keeps a rolling `dev` tag on develop's
+  # HEAD, and without this that tag is what describe finds -- so every develop
+  # build would report "unknown" instead of "newer than the last release".
+  execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
+                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                  OUTPUT_VARIABLE MVX_GIT_DESC
+                  OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+  if(MVX_GIT_DESC MATCHES "^v[0-9]")
+    string(REGEX REPLACE "^v" "" MVX_VERSION "${MVX_GIT_DESC}")
+  endif()
+endif()
+message(STATUS "MVX version ${MVX_VERSION}")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -93,6 +116,7 @@ if(M_LIBRARY)
   target_link_libraries(mvxrt PRIVATE ${M_LIBRARY})
 endif()
 target_compile_definitions(mvxrt PRIVATE
+  MVX_VERSION="${MVX_VERSION}"
   MVX_DRIVER_DIR="${CMAKE_BINARY_DIR}/lib"
   MVX_BIN_DIR="${CMAKE_BINARY_DIR}/bin"
   MVX_SYSTEM_DIR="${CMAKE_BINARY_DIR}/system")
@@ -344,6 +368,10 @@ add_dependencies(mvx-basic mvxrt mvx_crt)
 llvm_map_components_to_libnames(LLVM_LIBS
   core support passes native irreader targetparser)
 target_link_libraries(mvx-basic PRIVATE ${LLVM_LIBS})
+# The compiler reports the same version as the runtime, without linking it:
+# mvx-basic does not depend on libmvxrt and should not start now (#117).
+target_compile_definitions(mvx-basic PRIVATE MVX_VERSION="${MVX_VERSION}")
+target_include_directories(mvx-basic PRIVATE runtime/include)
 
 # --- install -----------------------------------------------------------
 # A relocatable prefix: bin/ holds the executables, lib/ the shared
