@@ -14,6 +14,11 @@ packages/*/bin/
 # An account is version-controlled in its legible directory form and
 # rebuilt into hash files by mvx-git / mvx-convert-acct.
 mvxdata.lmdb/
+# ...and every other backend's local store.  lmdb's is a DIRECTORY and was
+# named as one; sqlite's is a FILE with -shm and -wal beside it, so running
+# mvx anywhere in the tree left three untracked files behind once sqlite
+# became the default (#187).  Match the convention, not one name.
+mvxdata.*
 # tt/ is a throwaway scratch account.
 tt/
 # The repo root is the source tree, not an MVX account: ignore a stray
