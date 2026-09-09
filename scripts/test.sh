@@ -923,6 +923,22 @@ printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
 # packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# @SENTENCE, the spelling UniData and UniVerse populate (#97).  mvx had only
+# the SENTENCE() function, so portable code carried an $IFDEF MVX between the
+# two -- and @SENTENCE was not even reserved, so the U2 spelling compiled as an
+# ordinary unassigned variable and silently read nothing.  Both forms now come
+# from one source, which is what stops them disagreeing.
+SNA="$TESTROOT/sentacct"; mkdir -p "$SNA/BP"
+"$ROOT/scripts/mkaccount.sh" "$SNA" >/dev/null 2>&1
+printf 'PRINT "fn: ":SENTENCE()\nPRINT "at: ":@SENTENCE\n' > "$SNA/BP/SHOWSENT"
+MVXPRIV=developer "$TCL" -a "$SNA" -c 'CATALOG BP SHOWSENT' >/dev/null 2>&1
+printf '@SENTENCE = "nope"\n' > "$TESTROOT/rosent.b"
+check tcl-atsentence "$( \
+  echo '--- both spellings, through a cataloged verb from TCL'; \
+  "$TCL" -a "$SNA" -c 'SHOWSENT alpha beta' 2>&1; \
+  echo '--- and it is read-only, like any system variable'; \
+  "$MVX" "$TESTROOT/rosent.b" -o "$TESTROOT/rosent" 2>&1 | sed 's#.*/##')"
+
 # The toolchain says what it is, and a package can say what it needs (#117).
 # Two numbers answering different questions: the VERSION is which release, and
 # is what a `requires` range is matched against; the DRIVER ABI is what decides

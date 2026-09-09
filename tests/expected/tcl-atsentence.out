@@ -1,0 +1,5 @@
+--- both spellings, through a cataloged verb from TCL
+fn: SHOWSENT alpha beta
+at: SHOWSENT alpha beta
+--- and it is read-only, like any system variable
+rosent.b:1: cannot assign to system variable @SENTENCE
