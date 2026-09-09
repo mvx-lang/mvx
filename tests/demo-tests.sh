@@ -92,8 +92,11 @@ t "staff"      "8 record"   "$(V COUNT STAFF)"
 t "states"     "8 record"   "$(V COUNT STATES)"
 
 say "-- conversions: the stored form is not the shown form --"
-# Money is the classic scaled integer — 24900 in the record, $249.00 on screen.
-t "MD2\$ money"  '$249.00'   "$(V LIST INVENTORY PRICE WITH @ID = 'P100')"
+# Money is the classic scaled integer — 26900 in the record, $269.00 on screen.
+# The literal tracks the demo account's own data, which is the point (a broken
+# MD2$ shows up as a wrong number, not a missing one) but does mean a price
+# change upstream lands here: P100 was 24900 when this was written.
+t "MD2\$ money"  '$269.00'   "$(V LIST INVENTORY PRICE WITH @ID = 'P100')"
 t "D4/ date"     "2019"      "$(V LIST CLIENTS SINCE WITH @ID = 'C1001')"
 t "MTH time"     "09:24"     "$(V LIST ORDERS ORD_TIME WITH @ID = '1001')"
 
