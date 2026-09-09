@@ -10,7 +10,7 @@
 * BUILD-PKG <pkgdir> — build a package's BASIC source natively, the
 * package-level peer of CATALOG.  It compiles <pkgdir>/BP/* through the
 * runtime COMPILE primitive (which spawns the compiler argv-style, no shell):
-* SUBROUTINE sources become <pkgdir>/LIB/<name> shared libraries the CALL
+* SUBROUTINE and FUNCTION sources become <pkgdir>/LIB/<name> shared libraries the CALL
 * resolver loads, main programs become <pkgdir>/CATALOG/<name> verb
 * executables.  The package ships its own VOC verb records, so VOC is left
 * untouched.  This needs only developer privilege (compiling), not the
@@ -118,4 +118,9 @@ FIRSTSTMT:
       END
    NEXT FI
    IF FIRST[1, 11] = "SUBROUTINE " OR FIRST = "SUBROUTINE" THEN ISSUB = 1
+   * A FUNCTION builds into LIB/ exactly as a SUBROUTINE does -- it shares the
+   * subroutine ABI, with argv[0] reserved for the result.  Without this it was
+   * compiled as a program and the link failed on a missing _mvx_main, which is
+   * why a package could not export a function-style accessor (#101).
+   IF FIRST[1, 9] = "FUNCTION " OR FIRST = "FUNCTION" THEN ISSUB = 1
    RETURN
