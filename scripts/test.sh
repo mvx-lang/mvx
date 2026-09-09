@@ -923,6 +923,19 @@ printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
 # packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# LISTF reports a file whatever local backend holds it (#187).  It asked lmdb
+# and only lmdb, so a file the account placed in sqlite was invisible -- and
+# because mvx-git finds an account's files through this same list, it committed
+# such an account WITHOUT ITS RECORDS (mv_git#240).  So this is not cosmetic:
+# the list is what another tool builds an account from.
+ENA="$TESTROOT/enumacct"
+"$ROOT/scripts/mkaccount.sh" "$ENA" >/dev/null 2>&1
+sed -i.bak 's/^driver = .*/driver = sqlite/' "$ENA/.mvx" && rm -f "$ENA/.mvx.bak"
+check tcl-listf-backends "$( \
+  "$TCL" -a "$ENA" -c 'CREATE-FILE PARTS' 2>&1; \
+  echo '--- VOC on one backend, PARTS on the other, both listed'; \
+  "$TCL" -a "$ENA" -c 'LISTF' 2>&1 | grep -E '^(VOC|PARTS) ')"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and
