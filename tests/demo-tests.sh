@@ -43,6 +43,7 @@ PLATFORM="${PLATFORM:-mvx}"
 : "${MVXGIT:?set MVXGIT to the git driver (mvx-git, udt-git or uv-git)}"
 DEMO="${DEMO:-https://github.com/mvx-lang/demo.git}"
 WORK="${WORK:-$(mktemp -d)}"
+mkdir -p "$WORK" || exit 1   # mktemp -d exists; a WORK passed in may not
 PASS=0; FAIL=0; SKIP=0
 
 say()  { printf '%s\n' "$*"; }
