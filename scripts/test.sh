@@ -995,15 +995,42 @@ reqtest() { # reqtest <manifest-requirement> -> the LINK-PKG line
   "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1 | tail -1 | normalise \
     | sed -E -e 's/(but this is ).*/\1@RUNTIME@/'
 }
+# The ABI cases are the same everywhere -- it is a compile-time constant -- so
+# they go in a fixture.
 check tcl-requires "$( \
-  echo '--- a version this runtime has (derived, not hardcoded: a CI'; \
-  echo '    checkout has no tags and reports 0.0.0-dev)'; \
-  reqtest "!mvx>=$(printf '%s' "$VER" | sed -E 's/-.*//')" a; \
-  echo '--- one it has not'; reqtest '!mvx>=9.9.9' b; \
-  echo '--- an ABI it has'; reqtest '!mvx-abi>=1' c; \
+  echo '--- an ABI this runtime has'; reqtest '!mvx-abi>=1' c; \
   echo '--- one it has not'; reqtest '!mvx-abi>=99' d; \
   echo '--- and a requirement it does not understand is ignored, not fatal'; \
   reqtest '!something-else>=3' e)"
+
+# The VERSION cases are NOT the same everywhere, and that is the behaviour
+# rather than a flaw in the test: a tagged build knows what it is and refuses a
+# version it does not have; an untagged one (every CI checkout) says so and
+# continues.  Asserting the rule covers both, where a fixture could only ever
+# match the machine it was blessed on.
+case "$VER" in
+  0.0.0*) vknown=0 ;;
+  *)      vknown=1 ;;
+esac
+r="$(reqtest '!mvx>=9.9.9' f)"
+if [ "$vknown" = 1 ]; then
+  case "$r" in
+    *"needs mvx >=9.9.9"*) PASS=$((PASS+1))
+      echo "  a version this build has not is refused" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL tagged build should refuse >=9.9.9: $r" ;;
+  esac
+else
+  case "$r" in
+    *linked*) PASS=$((PASS+1))
+      echo "  an untagged build warns about a version it cannot check, and links" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL untagged build should warn, not refuse: $r" ;;
+  esac
+fi
+r="$(reqtest "!mvx>=$(printf '%s' "$VER" | sed -E 's/-.*//')" g)"
+case "$r" in
+  *linked*) PASS=$((PASS+1)); echo "  a version this build does have is accepted" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL should accept its own version: $r" ;;
+esac
 
 # A package can export a FUNCTION, and a DEFFUN'd caller resolves it across the
 # package boundary (#101).  BUILD-PKG and CATALOG classified only SUBROUTINE as
