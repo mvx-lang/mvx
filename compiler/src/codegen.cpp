@@ -456,6 +456,44 @@ private:
         return slot;
     }
 
+    /* A literal operand's boxed value never changes, so it does not need
+       rebuilding on every pass of a loop.  The banked sieve marks a flag
+       with `BANK(B)<1,P> = 0` and tests it with `= 0`, and both were calling
+       mv_set_int per iteration to remake the same constant (#130).
+       Built once in the entry block and reused.
+
+       ONLY for operands that are read.  A CALL passes its arguments by
+       reference and a subroutine may assign to a parameter, so emitCall
+       keeps using a fresh temp -- sharing one there would let a callee
+       rewrite the constant for every later use of it. */
+    Value *constPtr(const Expr &e) {
+        std::string key;
+        if (e.kind == Expr::K::IntLit)      key = "i" + std::to_string(e.ival);
+        else if (e.kind == Expr::K::StrLit) key = "s" + e.sval;
+        else return nullptr;                       // not a literal: caller falls back
+        auto it = constPool_.find(key);
+        if (it != constPool_.end()) return it->second;
+        IRBuilder<>::InsertPoint save = b_.saveIP();
+        b_.SetInsertPoint(eb_.GetInsertBlock(), eb_.GetInsertPoint());
+        Value *slot = newSlot("k");
+        if (e.kind == Expr::K::IntLit)
+            callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_},
+                   {slot, ConstantInt::get(i64Ty_, e.ival)});
+        else
+            callRt("mv_set_str", voidTy_, {ptrTy_, ptrTy_, i64Ty_},
+                   {slot, stringConst(e.sval),
+                    ConstantInt::get(i64Ty_, (int64_t)e.sval.size())});
+        b_.restoreIP(save);
+        constPool_[key] = slot;
+        return slot;
+    }
+    /* evalPtr, but a literal comes from the constant pool. */
+    Value *evalPtrRO(const Expr &e) {
+        if (Value *k = constPtr(e)) return k;
+        return evalPtr(e);
+    }
+    std::map<std::string, Value *> constPool_;
+
     Value *acquireTemp() {
         if (tempUsed_ == tempPool_.size())
             tempPool_.push_back(newSlot());
@@ -1312,8 +1350,8 @@ private:
                     default:        return b_.CreateFCmpOGE(l, r);
                     }
                 }
-                Value *pa = evalPtr(*e.lhs);
-                Value *pb = evalPtr(*e.rhs);
+                Value *pa = evalPtrRO(*e.lhs);
+                Value *pb = evalPtrRO(*e.rhs);
                 Value *c = callRt("mv_compare", i64Ty_, {ptrTy_, ptrTy_},
                                   {pa, pb});
                 Value *zero = ConstantInt::get(i64Ty_, 0);
@@ -2005,7 +2043,7 @@ private:
             else
                 err(t.line, "dynamic-array assignment target must be a "
                             "variable or array element");
-            Value *val = evalPtr(*s.value);
+            Value *val = evalPtrRO(*s.value);
             callRt("mv_replace_fn", voidTy_,
                    {ptrTy_, ptrTy_, i64Ty_, i64Ty_, i64Ty_, ptrTy_},
                    {bp, bp, subIdx(t, 0), subIdx(t, 1), subIdx(t, 2), val});
