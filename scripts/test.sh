@@ -1909,8 +1909,10 @@ FTEOF
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE BY PRICE FIRST 2' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE BY STATE FIRST 2' 2>&1)"
 
-  # range push-down (#48): numeric range pushes NULLIF(mvx_attr,'')::numeric;
-  # text range falls back to the scan. Result must equal the local tcl-range.
+  # range push-down (#48): a numeric range pushes the GUARDED cast of the
+  # document field (a bare ::numeric fails the whole query on one non-numeric
+  # value, #157); a text range falls back to the scan.  Result must equal the
+  # local tcl-range.
   check tcl-pgrange "$( \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE WITH PRICE > "500" BY @ID' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE WITH PRICE <= "450" BY @ID' 2>&1; \
@@ -1940,14 +1942,19 @@ MWEOF
 
   # DESCRIBE (#51): the verb renders the backend query it would run instead of
   # running it — an identity-column equality, a numeric range on the blob, an
-  # ORDER BY / LIMIT push, and a non-pushable @ID condition that scans and
-  # filters in the verb.  Reuses MWP (mapped STATE, PRICE above).
+  # ORDER BY / LIMIT push, the same push with no FIRST behind it, a text sort
+  # of a mapped column, and a non-pushable @ID condition that scans and filters
+  # in the verb.  Reuses MWP (mapped STATE, PRICE above).  The two plain-BY
+  # cases are #172: an ORDER BY was only ever described when a FIRST came with
+  # it, so a bare BY reported a sort in the verb that was not happening.
   # DESCRIBE / EXPLAIN work both right after the verb and trailing the
   # sentence — same plan either way — so the cases mix the two positions.
   check tcl-pgdescribe "$( \
     "$TCL" -a "$PGACCT" -c 'LIST DESCRIBE MWP STATE WITH STATE = "NSW"' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'LIST MWP WITH STATE = "NSW" AND PRICE > "500" DESCRIBE' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT EXPLAIN MWP BY PRICE FIRST 3' 2>&1; \
+    "$TCL" -a "$PGACCT" -c 'SORT MWP BY PRICE DESCRIBE' 2>&1; \
+    "$TCL" -a "$PGACCT" -c 'SORT MWP BY STATE DESCRIBE' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'LIST MWP WITH @ID = "O1" DESCRIBE' 2>&1)"
 
   # cross-process record locks (#16), including the mapped association subtables:
@@ -2374,19 +2381,28 @@ PDNEOF
       "$TCL" -a "$VMACCT" -c 'LIST PDN NAME CREDIT WITH CREDIT = "1500"' 2>&1)"
 
     # expression indexes (#43): CREATE-INDEX on an un-mapped field builds a
-    # Postgres expression index on the blob (via the IMMUTABLE mvx_attr
-    # helper), so the blob push-down becomes an index scan. A mapped identity
-    # field still gets a column index. PDN has STATE mapped, TIER unmapped.
+    # Postgres expression index on the document field the push-down uses, so
+    # that push-down becomes an index scan.  It needed an IMMUTABLE mvx_attr()
+    # installed into the schema until records became documents (#157); doc->>'n'
+    # is built in.  A mapped identity field still gets a column index.
+    # PDN has STATE mapped, TIER unmapped.
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX PDN STATE' >/dev/null 2>&1
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX PDN TIER' >/dev/null 2>&1
-    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%mvx_attr(rec, 4)%' \
+    # The unmapped attribute indexes the document field the push-down uses.
+    # It was mvx_attr(rec, 4) — a function this driver had to install — until
+    # records became documents (#157); postgres renders the expression as
+    # ((doc ->> '4'::text)).
+    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%COALESCE%doc ->> ''4''%' \
       THEN 'expression' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_TIER_idx'")
     STDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%(\"STATE\")%' \
       THEN 'column' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_STATE_idx'")
+    # The expression must be IDENTICAL to the one the driver builds, or the
+    # index does not match it.  Both come from pg_attr_expr, COALESCE included
+    # (an attribute past the end reads as empty in MV, #157).
     EXPLN=$(psql_ext "SET enable_seqscan=off; EXPLAIN SELECT id FROM \
-      vmtest.\"PDN\" WHERE vmtest.mvx_attr(rec,4)='gold'")
+      vmtest.\"PDN\" WHERE COALESCE(doc->>'4','')='gold'")
     USES=$(printf '%s' "$EXPLN" | grep -q 'PDN_TIER_idx' && echo yes || echo no)
     check tcl-exprindex "$(printf '%s\n' \
       "TIER (unmapped) index kind: $IDXDEF" \
@@ -2408,7 +2424,7 @@ RIXEOF
     "$MVX" "$TESTROOT/vmrix.b" -o "$TESTROOT/vmrixbin" 2>/dev/null
     (cd "$VMACCT" && MVXACCOUNT=. "$TESTROOT/vmrixbin")
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX RIX STATE' >/dev/null 2>&1
-    rixkind() { psql_ext "SELECT CASE WHEN indexdef LIKE '%mvx_attr%' THEN \
+    rixkind() { psql_ext "SELECT CASE WHEN indexdef LIKE '%doc ->>%' THEN \
       'expression' WHEN indexdef LIKE '%(\"STATE\")%' THEN 'column' ELSE '?' \
       END FROM pg_indexes WHERE schemaname='vmtest' AND indexname='RIX_STATE_idx'"; }
     RBEFORE=$(rixkind)
@@ -2505,9 +2521,68 @@ SQDEOF
   esac
   desc="$("$TCL" -a "$SQA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
   case "$desc" in
-    *"SELECT id FROM"*"mvx_attr"*) PASS=$((PASS+1))
+    *"SELECT id FROM"*"json_extract(doc,"*) PASS=$((PASS+1))
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL sqlite push-down plan: $desc" ;;
+  esac
+
+  # DESCRIBE tells the truth about the ORDER BY push (#172).  DESCRIBE has one
+  # job -- say what would run -- so it is only worth anything if it tracks the
+  # push-down rules exactly.  It used to describe an ORDER BY only when a FIRST
+  # was present, and could not describe an order on an unmapped attribute at
+  # all, so two of the three arms below reported "sorted in the verb" while the
+  # driver was in fact sorting.  DSC maps NAME and leaves CITY/QTY raw, which
+  # is what makes all three arms reachable from one file.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DSC' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdsc.b" <<'DSCEOF'
+OPEN "DSC" TO F ELSE PRINT "no DSC" ; STOP
+WRITE "Ada":@AM:"London":@AM:"30" ON F, "D1"
+WRITE "Bob":@AM:"Paris":@AM:"7" ON F, "D2"
+WRITE "Cy":@AM:"Berlin":@AM:"200" ON F, "D3"
+OPEN "DICT", "DSC" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L" ON D, "CITY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"4R" ON D, "QTY"
+DSCEOF
+  "$MVX" "$TESTROOT/sqdsc.b" -o "$TESTROOT/sqdsc" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdsc" >/dev/null 2>&1)
+  "$TCL" -a "$SQA" -c 'CREATE-MAP DSC NAME' >/dev/null 2>&1
+  # 1. mapped column, plain BY with no FIRST -- an ORDER BY, no LIMIT
+  d1="$("$TCL" -a "$SQA" -c 'SORT DSC BY NAME DESCRIBE' 2>&1)"
+  case "$d1" in
+    *'ORDER BY "NAME"'*LIMIT*) FAIL=$((FAIL+1))
+      echo "FAIL sqlite plain-BY plan has a LIMIT nobody asked for: $d1" ;;
+    *'ORDER BY "NAME"'*) PASS=$((PASS+1))
+      echo "  a plain BY on a mapped column is described as an ORDER BY" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite plain-BY plan: $d1" ;;
+  esac
+  # 2. RAW numeric attribute -- the guarded cast, the same expression
+  #    sq_order_expr builds for the query itself
+  d2="$("$TCL" -a "$SQA" -c 'SORT DSC BY QTY DESCRIBE' 2>&1)"
+  case "$d2" in
+    *"ORDER BY"*"CAST("*"AS REAL)"*"json_extract(doc,'\$.\"3\"')"*) PASS=$((PASS+1))
+      echo "  a numeric BY on an unmapped attribute is described too" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite raw-numeric BY plan: $d2" ;;
+  esac
+  # 3. RAW text attribute -- NOT pushable (MV's byte order over a whole
+  #    multivalued attribute is not what a column sort produces), so the plan
+  #    must still say the verb sorts.  Without this arm the fix could pass by
+  #    describing an ORDER BY for everything.
+  d3="$("$TCL" -a "$SQA" -c 'SORT DSC BY CITY DESCRIBE' 2>&1)"
+  case "$d3" in
+    *"ORDER BY"*) FAIL=$((FAIL+1))
+      echo "FAIL sqlite raw-text BY described as pushed, but it is not: $d3" ;;
+    *"sorted in the verb"*) PASS=$((PASS+1))
+      echo "  a text BY on an unmapped attribute still sorts in the verb" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite raw-text BY plan: $d3" ;;
+  esac
+  # 4. and the pushed order is the order MV wants: 7, 30, 200 numerically,
+  #    not "200" < "30" < "7" as bytes.  The plan above is only worth
+  #    printing if the query it names returns this.
+  o4="$("$TCL" -a "$SQA" -c 'SORT DSC BY QTY' 2>&1 | sed -n 's/^\(D[0-9]\).*/\1/p' | tr -d '\n')"
+  case "$o4" in
+    D2D1D3) PASS=$((PASS+1)); echo "  the pushed numeric order is MV's order" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite pushed numeric order: got '$o4', want D2D1D3" ;;
   esac
   # MAPPING WITH AN ASSOCIATION -- the multi-table write.  A record's parent
   # columns go in the base table and each association's values become rows in a
@@ -2715,10 +2790,81 @@ MYDEOF
   esac
   desc="$("$TCL" -a "$MYA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
   case "$desc" in
-    *"SELECT id FROM"*"SUBSTRING_INDEX"*) PASS=$((PASS+1))
+    *"SELECT id FROM"*"JSON_EXTRACT(doc,"*) PASS=$((PASS+1))
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL mysql push-down plan: $desc" ;;
   esac
+  # ...and the ORDER BY push is described as well (#172).  QTY is attribute 3
+  # and unmapped, so this is the raw-attribute arm, on a plain BY with no
+  # FIRST -- the two conditions that DESCRIBE used to leave out.
+  dord="$("$TCL" -a "$MYA" -c 'SORT CUST BY QTY DESCRIBE' 2>&1)"
+  case "$dord" in
+    *"ORDER BY"*"REGEXP"*"CAST("*"AS DECIMAL"*) PASS=$((PASS+1))
+      echo "  a plain numeric BY is described as an ORDER BY" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql BY plan: $dord" ;;
+  esac
+
+  # CREATE-INDEX on an UN-MAPPED attribute.  MySQL refuses a functional index
+  # on an expression returning TEXT, so raw attributes were not indexable here
+  # at all — the driver returned -1 and the runtime built its own index.  It
+  # now adds a STORED generated column carrying the push-down expression and a
+  # prefix index on it (#157).
+  #
+  # This asserts the path works and still answers correctly.  That the index is
+  # USED was measured by hand, and is worth recording because it is easy to get
+  # a false negative: the generated column stores its literals in the
+  # CONNECTION's character set, so an EXPLAIN issued from a client on a
+  # different charset does not match the expression and reports a full scan —
+  #   _utf8mb4'$."2"'  (mvx's connection)  vs  _latin1'$."2"'  (mysql CLI default)
+  # On a matching connection: `key: mvxix_CITY`, ref access, 1 row.
+  "$TCL" -a "$MYA" -c 'DELETE-FILE IXR' >/dev/null 2>&1
+  "$TCL" -a "$MYA" -c 'CREATE-FILE IXR' >/dev/null 2>&1
+  cat > "$TESTROOT/myixr.b" <<'MYIEOF'
+OPEN "IXR" TO F ELSE STOP
+OPEN "DICT", "IXR" TO D ELSE STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "Ada":@AM:"London" ON F, "R1"
+WRITE "Grace":@AM:"York" ON F, "R2"
+WRITE "Alan":@AM:"London" ON F, "R3"
+MYIEOF
+  "$MVX" "$TESTROOT/myixr.b" -o "$TESTROOT/myixrbin" 2>/dev/null
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myixrbin")
+  check tcl-mysql-rawindex "$( \
+    "$TCL" -a "$MYA" -c 'CREATE-INDEX IXR CITY' 2>&1; \
+    "$TCL" -a "$MYA" -c 'LIST-INDEXES IXR' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "London"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "York"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'DELETE-INDEX IXR CITY' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "London"' 2>&1)"
+
+  # A MULTIVALUED TRANS() key.  Only postgres had this (tcl-transjoinmv), and
+  # the gap hid a real break: the join asks "is the target id one of the source
+  # key's values", which was a delimiter-wrapped LOCATE over the blob's
+  # @VM-joined text.  A multivalued attribute is a JSON ARRAY now (#157), so
+  # that text became `["C1", "C2"]` and the test silently stopped matching —
+  # measured at 1 row where 2 are right, and 0 where 1 is.  JSON_CONTAINS is
+  # the membership test for an array and a scalar alike.
+  for jf in MYCUSJ MYORDMV; do
+    "$TCL" -a "$MYA" -c "DELETE-FILE $jf" >/dev/null 2>&1
+    "$TCL" -a "$MYA" -c "CREATE-FILE $jf" >/dev/null 2>&1
+  done
+  cat > "$TESTROOT/myjnmv.b" <<'MYJEOF'
+OPEN "MYCUSJ" TO C ELSE STOP
+WRITE "Alpha":@AM:"Sydney" ON C, "C1"
+WRITE "Beta":@AM:"Melbourne" ON C, "C2"
+OPEN "MYORDMV" TO O ELSE STOP
+WRITE "C1":@AM:"Single" ON O, "M1"
+WRITE "C1":@VM:"C2":@AM:"Multi" ON O, "M2"
+OPEN "DICT", "MYORDMV" TO D ELSE STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"Product":@AM:"10L" ON D, "PRODUCT"
+WRITE "I":@AM:"TRANS(MYCUSJ,1,2,X)":@AM:"":@AM:"City":@AM:"10L" ON D, "CITY"
+MYJEOF
+  "$MVX" "$TESTROOT/myjnmv.b" -o "$TESTROOT/myjnmvbin" 2>/dev/null
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myjnmvbin")
+  # Sydney -> M1 (C1) + M2 (C1 is one of its values) = 2; Melbourne -> M2 = 1.
+  check tcl-mysql-transjoinmv "$( \
+    "$TCL" -a "$MYA" -c 'SELECT MYORDMV WITH CITY = "Sydney"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'SELECT MYORDMV WITH CITY = "Melbourne"' 2>&1)"
 else
   echo "  (mysql test skipped — set MVX_MYSQL to run)"
 fi
@@ -2736,11 +2882,16 @@ if [ -n "${MVX_MONGO:-}" ]; then
   # write two, read one (multivalue preserved), delete the other.
   printf 'OPEN "ORDERS" TO F ELSE STOP\nWRITE "Widget":@VM:"Gadget" ON F, "O1"\nWRITE "Acme" ON F, "O2"\nREAD V FROM F, "O1" THEN PRINT "read: ":V<1,1>:"/":V<1,2>\nDELETE F, "O2"\n' > "$TESTROOT/mg.b"
   "$MVX" "$TESTROOT/mg.b" -o "$TESTROOT/mgbin" 2>/dev/null
-  check tcl-mongo "$( \
+  # libmongoc writes "Falling back to malloc for counters" to stderr when it
+  # cannot map its shared-counter segment — intermittently, and depending on
+  # the container.  It is not output of ours; drop it, or whether the suite
+  # passes depends on whether the run that blessed it happened to see it.
+  nomgwarn() { grep -v 'WARNING:.*mongoc' || true; }
+  check tcl-mongo "$( { \
     "$TCL" -a "$MGACCT" -c 'CREATE-FILE ORDERS USING @mongotest' 2>&1; \
     (cd "$MGACCT" && MVXACCOUNT=. "$TESTROOT/mgbin"); \
     printf 'COUNT ORDERS\nSELECT ORDERS\nLIST ORDERS\n' | \
-      "$TCL" -a "$MGACCT" 2>&1)"
+      "$TCL" -a "$MGACCT" 2>&1; } | nomgwarn)"
 
   # relational mapping + native index + WITH/COUNT push-down (#62). CREATE-MAP
   # projects each mapped dict column onto its { _id, rec } document as a native
@@ -2766,14 +2917,14 @@ WRITE "D":@AM:"5":@AM:"MD0":@AM:"Qty":@AM:"5R":@AM:"LINES" ON D, "QTY"
 MMEOF
   "$MVX" "$TESTROOT/mgmap.b" -o "$TESTROOT/mgmapbin" 2>/dev/null
   (cd "$MGACCT" && MVXACCOUNT=. "$TESTROOT/mgmapbin")
-  check tcl-mongomap "$( \
+  check tcl-mongomap "$( { \
     "$TCL" -a "$MGACCT" -c 'CREATE-MAP MORD NAME STATE PRICE PRODUCT QTY' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD WITH STATE = "NSW"' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD WITH NAME = "Bolt"' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH STATE = "NSW" BY @ID' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'CREATE-INDEX MORD NAME' 2>&1; \
-    "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH NAME = "Bolt"' 2>&1)"
+    "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH NAME = "Bolt"' 2>&1; } | nomgwarn)"
 else
   echo "  (mongo test skipped — set MVX_MONGO to run)"
 fi
@@ -2858,6 +3009,234 @@ fi
 # only moment that change is provably behaviour-neutral.  This is what keeps
 # them in: a rule nothing checks is a rule that decays, and this one has to hold
 # across six files that have no other reason to agree with each other.
+echo "== records as documents"
+# Compiled here rather than by CMake: it is a test, not something to install,
+# and building it against build/lib is the same thing build-native.sh does.
+if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/doc-roundtrip.c" \
+      -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/doc-roundtrip" 2>"$TESTROOT/dcerr"; then
+  if DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+     "$TESTROOT/doc-roundtrip" > "$TESTROOT/docout" 2>&1; then
+    PASS=$((PASS + 1)); sed -n 's/^doc-roundtrip: /  /p' "$TESTROOT/docout" | tail -1
+  else
+    echo "FAIL doc-roundtrip:"; sed 's/^/    /' "$TESTROOT/docout" | grep -A3 FAIL | head -20
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "FAIL doc-roundtrip: did not compile"; sed 's/^/    /' "$TESTROOT/dcerr" | head -10
+  FAIL=$((FAIL + 1))
+fi
+
+# NATIVE MODE STORES A MAPPED ATTRIBUTE ONCE.
+#
+# The column is authoritative there and map_recompose reads it back from the
+# column unconditionally, so keeping it in the document as well is a second
+# copy that is never read and can only drift (#157).  Going BACK to mirror has
+# to put them into the documents again, because mirror reads the document and
+# never consults the columns — without that every record would read with its
+# mapped attributes empty while the values sat in columns nobody looks at.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== native mode stores a mapped attribute once"
+  NDA="$TESTROOT/ndacct"; mkdir -p "$NDA"
+  printf '# MVX account descriptor\nname=nd\nversion=1\n' > "$NDA/.mvx"
+  printf '* sqlite %s/nd.sqlite\n' "$NDA" > "$NDA/BINDINGS"
+  "$TCL" -a "$NDA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/nd.b" <<'NDEOF'
+OPEN "CUST" TO F ELSE STOP
+OPEN "DICT", "CUST" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L" ON D, "CITY"
+WRITE "Ada":@AM:"London":@AM:"unmapped-extra" ON F, "C1"
+NDEOF
+  "$MVX" "$TESTROOT/nd.b" -o "$TESTROOT/ndbin" 2>/dev/null
+  (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndbin")
+  cat > "$TESTROOT/ndrw.b" <<'NDWEOF'
+OPEN "CUST" TO F ELSE STOP
+WRITE "Ada":@AM:"London":@AM:"unmapped-extra" ON F, "C1"
+READ R FROM F, "C1" THEN
+   PRINT "record: [":R<1>:"][":R<2>:"][":R<3>:"]"
+END ELSE PRINT "LOST"
+NDWEOF
+  "$MVX" "$TESTROOT/ndrw.b" -o "$TESTROOT/ndrwbin" 2>/dev/null
+  "$TCL" -a "$NDA" -c 'CREATE-MAP CUST NAME CITY' >/dev/null 2>&1
+  printf 'y\n' | "$TCL" -a "$NDA" -c 'MAP-MODE CUST native' >/dev/null 2>&1
+  (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") >/dev/null 2>&1
+  # the document holds ONLY the un-mapped attribute; the record still reads whole
+  NDDOC=$(sqlite3 "$NDA/nd.sqlite" 'SELECT doc FROM CUST;' 2>/dev/null)
+  NDREAD=$( (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") 2>&1 | tail -1)
+  "$TCL" -a "$NDA" -c 'MAP-MODE CUST mirror' >/dev/null 2>&1
+  NDDOC2=$(sqlite3 "$NDA/nd.sqlite" 'SELECT doc FROM CUST;' 2>/dev/null)
+  NDREAD2=$( (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") 2>&1 | tail -1)
+  check tcl-native-onecopy "$(printf '%s\n' \
+    "native  doc: $NDDOC" \
+    "native  $NDREAD" \
+    "mirror  doc: $NDDOC2" \
+    "mirror  $NDREAD2")"
+fi
+
+# A LONG MAPPED VALUE SURVIVES NATIVE MODE.
+#
+# In native mode a mapped attribute is read back from its COLUMN, so anything
+# the column cannot hold is lost — and it was: the runtime projected through a
+# fixed 256-byte cell, so every mapped value over 255 bytes was silently cut,
+# and the check meant to refuse an unfittable record used the same buffer and
+# so could not see it (mvx#174).  300 bytes is the shape that failed.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a long mapped value in native mode"
+  NVA="$TESTROOT/nvacct"; mkdir -p "$NVA"
+  printf '# MVX account descriptor\nname=nv\nversion=1\n' > "$NVA/.mvx"
+  printf '* sqlite %s/nv.sqlite\n' "$NVA" > "$NVA/BINDINGS"
+  "$TCL" -a "$NVA" -c 'CREATE-FILE ITM' >/dev/null 2>&1
+  cat > "$TESTROOT/nv.b" <<'NVEOF'
+OPEN "ITM" TO F ELSE STOP
+OPEN "DICT", "ITM" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE STR("A", 300) ON F, "L1"
+NVEOF
+  "$MVX" "$TESTROOT/nv.b" -o "$TESTROOT/nvbin" 2>/dev/null
+  (cd "$NVA" && MVXACCOUNT=. "$TESTROOT/nvbin")
+  "$TCL" -a "$NVA" -c 'CREATE-MAP ITM NAME' >/dev/null 2>&1
+  printf 'y\n' | "$TCL" -a "$NVA" -c 'MAP-MODE ITM native' >/dev/null 2>&1
+  cat > "$TESTROOT/nvr.b" <<'NVREOF'
+OPEN "ITM" TO F ELSE STOP
+READ R FROM F, "L1" THEN
+   PRINT "native read-back length = " : LEN(R<1>)
+END ELSE PRINT "L1 NOT FOUND"
+NVREOF
+  "$MVX" "$TESTROOT/nvr.b" -o "$TESTROOT/nvrbin" 2>/dev/null
+  check tcl-native-longvalue "$( \
+    "$TCL" -a "$NVA" -c 'MAP-MODE ITM' 2>&1; \
+    (cd "$NVA" && MVXACCOUNT=. "$TESTROOT/nvrbin"))"
+fi
+
+# ---------------------------------------------------------------------------
+# The backends agree with each other, and with the verb.
+#
+# Non-negotiable 6: nothing above the driver may depend on backend-specific
+# behaviour.  A push-down is only correct if it returns what the client-side
+# scan returns, so lmdb — which has no push-down and filters in the verb — is
+# the reference every other backend is compared against.
+#
+# This exists because storing records as documents (#157) broke that quietly
+# twice.  A missing attribute became NULL where the blob expression had
+# returned '', so a shorter record stopped matching `# value` on sqlite and
+# postgres; and mongo matches array elements natively, so a multivalued
+# attribute matched `= value` there and nowhere else.  Both passed every
+# existing test: each backend was self-consistent, and nothing compared them.
+echo "== backends agree"
+AGACC="$TESTROOT/agree"; mkdir -p "$AGACC"
+cat > "$TESTROOT/agseed.b" <<'AGEOF'
+OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
+OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L":@AM:"S" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"6R":@AM:"S" ON D, "QTY"
+WRITE "Ada":@AM:"London":@AM:"9" ON F, "C1"
+WRITE "Grace":@AM:"York":@AM:"10" ON F, "C2"
+WRITE "Alan":@AM:"London":@VM:"York":@AM:"100" ON F, "C3"
+WRITE "Edsger":@AM:"":@AM:"abc" ON F, "C4"
+WRITE "Barbara":@AM:"Perth":@AM:"7":@VM:"8" ON F, "C5"
+AGEOF
+"$MVX" "$TESTROOT/agseed.b" -o "$TESTROOT/agseedbin" >/dev/null 2>&1
+
+# answers <account-dir> -> the three counts, on one line
+ag_answers() {
+  a="$1"
+  n1=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  n2=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY # "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  n3=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = ""' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  # ORDER BY a RAW attribute, both ways.  QTY is right-justified, so BY QTY is
+  # MV's NUMERIC sort (9 before 10 before 100) while BY CITY is its byte sort —
+  # and a pushed-down ORDER has to produce what the verb produces, including
+  # where a multivalued and an empty attribute land.
+  o1=$("$TCL" -a "$a" -c 'SORT CUST BY QTY @ID' 2>&1 | sed -n 's/^\(C[0-9]\) .*/\1/p' | tr -d '\n')
+  o2=$("$TCL" -a "$a" -c 'SORT CUST BY CITY @ID' 2>&1 | sed -n 's/^\(C[0-9]\) .*/\1/p' | tr -d '\n')
+  printf '=London:%s #London:%s =empty:%s byQTY:%s byCITY:%s' \
+         "${n1:-?}" "${n2:-?}" "${n3:-?}" "${o1:-?}" "${o2:-?}"
+}
+ag_seed() { # ag_seed <dir> [create-args]
+  d="$1"; shift
+  mkdir -p "$d"
+  printf '# MVX account descriptor\nname=agree\nversion=1\n' > "$d/.mvx"
+  [ -n "${AG_BIND:-}" ] && printf '%s\n' "$AG_BIND" > "$d/BINDINGS"
+  # the backend section above may have left its own CUST behind
+  "$TCL" -a "$d" -c 'DELETE-FILE CUST' >/dev/null 2>&1
+  "$TCL" -a "$d" -c "CREATE-FILE CUST $*" >/dev/null 2>&1
+  (cd "$d" && MVXACCOUNT=. "$TESTROOT/agseedbin") >/dev/null 2>&1
+}
+
+AG_BIND="" ag_seed "$AGACC/lmdb"
+REF=$(ag_answers "$AGACC/lmdb")
+AGOUT="verb (reference)  $REF"
+AGN=0                                 # backends actually compared
+AGBAD=0                               # ...and how many disagreed
+# ag_row <label> <answers> — add a row, count it, flag a disagreement
+ag_row() {
+  AGN=$((AGN + 1))
+  [ "$2" = "$REF" ] || AGBAD=$((AGBAD + 1))
+  AGOUT="$AGOUT
+$1$2$([ "$2" = "$REF" ] || echo '   <-- DISAGREES')"
+}
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  AG_BIND="* sqlite $AGACC/sq.sqlite" ag_seed "$AGACC/sqlite"
+  G=$(ag_answers "$AGACC/sqlite")
+  ag_row "sqlite            " "$G"
+fi
+if [ -n "${MVX_PG:-}" ]; then
+  psql_ext "DROP SCHEMA IF EXISTS agree CASCADE" >/dev/null 2>&1
+  mkdir -p "$AGACC/pg"
+  printf 'SET-CONNECTION cn driver=postgres %s namespace=agree\n' "$MVX_PG" | \
+    "$TCL" -a "$AGACC/pg" >/dev/null 2>&1
+  AG_BIND="CUST @cn" ag_seed "$AGACC/pg" "USING @cn"
+  G=$(ag_answers "$AGACC/pg")
+  ag_row "postgres          " "$G"
+fi
+if [ -n "${MVX_MONGO:-}" ]; then
+  mkdir -p "$AGACC/mg"
+  printf 'SET-CONNECTION cn driver=mongo address=%s namespace=agree\n' \
+    "$(printf '%s' "$MVX_MONGO" | sed -n 's/.*address=\([^ ]*\).*/\1/p')" | \
+    "$TCL" -a "$AGACC/mg" >/dev/null 2>&1
+  AG_BIND="CUST @cn" ag_seed "$AGACC/mg" "USING @cn"
+  G=$(ag_answers "$AGACC/mg")
+  ag_row "mongo             " "$G"
+fi
+if [ -n "${MVX_MYSQL:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 2>&1; then
+  AG_BIND="* mysql $MVX_MYSQL" ag_seed "$AGACC/my"
+  G=$(ag_answers "$AGACC/my")
+  ag_row "mysql             " "$G"
+fi
+# AND THE INDEX MUST NOT CHANGE THE ANSWER.  This is the axis the comparison
+# above cannot see: the scan and all four push-downs agreed with each other
+# while all disagreeing with the INDEX path, which is the one implementing the
+# documented semantics (ARCHITECTURE.md 5.2).  Building an index changed query
+# results (mvx#173) and nothing noticed.
+AG_BIND="" ag_seed "$AGACC/ix"
+IXBEFORE=$(ag_answers "$AGACC/ix")
+"$TCL" -a "$AGACC/ix" -c 'CREATE-INDEX CUST CITY' >/dev/null 2>&1
+"$TCL" -a "$AGACC/ix" -c 'CREATE-INDEX CUST QTY' >/dev/null 2>&1
+IXAFTER=$(ag_answers "$AGACC/ix")
+AGOUT="$AGOUT
+unindexed         $IXBEFORE
+indexed           $IXAFTER$([ "$IXAFTER" = "$IXBEFORE" ] || echo '   <-- INDEX CHANGED THE ANSWER')"
+# Assert the agreement, do not diff a transcript of it.  Which backends are
+# present depends on the environment -- CI has postgres and mongo but no mysql,
+# a laptop may have none of them -- so a blessed transcript encodes the machine
+# it was blessed on and fails everywhere else.  What this test actually claims
+# is that every backend that DID run agrees with the verb, and that is true
+# whatever ran.
+if [ "$AGN" -lt 1 ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL backends agree: no backend was compared (sqlite should always be)"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+elif [ "$AGBAD" -ne 0 ] || [ "$IXAFTER" != "$IXBEFORE" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL backends agree: $AGBAD of $AGN disagreed with the verb"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+else
+  PASS=$((PASS + 1))
+  echo "  $AGN backend(s) agree with the verb, indexed and not"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+fi
+
 echo "== byte accessor discipline"
 stray=$(grep -rn -- '->data' "$ROOT"/runtime/src/*.c 2>/dev/null \
         | grep -v '^.*mv_str\.c:' || true)

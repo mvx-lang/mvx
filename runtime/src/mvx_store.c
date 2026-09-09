@@ -211,7 +211,8 @@ static int map_project_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
 static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
                        int64_t idlen, const mv_value *rec,
                        const mv_value *old);
-static int map_validate_one(mvx_ctx *ctx, mapmeta *m, const mv_value *rec);
+static int map_validate_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
+                            const mv_value *rec);
 static int map_recompose(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
                          const char *id, int64_t idlen, mv_value *rec);
 static const char *map_identity_col(open_file *o, int64_t attr);
@@ -1112,7 +1113,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
     if (o) {
         map_load(o);
         if (o->map.nf > 0 && o->map.native &&
-            !map_validate_one(ctx, &o->map, rec)) {
+            !map_validate_one(ctx, f, &o->map, rec)) {
             if (onerr) return -2;
             mvx_fatal("WRITE rejected by native map on %s id %.*s",
                       b->spec, (int)idlen, ip);
@@ -1140,14 +1141,44 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
     if (o && o->map.nf > 0 && b->driver->bulk_begin && b->driver->bulk_commit)
         txn = b->driver->bulk_begin(f);
 
+    /* NATIVE MODE STORES THE RECORD ONCE.  A mapped attribute lives in its
+       column, and map_recompose reads it back from there unconditionally — so
+       keeping it in the document as well is a second copy that is never read
+       and can only drift (#157).  Strip those attributes from what is stored;
+       the FULL record still goes to ix_diff and map_project below, which is
+       what the index and the columns are built from.
+       Mirror mode keeps everything: there the document is the authority and
+       the columns are the derived copy, which is the whole difference between
+       the two modes. */
+    mv_value stored;
+    const mv_value *towrite = rec;
+    int stripped = 0;
+    if (o && o->map.nf > 0 && o->map.native) {
+        char nb[64];
+        const char *rp;
+        int64_t rl = mv_val_chars((mv_value *)rec, nb, sizeof nb, &rp);
+        mv_init(&stored);
+        mv_set_str(&stored, rl > 0 ? rp : "", rl > 0 ? rl : 0);
+        mv_value empty;
+        mv_init(&empty);
+        mv_set_str(&empty, "", 0);
+        for (int i = 0; i < o->map.nf; i++)
+            if (o->map.anos[i] > 0)
+                mv_replace_fn(&stored, &stored, o->map.anos[i], 0, 0, &empty);
+        mv_clear(&empty);
+        towrite = &stored;
+        stripped = 1;
+    }
+
     if (o && o->ix.n > 0 && b->driver->write_ix) {
         mvx_ixop ops[IX_MAX_ITEMS * IX_MAX_VALS * 2];
         static ixvals pool[IX_MAX_ITEMS * 2];
         int nops = ix_diff(o, &old, had_old, rec, ops, pool);
-        ok = b->driver->write_ix(f, ip, idlen, rec, ops, nops);
+        ok = b->driver->write_ix(f, ip, idlen, towrite, ops, nops);
     } else {
-        ok = b->driver->write(f, ip, idlen, rec);
+        ok = b->driver->write(f, ip, idlen, towrite);
     }
+    if (stripped) mv_clear(&stored);
     if (!ok) {
         if (txn && b->driver->rollback) b->driver->rollback(f);
         if (need_old) mv_clear(&old);
@@ -1407,25 +1438,72 @@ int64_t mvx_index_build(mvx_ctx *ctx, const mv_value *fvar,
    driver materialises columns / child tables and persists.  Returns the
    record count, -1 on error, or -2 when the backend has no mapping. */
 
+/* map_cell into a buffer that GROWS to fit.
+ *
+ * map_cell truncates silently at `cap` and returns the truncated length, so a
+ * caller with a fixed cell cannot tell a 255-byte value from a 300-byte one
+ * cut short.  Both places that projected or validated a mapped value used a
+ * 256-byte cell, so every mapped value over 255 bytes was quietly shortened —
+ * and in NATIVE mode, where the column is the read, the record came back
+ * short (mvx#174).
+ *
+ * Detect the truncation by its symptom: map_cell filled the buffer exactly.
+ * A value that genuinely ends at cap-1 costs one extra call and the same
+ * answer.  The buffer is the caller's to free. */
+static int64_t map_cell_grow(mvx_ctx *ctx, const mv_value *rec, int64_t ano,
+                             int64_t seq, const char *conv, const char *type,
+                             mv_value *av, mv_value *ov, mv_value *code,
+                             char **buf, size_t *cap) {
+    if (!*buf) {
+        *cap = 256;
+        *buf = malloc(*cap);
+        if (!*buf) mvx_fatal("out of memory projecting a mapped value");
+    }
+    for (;;) {
+        int64_t n = map_cell(ctx, rec, ano, seq, conv, type, av, ov, code,
+                             *buf, *cap);
+        if (n < 0 || (size_t)n < *cap - 1) return n;
+        if (*cap >= (size_t)16 << 20) return n;    /* absurd: take what fits */
+        size_t nc = *cap * 4;
+        char *nb = realloc(*buf, nc);
+        if (!nb) mvx_fatal("out of memory projecting a mapped value");
+        *buf = nb; *cap = nc;
+    }
+}
+
 /* Validate a record against a mapping without touching the backend: 1 if
    every typed cell fits its column, 0 if any non-empty value mismatches.
    Native mode calls this to reject a bad WRITE before it commits. */
-static int map_validate_one(mvx_ctx *ctx, mapmeta *m, const mv_value *rec) {
+static int map_validate_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
+                            const mv_value *rec) {
+    mvx_file_base *b = (mvx_file_base *)f;
+    /* What a mapped TEXT column can hold here, 0 = no practical limit.  In
+       native mode the column is the read, so a value it cannot hold is a
+       value the record loses — silently, and only on the backends that bound
+       their columns (mvx#174). */
+    int64_t tcap = (b && b->driver->map_text_cap) ? b->driver->map_text_cap(f) : 0;
     mv_value av, ov, code;
     mv_init(&av); mv_init(&ov); mv_init(&code);
-    char cell[256];
+    char *cell = NULL;
+    size_t ccap = 0;
     int ok = 1;
     for (int i = 0; i < m->nf && ok; i++) {
         int nv = m->assocs[i][0] ? map_vcount(rec, m->anos[i], &av) : 0;
         for (int seq = 0; seq <= nv; seq++) {
             if (m->assocs[i][0] && seq == 0) continue;   /* MV: 1..nv only */
-            if (map_cell(ctx, rec, m->anos[i], seq, m->convs[i], m->types[i],
-                         &av, &ov, &code, cell, sizeof cell) < 0) {
-                ok = 0;
+            /* The WHOLE value, not the first 255 bytes of it: this is the
+               check MAP-MODE native runs to refuse a record that does not
+               fit, and it was testing a truncated copy. */
+            int64_t cl = map_cell_grow(ctx, rec, m->anos[i], seq, m->convs[i],
+                                       m->types[i], &av, &ov, &code,
+                                       &cell, &ccap);
+            if (cl < 0 || (tcap > 0 && cl > tcap)) {
+                ok = 0;                   /* wrong type, or too long to store */
                 break;
             }
         }
     }
+    free(cell);
     mv_clear(&av); mv_clear(&ov); mv_clear(&code);
     return ok;
 }
@@ -1529,8 +1607,12 @@ static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
     mv_init(&av); mv_init(&ov); mv_init(&code); mv_init(&ta); mv_init(&tb);
     int ok = 1;
 
-    /* parent columns — only the changed ones (all, when there is no old) */
-    static char ps[MAP_MAXF][256];
+    /* parent columns — only the changed ones (all, when there is no old).
+       A GROWING cell per column: a fixed 256 quietly cut every mapped value
+       over 255 bytes, and in native mode, where the column IS the read, the
+       record came back short (mvx#174). */
+    static char *ps[MAP_MAXF];
+    static size_t pscap[MAP_MAXF];
     mvx_mapfield pcol[MAP_MAXF];
     const char *vals[MAP_MAXF];
     int64_t vlens[MAP_MAXF];
@@ -1538,9 +1620,9 @@ static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
     for (int i = 0; i < m->nf; i++) {
         if (m->assocs[i][0] != '\0') continue;
         if (old && map_attr_equal(old, rec, m->anos[i], &ta, &tb)) continue;
-        int64_t vl = map_cell(ctx, rec, m->anos[i], 0, m->convs[i],
-                              m->types[i], &av, &ov, &code, ps[nchg],
-                              sizeof ps[0]);
+        int64_t vl = map_cell_grow(ctx, rec, m->anos[i], 0, m->convs[i],
+                                   m->types[i], &av, &ov, &code,
+                                   &ps[nchg], &pscap[nchg]);
         if (vl < 0) { vl = 0; ps[nchg][0] = '\0'; }
         pcol[nchg].name = m->names[i];
         pcol[nchg].type = m->types[i];
@@ -1842,6 +1924,55 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
     return rc < 0 ? rc : count;
 }
 
+/* Put the mapped attributes back INTO the documents.
+ *
+ * Native mode stores a mapped attribute once, in its column, and leaves it out
+ * of the document (#157).  Mirror reads the document and never consults the
+ * columns — that is the difference between the modes — so going back without
+ * this every record would read with its mapped attributes EMPTY while the
+ * values sat untouched in columns nobody looks at any more.
+ *
+ * Deliberately independent of the mode flag: it reads the stored document,
+ * fills the mapped attributes from the columns itself, and writes the whole
+ * record back through the driver.  So it is correct run before or after the
+ * flip, which BASIC could not manage — the mode is global, and one record
+ * cannot be read in one mode and written in the other.
+ *
+ * Returns the number of records rewritten, or -2 if the backend cannot
+ * enumerate. */
+int64_t mvx_maprestore(mvx_ctx *ctx, const mv_value *fvar,
+                       const mv_value *spec) {
+    mvx_file *f = file_of(fvar, "MAPRESTORE");
+    mvx_file_base *b = (mvx_file_base *)f;
+    if (!b->driver->select_begin || !b->driver->read || !b->driver->write)
+        return -2;
+    char nb[40];
+    const char *sp;
+    int64_t slen = mv_val_chars(spec, nb, sizeof nb, &sp);
+    mapmeta m;
+    memset(&m, 0, sizeof m);
+    map_parse(sp, slen, &m);
+    if (m.nf == 0) { free(m.buf); return 0; }
+
+    mvx_cursor *c = b->driver->select_begin(f);
+    if (!c) { free(m.buf); return -2; }
+    int64_t n = 0;
+    mv_value id, rec;
+    mv_init(&id); mv_init(&rec);
+    while (b->driver->select_next(c, &id)) {
+        char ib[40];
+        const char *ip;
+        int64_t il = mv_val_chars(&id, ib, sizeof ib, &ip);
+        if (!b->driver->read(f, ip, il, &rec)) continue;
+        map_recompose(ctx, f, &m, ip, il, &rec);
+        if (b->driver->write(f, ip, il, &rec)) n++;
+    }
+    mv_clear(&id); mv_clear(&rec);
+    if (b->driver->select_end) b->driver->select_end(c);
+    free(m.buf);
+    return n;
+}
+
 /* Count records that would fail native (strict) validation against spec,
    without writing anything — the switch-to-native safety check.  Returns
    the violation count (0 = every record fits), or -2 if unsupported. */
@@ -1868,7 +1999,7 @@ int64_t mvx_mapcheck(mvx_ctx *ctx, const mv_value *fvar,
         const char *rp;
         int64_t rl = mv_val_chars(&rid, rb, sizeof rb, &rp);
         if (!b->driver->read(f, rp, rl, &rec)) continue;
-        if (!map_validate_one(ctx, &m, &rec)) bad++;
+        if (!map_validate_one(ctx, f, &m, &rec)) bad++;
     }
     b->driver->select_end(c);
     mv_clear(&rid); mv_clear(&rec);
@@ -2450,9 +2581,17 @@ int64_t mvx_orderselect(mvx_ctx *ctx, const mv_value *fvar,
     if (!o) return 0;
 
     int otext = 0;
-    const char *ocol = map_order_col(o, mv_get_int(oattr_v),
-                                     (int)mv_get_int(onum_v), &otext);
-    if (!ocol) return 0;                  /* order field not a matching column */
+    int64_t oattr = mv_get_int(oattr_v);
+    int onum = (int)mv_get_int(onum_v);
+    /* A mapped column of the right type sorts natively; otherwise the driver
+       sorts the raw attribute out of the document (#157).  This used to give
+       up here, which is why every BY on an un-mapped field was sorted in the
+       verb after streaming every id. */
+    const char *ocol = map_order_col(o, oattr, onum, &otext);
+    if (!ocol) {
+        if (oattr < 1) return 0;          /* @ID / I-type: nothing to push */
+        otext = !onum;
+    }
 
     /* optional filter, pushable like the others */
     const char *fcol = NULL, *fop = "", *fval = NULL;
@@ -2479,7 +2618,8 @@ int64_t mvx_orderselect(mvx_ctx *ctx, const mv_value *fvar,
     }
 
     mvx_cursor *c = b->driver->select_order(f, fcol, fattr, fop, fval, fvl,
-                                            ocol, otext, mv_get_int(limit_v));
+                                            ocol, oattr, onum, otext,
+                                            mv_get_int(limit_v));
     if (!c) return 0;
     store_state *st = state(ctx);
     clear_select(st);
@@ -2595,17 +2735,26 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
     char plan[4096], sql[4000];
     int done = 0;
 
-    /* Priority 1: BY + FIRST with at most one filter -> ORDER BY / LIMIT push. */
-    if (!done && b->driver->explain && limit > 0 && np <= 1 && battr > 0) {
+    /* Priority 1: BY (with or without FIRST) and at most one filter -> the
+       ORDER BY / LIMIT push.
+       NOT `limit > 0`: that required a FIRST, so a plain `BY x` reported
+       "sorted in the verb" while an ORDER BY was in fact pushed.  And `ocol`
+       may be NULL — an order on a RAW attribute pushes when the sort is
+       numeric (#157), which this could not describe at all.  Both conditions
+       must match what mvx_orderselect actually does, or DESCRIBE goes back to
+       describing something else (#172). */
+    if (!done && b->driver->explain && np <= 1 && battr > 0) {
         int otext = 0;
         const char *ocol = o ? map_order_col(o, battr, (int)bnum, &otext) : NULL;
+        if (!ocol) otext = !bnum;
+        int orderok = ocol != NULL || bnum;     /* raw: numeric only */
         int filterok = np == 0 ||
                        (ops[0][1] == '\0' && (ops[0][0] == '=' || ops[0][0] == '#'));
-        if (ocol && filterok) {
+        if (orderok && filterok) {
             mvx_pred fp;
             if (np == 1) { fp = preds[0]; fp.numeric = 0; }
-            if (b->driver->explain(f, np == 1 ? &fp : NULL, np, ocol, otext,
-                                   limit, sql, sizeof sql)) {
+            if (b->driver->explain(f, np == 1 ? &fp : NULL, np, ocol, battr,
+                                   (int)bnum, otext, limit, sql, sizeof sql)) {
                 snprintf(plan, sizeof plan, "%s: %s", drv, sql);
                 done = 1;
             }
@@ -2614,7 +2763,8 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
 
     /* Priority 2: every condition pushes -> one server-side WHERE (no order). */
     if (!done && b->driver->explain && np >= 1 && allpush) {
-        if (b->driver->explain(f, preds, np, NULL, 0, 0, sql, sizeof sql)) {
+        if (b->driver->explain(f, preds, np, NULL, 0, 0, 0, 0,
+                               sql, sizeof sql)) {
             size_t pp = (size_t)snprintf(plan, sizeof plan, "%s: %s", drv, sql);
             if (battr > 0 || limit > 0)
                 snprintf(plan + pp, sizeof plan - pp, "; then %s in the verb",
@@ -2626,7 +2776,8 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
     /* Priority 3: no server-side query for this shape. */
     if (!done) {
         if (b->driver->explain &&
-            b->driver->explain(f, NULL, 0, NULL, 0, 0, sql, sizeof sql)) {
+            b->driver->explain(f, NULL, 0, NULL, 0, 0, 0, 0,
+                               sql, sizeof sql)) {
             size_t pp = (size_t)snprintf(plan, sizeof plan, "%s: %s", drv, sql);
             if (np > 0)
                 pp += (size_t)snprintf(plan + pp, sizeof plan - pp,
