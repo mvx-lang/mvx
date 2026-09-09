@@ -1,4 +1,4 @@
 [417] file PARTS created
 --- VOC on one backend, PARTS on the other, both listed
-VOC                      lmdb
-PARTS                    sqlite
+PARTS                    lmdb
+VOC                      sqlite

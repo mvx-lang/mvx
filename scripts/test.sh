@@ -39,7 +39,7 @@ TCL="$ROOT/build/bin/mvx"
 # "mvx broke", not "a package released this morning".
 PKG_VERSION_cmd=1.4.1
 PKG_VERSION_getopt=1.1.0
-PKG_VERSION_git=2.0.3
+PKG_VERSION_git=2.0.4
 PKG_ASSET_cmd=cmd
 PKG_ASSET_getopt=getopt
 PKG_ASSET_git=mvx-lang_git
@@ -350,9 +350,14 @@ EOF
 "$MVX" "$seed" -o "$TESTROOT/seedbin" 2>/dev/null
 (cd "$ACCT" && MVXACCOUNT=. "$TESTROOT/seedbin") >/dev/null
 
+# BY @ID on the WITH queries below: an unordered LIST returns records in
+# whatever order the backend keeps them -- lmdb by key, sqlite by rowid -- and
+# MV promises no order without one.  These fixtures were encoding lmdb's, so
+# they failed the moment the same file lived anywhere else.  What they are for
+# is WHICH records come back, not in what order (#187).
 check tcl-query "$(printf '%s\n' \
   'LIST PARTS NAME PRICE COLOR BY PRICE' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'SELECT PARTS WITH COLOR = blue' \
   'COUNT PARTS' \
   'COUNT PARTS' \
@@ -930,7 +935,9 @@ check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 # the list is what another tool builds an account from.
 ENA="$TESTROOT/enumacct"
 "$ROOT/scripts/mkaccount.sh" "$ENA" >/dev/null 2>&1
-sed -i.bak 's/^driver = .*/driver = sqlite/' "$ENA/.mvx" && rm -f "$ENA/.mvx.bak"
+# lmdb, not sqlite: sqlite is the default now, so declaring it splits nothing
+# and this would silently stop testing two backends at once.
+sed -i.bak 's/^driver = .*/driver = lmdb/' "$ENA/.mvx" && rm -f "$ENA/.mvx.bak"
 check tcl-listf-backends "$( \
   "$TCL" -a "$ENA" -c 'CREATE-FILE PARTS' 2>&1; \
   echo '--- VOC on one backend, PARTS on the other, both listed'; \
@@ -948,7 +955,9 @@ check tcl-listf-backends "$( \
 # into an lmdb one.
 DCL="$TESTROOT/declacct"
 "$ROOT/scripts/mkaccount.sh" "$DCL" >/dev/null 2>&1
-sed -i.bak 's/^driver = .*/driver = sqlite/' "$DCL/.mvx" && rm -f "$DCL/.mvx.bak"
+# lmdb for the same reason: the split has to be against whatever the default
+# now is, or the test asserts nothing.
+sed -i.bak 's/^driver = .*/driver = lmdb/' "$DCL/.mvx" && rm -f "$DCL/.mvx.bak"
 printf 'OPEN "SPLITF" TO F ELSE PRINT "cannot open SPLITF" ; STOP\nWRITE "hi" ON F, "K1"\nREAD R FROM F, "K1" THEN PRINT "read back: ":R\n' \
   > "$TESTROOT/splitf.b"
 "$MVX" "$TESTROOT/splitf.b" -o "$TESTROOT/splitf" >/dev/null 2>&1
@@ -1819,25 +1828,25 @@ check tcl-port "$(printf 'PORT-SOURCE BP CPORT\nCT BP CPORT.PORTED\n' | tclrun; 
 check tcl-index "$(printf '%s\n' \
   'CREATE-INDEX PARTS COLOR' \
   'LIST-INDEXES PARTS' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'COPY PARTS W100 TO W950' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'DELETE PARTS W950' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'ED PARTS G200' \
   '3' \
   'R/red/blue' \
   'FI' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'ED PARTS G200' \
   '3' \
   'R/blue/red' \
   'FI' \
-  'LIST PARTS NAME WITH COLOR = red' \
+  'LIST PARTS NAME WITH COLOR = red BY @ID' \
   'CREATE-INDEX PARTS NAME' \
   'DELETE-INDEX PARTS COLOR' \
   'LIST-INDEXES PARTS' \
-  'LIST PARTS NAME WITH COLOR = blue' \
+  'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'DELETE-INDEX PARTS NAME' | tclrun)"
 
 # EXPORT/IMPORT: a hash file round-trips through a git-native
@@ -1881,7 +1890,7 @@ NSEOF
 # select lists crossing EXECUTE into a program
 prog="$TESTROOT/progsel.b"
 cat > "$prog" <<'EOF'
-EXECUTE "SELECT PARTS WITH COLOR = blue" CAPTURING X
+EXECUTE "SSELECT PARTS WITH COLOR = blue BY @ID" CAPTURING X
 DONE = 0
 LOOP
    READNEXT ID ELSE DONE = 1

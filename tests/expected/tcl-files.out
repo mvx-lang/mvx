@@ -1,10 +1,10 @@
 [417] file STOCKF created
 0 record(s) counted
 File                     Type
-STOCKF                   lmdb
-VOC                      lmdb
+STOCKF                   sqlite
+VOC                      sqlite
 2 file(s)
 [418] file STOCKF deleted
 File                     Type
-VOC                      lmdb
+VOC                      sqlite
 1 file(s)

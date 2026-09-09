@@ -526,6 +526,87 @@ static int binding_for(const char *cspec, char *driver, size_t dcap,
     return 1;
 }
 
+static int fl_internal(const char *p, size_t n);
+
+/* THE DEFAULT FOR AN ACCOUNT THAT DECLARED NOTHING (#187).
+ *
+ * sqlite, not lmdb, because lmdb pushes nothing down -- no select_where,
+ * select_order, count_where, sum_where, join or explain -- so every WITH
+ * streams the whole id list to the verb and filters there.  sqlite answers
+ * those in SQL, and is the same deal for the operator: one local file, no
+ * server.
+ *
+ * EXCEPT WHERE AN ACCOUNT ALREADY HOLDS LMDB FILES.  Accounts made before
+ * `driver` existed declare nothing, so they resolve through this; answering
+ * sqlite for them would make their files unreachable.  An account that already
+ * has lmdb files keeps getting lmdb, and only an account with none -- a new
+ * one, or one that has said what it wants -- gets sqlite.
+ *
+ * The probe asks the driver for its file list rather than looking for
+ * mvxdata.lmdb on disk: that path is created merely by enumerating through the
+ * driver, so its presence says nothing about whether anything is in it.
+ *
+ * Answered once per process; this is on the open path.
+ */
+/* Does `drv` hold a file called `name` in this account?  The honest way to
+   ask which backend an account's VOC is in, without opening it (#187). */
+int mvx_backend_has_file(const char *drv, const char *name) {
+    if (!drv || !name || !mvx_driver_available(drv)) return 0;
+    const mvx_driver *d = driver_load(drv);
+    if (!d || !d->names) return 0;
+    int found = 0;
+    mv_value names;
+    mv_init(&names);
+    char err[256] = "";
+    if (d->names(NULL, &names, err, sizeof err) &&
+        names.tag == MV_STR && names.s->len > 0) {
+        size_t want = strlen(name);
+        const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
+        while (p < end && !found) {
+            const char *am = memchr(p, '\xFE', (size_t)(end - p));
+            size_t n = (am ? am : end) - p;
+            if (n == want && memcmp(p, name, n) == 0) found = 1;
+            p = am ? am + 1 : end;
+        }
+    }
+    mv_clear(&names);
+    return found;
+}
+
+static const char *undeclared_default(void) {
+    static char cached[64];
+    static int  done;
+    if (done) return cached;
+    done = 1;
+
+    snprintf(cached, sizeof cached, "sqlite");
+    if (!mvx_driver_available("sqlite")) {
+        snprintf(cached, sizeof cached, "lmdb");
+        return cached;
+    }
+    const mvx_driver *l = driver_load("lmdb");
+    if (l && l->names) {
+        mv_value names;
+        mv_init(&names);
+        char err[256] = "";
+        if (l->names(NULL, &names, err, sizeof err) &&
+            names.tag == MV_STR && names.s->len > 0) {
+            const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
+            while (p < end) {
+                const char *am = memchr(p, '\xFE', (size_t)(end - p));
+                size_t n = (am ? am : end) - p;
+                if (n > 0 && !fl_internal(p, n)) {
+                    snprintf(cached, sizeof cached, "lmdb");
+                    break;
+                }
+                p = am ? am + 1 : end;
+            }
+        }
+        mv_clear(&names);
+    }
+    return cached;
+}
+
 /* Resolve a spec to its driver, and derive the dictionary spec when
    asked: DICT.<spec> as a sibling LMDB named DB, and <spec>.DICT as a
    sibling directory for directory files — so a directory file NAME and
@@ -570,7 +651,7 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
     char ad[64];
     mvx_account_driver(ad, sizeof ad);
     if (ad[0] && mvx_driver_available(ad)) return driver_load(ad);
-    return driver_load("lmdb");
+    return driver_load(undeclared_default());
 }
 
 int64_t mvx_open(mvx_ctx *ctx, const mv_value *dict, const mv_value *spec,

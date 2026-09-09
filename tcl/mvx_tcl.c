@@ -930,6 +930,63 @@ static int command(char *line) {
     return 127;                          /* command not found (Unix convention) */
 }
 
+
+/* WHICH BACKEND HOLDS THIS ACCOUNT'S VOC (#187).
+ *
+ * VOC is the bootstrap file: it has to be opened before anything that could
+ * describe it, so `.mvx` names it (`voc = <driver>`).  An account made before
+ * that key existed names nothing, and since the default for an undeclared
+ * account is now sqlite, such an account would be looked for in the wrong
+ * place.
+ *
+ * So: if `.mvx` does not say, try lmdb -- which is what every account made
+ * before this used -- and if VOC is there, record it and carry on.  The
+ * account is fixed once and never asks again.
+ *
+ * If it is NOT there, we genuinely do not know, and guessing would put the
+ * account's files somewhere nobody chose.  Ask, on a terminal.  Off one, say
+ * so and change nothing: the same rule the driver-substitution prompt already
+ * follows, because a prompt into a closed pipe is not a question.
+ */
+static void mvx_append_descriptor(const char *key, const char *val) {
+    FILE *fp = fopen(".mvx", "a");
+    if (!fp) return;
+    fprintf(fp, "%s = %s\n", key, val);
+    fclose(fp);
+}
+
+static void voc_backend_settle(void) {
+    char declared[64];
+    mvx_account_voc(declared, sizeof declared);
+    if (declared[0]) return;                  /* already answered */
+    if (!has_descriptor()) return;            /* not an account (yet) */
+
+    if (mvx_backend_has_file("lmdb", "VOC")) { /* an account from before the key */
+        mvx_append_descriptor("voc", "lmdb");
+        return;
+    }
+    if (!isatty(0)) return;                   /* no terminal, no guessing */
+
+    char avail[512];
+    mvx_driver_names(avail, sizeof avail);
+    for (char *c = avail; *c; c++) if (*c == ',') *c = ' ';
+    printf("This account does not say which backend holds its VOC.\n");
+    printf("  available: %s\n", avail[0] ? avail : "(none)");
+    printf("  VOC backend (blank to leave unset): ");
+    fflush(stdout);
+    char ans[64];
+    if (!read_line_raw(ans, sizeof ans)) return;
+    size_t n = strlen(ans);
+    while (n && (ans[n-1] == '\n' || ans[n-1] == '\r' || ans[n-1] == ' ')) ans[--n] = '\0';
+    if (!ans[0]) return;
+    if (!mvx_driver_available(ans)) {
+        printf("  \"%s\" is not available here; leaving it unset.\n", ans);
+        return;
+    }
+    mvx_append_descriptor("voc", ans);
+    printf("  recorded voc = %s in .mvx\n", ans);
+}
+
 int main(int argc, char **argv) {
     const char *acct = NULL;
     const char *one_cmd = NULL;
@@ -980,6 +1037,7 @@ int main(int argc, char **argv) {
     /* upgrade a pre-.mvx account so the descriptor becomes canonical */
     if (!has_descriptor() && has_markers())
         write_descriptor(g_acct_base);
+    voc_backend_settle();     /* and say which backend holds its VOC (#187) */
 
     /* Resolve and load the stack before anything runs.  Not gated on a
        terminal: .L and .X have to work down a pipe too, or the feature is
