@@ -923,6 +923,33 @@ printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
 # packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# A package can export a FUNCTION, and a DEFFUN'd caller resolves it across the
+# package boundary (#101).  BUILD-PKG and CATALOG classified only SUBROUTINE as
+# library-producing, so a FUNCTION was compiled as a PROGRAM and the link failed
+# on a missing _mvx_main -- which is why getopt had to ship subroutine accessors
+# (CALL GETOPT.VAL("m", MSG)) instead of the function-style OPT("m").
+#
+# The ABI was never the problem and this does not change it: the compiler already
+# marks a FUNCTION isSubroutine and reserves argv[0] for the result, and the call
+# site already passes it there.  Only the classification was missing.
+FNPKG="$TESTROOT/fnpkg"; mkdir -p "$FNPKG/BP"
+printf '# MVX account descriptor\nname=fnpkg\nversion=1\n' > "$FNPKG/.mvx"
+printf 'fnpkg\n1.0.0\nfunctions across a package boundary\n' > "$FNPKG/PKG"
+printf 'FUNCTION TWICE(X)\nRETURN(X * 2)\n' > "$FNPKG/BP/TWICE"
+printf 'FUNCTION SHOUT(S)\nRETURN(OCONV(S, "MCU"):"!")\n' > "$FNPKG/BP/SHOUT"
+FNACC="$TESTROOT/fnacc"; mkdir -p "$FNACC/BP"
+"$ROOT/scripts/mkaccount.sh" "$FNACC" >/dev/null 2>&1
+printf 'DEFFUN TWICE(1)\nDEFFUN SHOUT(1)\nPRINT "TWICE=":TWICE(21)\nPRINT "SHOUT=":SHOUT("hello")\n' \
+  > "$FNACC/BP/USEFN"
+check tcl-pkgfunction "$( \
+  MVXPRIV=developer "$TCL" -a "$FNPKG" -c 'BUILD-PKG .' 2>&1; \
+  echo '--- both built into LIB/, not attempted as programs'; \
+  ls "$FNPKG/LIB" 2>/dev/null | grep -v dSYM | sed 's/\.[a-z]*$//' | sort; \
+  "$TCL" -a "$FNACC" -c "LINK-PKG $FNPKG" 2>&1 | normalise; \
+  MVXPRIV=developer "$TCL" -a "$FNACC" -c 'CATALOG BP USEFN' 2>&1; \
+  echo '--- and a DEFFUN call resolves across the boundary'; \
+  (cd "$FNACC" && MVXACCOUNT=. ./CATALOG/USEFN) 2>&1 | normalise)"
+
 # Fetched and built once here, reused by every package test below.
 PKG_GETOPT="$(pkg_dir getopt)"
 PKG_CMD="$(pkg_dir cmd)"

@@ -23,7 +23,7 @@ READ SRC FROM F, IT ELSE
    PRINT IT:" not on file ":FN
    STOP
 END
-* A SUBROUTINE source catalogs into LIB/ as a shared library the
+* A SUBROUTINE or FUNCTION source catalogs into LIB/ as a shared library the
 * runtime CALL resolver loads; only main programs become verbs.  Skip
 * comments in every style (* ! REM // and /* */ blocks) and $ preprocessor
 * directives when finding the first real statement.
@@ -58,11 +58,21 @@ FOR I = 1 TO NA
       END CASE
    END
 NEXT I
-IF FIRST[1, 11] = "SUBROUTINE " OR FIRST = "SUBROUTINE" THEN
+* A FUNCTION catalogs the same way a SUBROUTINE does.  It shares the
+* subroutine ABI -- the compiler marks it isSubroutine and reserves argv[0]
+* for the result -- so the only thing that stopped a cataloged FUNCTION from
+* resolving was this classification: it fell through to the exe path and the
+* link failed on a missing _mvx_main (#101).
+ISLIB = 0
+IF FIRST[1, 11] = "SUBROUTINE " OR FIRST = "SUBROUTINE" THEN ISLIB = 1
+IF FIRST[1, 9] = "FUNCTION " OR FIRST = "FUNCTION" THEN ISLIB = 2
+IF ISLIB THEN
    X = CREATEFILE("LIB", "DIR")
    RC = COMPILE("shared", FN:"/":IT, "LIB/":IT)
    IF RC = 0 THEN
-      PRINT "[244] ":IT:" cataloged as a subroutine"
+      KIND = "a subroutine"
+      IF ISLIB = 2 THEN KIND = "a function"
+      PRINT "[244] ":IT:" cataloged as ":KIND
    END ELSE
       PRINT "[247] compilation of ":IT:" failed"
    END
