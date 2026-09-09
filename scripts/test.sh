@@ -943,6 +943,32 @@ check tcl-listf-backends "$( \
   echo '--- VOC on one backend, PARTS on the other, both listed'; \
   "$TCL" -a "$ENA" -c 'LISTF' 2>&1 | grep -E '^(VOC|PARTS) ')"
 
+# CONVERT-FILE moves a file between backends, and when the file is VOC the
+# account's record of where VOC lives has to move with it -- VOC is the one
+# file nothing else can describe, so a stale `voc =` makes the account
+# unopenable rather than merely wrong.  Recorded by the runtime at creation,
+# so every route that changes VOC's backend is covered, not just this verb.
+#
+# Also asserts the conversion actually happens: `CONVERT-FILE x lmdb` used a
+# bare CREATEFILE, which takes the ACCOUNT default -- sqlite since #187 -- so
+# it reported success and left the file exactly where it was.
+CVA="$TESTROOT/cvtacct"
+"$ROOT/scripts/mkaccount.sh" "$CVA" >/dev/null 2>&1
+check tcl-convert-voc "$( \
+  echo "--- a new account starts on the default"; \
+  grep -E '^voc' "$CVA/.mvx"; \
+  "$TCL" -a "$CVA" -c 'CREATE-FILE T' 2>&1; \
+  echo '--- CONVERT-FILE really converts, it does not just say so'; \
+  "$TCL" -a "$CVA" -c 'CONVERT-FILE T lmdb' 2>&1; \
+  "$TCL" -a "$CVA" -c 'LISTF' 2>&1 | grep -E '^T  '; \
+  echo '--- and converting VOC updates the account record'; \
+  "$TCL" -a "$CVA" -c 'CONVERT-FILE VOC lmdb' 2>&1; \
+  grep -E '^voc' "$CVA/.mvx"; \
+  echo '--- which a FRESH process then resolves'; \
+  "$TCL" -a "$CVA" -c 'COUNT VOC' 2>&1; \
+  echo '--- with the policy lines in .mvx untouched'; \
+  grep -cE '^permit' "$CVA/.mvx")"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and

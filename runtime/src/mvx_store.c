@@ -3757,6 +3757,65 @@ static void account_field(const char *key, char *buf, size_t cap) {
     }
 }
 
+/* Set (or replace) one key in this account's .mvx.
+ *
+ * Rewrites the file, keeping every other line as it stands -- comments and
+ * permit/deny rules included, since they are policy and losing them silently
+ * would be far worse than the thing this is recording. */
+static void account_set_field(const char *key, const char *val) {
+    const char *acct = getenv("MVXACCOUNT");
+    if (!acct || !acct[0]) acct = ".";
+    char path[4200];
+    snprintf(path, sizeof path, "%s/.mvx", acct);
+    FILE *in = fopen(path, "r");
+    if (!in) return;                          /* not an account: nothing to say */
+
+    char *buf = NULL;
+    size_t cap = 0, len = 0;
+    char line[1024];
+    int replaced = 0;
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof line, in)) {
+        const char *k = line;
+        while (*k == ' ' || *k == '\t') k++;
+        const char *eq = strchr(k, '=');
+        int iskey = 0;
+        if (eq) {
+            const char *ke = eq;
+            while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+            iskey = (size_t)(ke - k) == klen && strncasecmp(k, key, klen) == 0;
+        }
+        char out[1200];
+        int n = iskey ? snprintf(out, sizeof out, "%s = %s\n", key, val)
+                      : snprintf(out, sizeof out, "%s", line);
+        if (iskey) replaced = 1;
+        if (len + (size_t)n + 1 > cap) {
+            cap = (len + (size_t)n + 1) * 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); fclose(in); return; }
+            buf = nb;
+        }
+        memcpy(buf + len, out, (size_t)n);
+        len += (size_t)n;
+    }
+    fclose(in);
+    if (!replaced) {                          /* not there yet: append it */
+        char out[1200];
+        int n = snprintf(out, sizeof out, "%s = %s\n", key, val);
+        if (len + (size_t)n + 1 > cap) {
+            cap = len + (size_t)n + 1;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return; }
+            buf = nb;
+        }
+        memcpy(buf + len, out, (size_t)n);
+        len += (size_t)n;
+    }
+    FILE *o = fopen(path, "w");
+    if (o) { fwrite(buf, 1, len, o); fclose(o); }
+    free(buf);
+}
+
 /* The account's default backend: what a file gets when neither CREATE-FILE nor
    a binding said otherwise. */
 void mvx_account_hash(char *buf, size_t cap) {
@@ -3990,6 +4049,12 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
         }
         write_file_meta(drv, dictspec, drvname, ap);
         voc_register(cspec);
+        /* If this was VOC, the account's record of where VOC lives is now
+           stale, and VOC is the one file nothing else can describe -- it has
+           to be opened before anything that could (#187).  CONVERT-FILE goes
+           through here, so changing VOC's backend updates .mvx by itself
+           rather than leaving the operator to remember. */
+        if (strcasecmp(cspec, "VOC") == 0) account_set_field("voc", drvname);
         return 1;
     }
 
