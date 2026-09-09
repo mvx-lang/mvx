@@ -1,0 +1,34 @@
+  1 COUNT VOC
+  2 LISTF
+--- .L n and .L m-n
+  1 A4
+  2 A3
+  2 A3
+  3 A2
+--- .X n runs it and pops it to the top
+13 record(s) counted
+13 record(s) counted
+  1 COUNT VOC
+  2 LISTF
+--- .R n/old/new edits, and the edit moves to the top
+  1 CT VOC
+  1 CT VOC
+  2 LISTF
+--- .DE, .DE n, .DE n/str
+  1 A2
+  2 A1
+  1 A2
+  2 A1
+  1 A4
+  2 A3
+  3 A1
+--- a bad entry number is refused, not guessed at
+[1310] no such stack entry
+[1310] no such stack entry
+[1312] "nope" is not in entry 1
+[1311] .L takes a count or a m-n range
+--- a dot command is not itself stacked
+  1 WHO
+  1 WHO
+--- .FOO is a verb, not a stack command
+verb ".FOO" not found

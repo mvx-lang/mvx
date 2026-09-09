@@ -727,6 +727,44 @@ check tcl-multiwith "$( \
 # DESCRIBE (#51) on a local (LMDB) file: no SQL backend, so the plan states the
 # selection resolves in the driver and the verb applies the conditions. An SQL
 # backend renders the actual query instead (tcl-pgdescribe). MWF reused.
+# The R83 command stack (#114).  Semantics are D3's, from the Pick Systems
+# Reference Manual: only UNIQUE commands are kept, entry 1 is the most recent,
+# and re-running or editing an entry moves it to the top.  Those three rules
+# are what make the numbers mean anything, so they are what is asserted here
+# rather than just "the dot commands do not error".
+#
+# MVXSTACK points the stack somewhere disposable; without it these would write
+# to whoever is running the suite.
+STK="$TESTROOT/stack"
+stk() { rm -f "$STK"; MVXSTACK="$STK" "$TCL" -a "$ACCT" 2>&1; }
+check tcl-stack "$( \
+  printf 'COUNT VOC\nLISTF\nCOUNT VOC\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- .L n and .L m-n'; \
+  printf 'A1\nA2\nA3\nA4\n.L 2\n.L 2-3\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- .X n runs it and pops it to the top'; \
+  printf 'COUNT VOC\nLISTF\n.X 2\n.L\n' | stk | grep -E '^ +[0-9]+ |record\(s\) counted'; \
+  echo '--- .R n/old/new edits, and the edit moves to the top'; \
+  printf 'COUNT VOC\nLISTF\n.R 2/COUNT/CT\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- .DE, .DE n, .DE n/str'; \
+  printf 'A1\nA2\nA3\n.DE\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  printf 'A1\nA2\nA3\nA4\n.DE 2\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  printf 'A1\nA2\nA3\nA4\n.DE 3/A2\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- a bad entry number is refused, not guessed at'; \
+  printf 'WHO\n.X 9\n.R 9\n.R 1/nope/x\n.L junk\n' | stk | grep -E '^\[1[0-9]+\]'; \
+  echo '--- a dot command is not itself stacked'; \
+  printf 'WHO\n.L\n.L\n' | stk | grep -E '^ +[0-9]+ ' | tail -2; \
+  echo '--- .FOO is a verb, not a stack command'; \
+  printf '.FOO\n' | stk | tail -1)"
+
+# An existing libedit history file has to become the stack, not be discarded
+# and not be shown back with its own format header as entry 1.
+printf '_HiStOrY_V2_\nOLD ONE\nOLD TWO\n' > "$TESTROOT/mig"
+check tcl-stack-migrate "$( \
+  printf '.L\n' | MVXSTACK="$TESTROOT/mig" "$TCL" -a "$ACCT" 2>&1 | grep -E '^ +[0-9]+ '; \
+  printf 'WHO\n' | MVXSTACK="$TESTROOT/mig" "$TCL" -a "$ACCT" >/dev/null 2>&1; \
+  echo '--- and the header is gone from the file'; \
+  head -3 "$TESTROOT/mig")"
+
 check tcl-describe "$( \
   printf '%s\n' \
     'LIST DESCRIBE MWF STATE WITH STATE = "NSW"' \
