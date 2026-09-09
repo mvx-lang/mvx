@@ -396,6 +396,8 @@ int64_t mv_val_chars(const mv_value *v, char *numbuf, size_t cap,
 void mvx_fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 void mvx_stop(void) __attribute__((noreturn));      /* STOP: end the program */
 void mvx_exit(int32_t code) __attribute__((noreturn)); /* STOP <code>: exit status */
+/* STOP/ABORT <expr>: numeric -> exit status, otherwise print and stop (#120) */
+void mvx_stop_value(const mv_value *v, int32_t abort_) __attribute__((noreturn));
 void mvx_arity_check(const char *name, int32_t expected, int32_t got);
 
 /* Compiled main programs export this; the runtime crt calls it. */

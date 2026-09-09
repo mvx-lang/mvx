@@ -1,0 +1,11 @@
+--- the concatenated operand that used to crash the compiler
+cannot open STATES|1
+--- a plain string operand
+no|1
+--- a numeric operand is still an exit status
+|3
+--- and bare STOP is still a clean end
+ran|0
+--- ABORT, with and without a message
+gave up|1
+|1

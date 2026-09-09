@@ -63,7 +63,7 @@ struct Stmt {
         Loop,       // pre, condKind, cond, post
         Print,      // items + seps, noNewline  (CRT is the same in Slice 1)
         Call,       // name, args
-        Return, Stop,
+        Return, Stop,   // Stop carries isAbort for ABORT (#120)
         Continue, Exit,     // loop control: next iteration / leave loop
         OnGoto, OnGosub,    // cond: selector; labelList: targets (1-based)
         Label,      // name: numeric statement label
@@ -111,6 +111,7 @@ struct Stmt {
     std::vector<std::string> labelList;  // ON GOTO/GOSUB targets
     std::vector<StmtP> pre, post;        // Loop
     LoopCond loopCond = LoopCond::None;
+    bool isAbort = false;                // Stop: the statement was ABORT (#120)
 };
 
 struct Program {

@@ -756,6 +756,35 @@ check tcl-stack "$( \
   echo '--- .FOO is a verb, not a stack command'; \
   printf '.FOO\n' | stk | tail -1)"
 
+# STOP / ABORT with a string operand (#120).  `STOP "cannot open ":FN` is the
+# ordinary portable idiom and it used to abort the COMPILER inside LLVM with
+# invalid IR; a plain `STOP "no"` failed as an "internal error"; and ABORT was
+# not a statement at all.  Classic Pick prints the message and stops, so a
+# numeric operand stays an exit status and anything else is a message.
+stopcase() { # stopcase <source> -> "<stdout+stderr>|<exit status>"
+  printf '%s\n' "$1" > "$TESTROOT/stopc.b"
+  if ! "$MVX" "$TESTROOT/stopc.b" -o "$TESTROOT/stopc" 2>"$TESTROOT/stopc.err"; then
+    printf 'COMPILE FAILED: %s' "$(head -1 "$TESTROOT/stopc.err")"
+    return
+  fi
+  out="$("$TESTROOT/stopc" 2>&1)"; printf '%s|%s' "$out" "$?"
+}
+check tcl-stopstring "$( \
+  echo '--- the concatenated operand that used to crash the compiler'; \
+  stopcase 'FN = "STATES"
+IF FN = "STATES" THEN STOP "cannot open ":FN
+PRINT "not reached"'; echo; \
+  echo '--- a plain string operand'; \
+  stopcase 'STOP "no"'; echo; \
+  echo '--- a numeric operand is still an exit status'; \
+  stopcase 'STOP 3'; echo; \
+  echo '--- and bare STOP is still a clean end'; \
+  stopcase 'PRINT "ran"
+STOP'; echo; \
+  echo '--- ABORT, with and without a message'; \
+  stopcase 'ABORT "gave up"'; echo; \
+  stopcase 'ABORT'; echo)"
+
 # Arithmetic and aggregate I-types (#121).  The evaluator used to handle TRANS
 # and DOCTAG only and returned "" for everything else, so the commonest kind of
 # I-type there is -- arithmetic over sibling attributes -- listed as a blank

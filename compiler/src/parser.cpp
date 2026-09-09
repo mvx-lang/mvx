@@ -504,14 +504,20 @@ private:
             endStatementSoft();
             break;
         case Tok::KwStop:
+        case Tok::KwAbort: {
+            bool isAbort = at(Tok::KwAbort);
             advance();
             s = mk(Stmt::K::Stop);
-            // STOP <code>: an optional numeric process exit status (default 0).
+            s->isAbort = isAbort;
+            // STOP/ABORT <expr>: an exit status when the operand is numeric,
+            // otherwise a message to print before stopping (#120).  Not
+            // forced to a number here -- see mvx_stop_value.
             if (!at(Tok::Eol) && !at(Tok::Semi) && !at(Tok::Eof) &&
                 !at(Tok::KwElse))
                 s->value = expression();
             endStatementSoft();
             break;
+        }
         case Tok::KwNull:                       // explicit no-op statement
             advance();
             s = mk(Stmt::K::Nop);

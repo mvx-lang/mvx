@@ -42,6 +42,40 @@ void mvx_exit(int32_t code) {
     exit(code & 0xFF);
 }
 
+/* STOP <expr> / ABORT <expr> (#120).
+ *
+ * The operand used to be forced to a number at compile time, which made
+ * `STOP "cannot open ":FN` -- the ordinary portable idiom -- emit invalid IR
+ * and abort inside LLVM, and a plain `STOP "no"` fail as an "internal error".
+ * The type of an MV value is not a compile-time property, so the decision
+ * belongs here:
+ *
+ *   numeric      -> that process exit status, as before
+ *   anything else -> print it and stop non-zero, which is what classic Pick
+ *                    does with a STOP message and what the idiom expects
+ *
+ * `abort` only changes the wording and the status of an empty operand: both
+ * end the process, because in MVX a verb IS a process, so there is no calling
+ * program left to return to that ABORT would have to unwind past. */
+void mvx_stop_value(const mv_value *v, int32_t abort_) {
+    char nb[64];
+    const char *p;
+    int64_t n = v ? mv_val_chars(v, nb, sizeof nb, &p) : 0;
+    if (n > 0 && mv_num_fn(v)) {
+        char t[64];
+        if (n >= (int64_t)sizeof t) n = sizeof t - 1;
+        memcpy(t, p, (size_t)n);
+        t[n] = '\0';
+        exit(atoi(t) & 0xFF);
+    }
+    if (n > 0) {
+        fwrite(p, 1, (size_t)n, stderr);
+        fputc('\n', stderr);
+        exit(1);                      /* a message means it did not go well */
+    }
+    exit(abort_ ? 1 : 0);             /* bare ABORT is abnormal, bare STOP is not */
+}
+
 void mvx_arity_check(const char *name, int32_t expected, int32_t got) {
     if (expected != got)
         mvx_fatal("CALL %s: %d argument(s) passed, subroutine takes %d",
