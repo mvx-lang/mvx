@@ -3279,18 +3279,28 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
     }
     free(ents);
 
-    const mvx_driver *lmdb = driver_load("lmdb");
-    if (lmdb->names) {
+    /* Local unbound files live in whichever embedded backend made them, and
+       an account can now say which that is (#187: `driver` in .mvx).  Ask
+       BOTH and label each file with the driver that holds it.
+       This is not hypothetical tidiness: a file the account placed in sqlite
+       was invisible here, so LISTF under-reported it and mvx-git -- which
+       finds an account's files through this same list -- committed the
+       account without its records (mv_git#240). */
+    static const char *local_drv[] = {"lmdb", "sqlite"};
+    for (size_t li = 0; li < sizeof local_drv / sizeof local_drv[0]; li++) {
+        if (!mvx_driver_available(local_drv[li])) continue;
+        const mvx_driver *ld = driver_load(local_drv[li]);
+        if (!ld || !ld->names) continue;
         mv_value names;
         mv_init(&names);
         char err[256] = "";
-        if (lmdb->names(NULL, &names, err, sizeof err) &&
+        if (ld->names(NULL, &names, err, sizeof err) &&
             names.tag == MV_STR && names.s->len > 0) {
             const char *p = mv_str_bytes(names.s), *end = p + names.s->len;
             while (p < end) {
                 const char *am = memchr(p, '\xFE', (size_t)(end - p));
                 size_t n = (am ? am : end) - p;
-                if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, "lmdb");
+                if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, local_drv[li]);
                 p = am ? am + 1 : end;
             }
         }
