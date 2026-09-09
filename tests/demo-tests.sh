@@ -28,8 +28,15 @@
 #   DEMO     = repository to clone           (default the public demo)
 #   WORK     = scratch directory             (default a mktemp -d)
 #
-#   PLATFORM=mvx MVX=build/bin/mvx MVXGIT=packages/git/bin/mvx-git \
+#   PLATFORM=mvx MVX=build/bin/mvx MVXGIT=<path to mvx-git> \
 #       sh tests/demo-tests.sh
+#
+# MVXGIT has no default on purpose.  mvx-git is NOT built by this tree --
+# it came from the packages/git submodule, which went away with #169, and
+# the build now produces only mvx-git-adopt (which reads a plain checkout
+# and cannot clone).  Point MVXGIT at an mvx-git from the installed `git`
+# package, or from a build of mvx-lang/mv_git.  Without one this suite
+# cannot fetch the account and stops at the clone.
 set -u
 PLATFORM="${PLATFORM:-mvx}"
 : "${MVX:?set MVX to the platform binary (mvx, udt or uv)}"
