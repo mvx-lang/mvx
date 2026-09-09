@@ -2735,17 +2735,26 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
     char plan[4096], sql[4000];
     int done = 0;
 
-    /* Priority 1: BY + FIRST with at most one filter -> ORDER BY / LIMIT push. */
-    if (!done && b->driver->explain && limit > 0 && np <= 1 && battr > 0) {
+    /* Priority 1: BY (with or without FIRST) and at most one filter -> the
+       ORDER BY / LIMIT push.
+       NOT `limit > 0`: that required a FIRST, so a plain `BY x` reported
+       "sorted in the verb" while an ORDER BY was in fact pushed.  And `ocol`
+       may be NULL — an order on a RAW attribute pushes when the sort is
+       numeric (#157), which this could not describe at all.  Both conditions
+       must match what mvx_orderselect actually does, or DESCRIBE goes back to
+       describing something else (#172). */
+    if (!done && b->driver->explain && np <= 1 && battr > 0) {
         int otext = 0;
         const char *ocol = o ? map_order_col(o, battr, (int)bnum, &otext) : NULL;
+        if (!ocol) otext = !bnum;
+        int orderok = ocol != NULL || bnum;     /* raw: numeric only */
         int filterok = np == 0 ||
                        (ops[0][1] == '\0' && (ops[0][0] == '=' || ops[0][0] == '#'));
-        if (ocol && filterok) {
+        if (orderok && filterok) {
             mvx_pred fp;
             if (np == 1) { fp = preds[0]; fp.numeric = 0; }
-            if (b->driver->explain(f, np == 1 ? &fp : NULL, np, ocol, otext,
-                                   limit, sql, sizeof sql)) {
+            if (b->driver->explain(f, np == 1 ? &fp : NULL, np, ocol, battr,
+                                   (int)bnum, otext, limit, sql, sizeof sql)) {
                 snprintf(plan, sizeof plan, "%s: %s", drv, sql);
                 done = 1;
             }
@@ -2754,7 +2763,8 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
 
     /* Priority 2: every condition pushes -> one server-side WHERE (no order). */
     if (!done && b->driver->explain && np >= 1 && allpush) {
-        if (b->driver->explain(f, preds, np, NULL, 0, 0, sql, sizeof sql)) {
+        if (b->driver->explain(f, preds, np, NULL, 0, 0, 0, 0,
+                               sql, sizeof sql)) {
             size_t pp = (size_t)snprintf(plan, sizeof plan, "%s: %s", drv, sql);
             if (battr > 0 || limit > 0)
                 snprintf(plan + pp, sizeof plan - pp, "; then %s in the verb",
@@ -2766,7 +2776,8 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
     /* Priority 3: no server-side query for this shape. */
     if (!done) {
         if (b->driver->explain &&
-            b->driver->explain(f, NULL, 0, NULL, 0, 0, sql, sizeof sql)) {
+            b->driver->explain(f, NULL, 0, NULL, 0, 0, 0, 0,
+                               sql, sizeof sql)) {
             size_t pp = (size_t)snprintf(plan, sizeof plan, "%s: %s", drv, sql);
             if (np > 0)
                 pp += (size_t)snprintf(plan + pp, sizeof plan - pp,

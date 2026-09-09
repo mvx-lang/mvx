@@ -1942,14 +1942,19 @@ MWEOF
 
   # DESCRIBE (#51): the verb renders the backend query it would run instead of
   # running it — an identity-column equality, a numeric range on the blob, an
-  # ORDER BY / LIMIT push, and a non-pushable @ID condition that scans and
-  # filters in the verb.  Reuses MWP (mapped STATE, PRICE above).
+  # ORDER BY / LIMIT push, the same push with no FIRST behind it, a text sort
+  # of a mapped column, and a non-pushable @ID condition that scans and filters
+  # in the verb.  Reuses MWP (mapped STATE, PRICE above).  The two plain-BY
+  # cases are #172: an ORDER BY was only ever described when a FIRST came with
+  # it, so a bare BY reported a sort in the verb that was not happening.
   # DESCRIBE / EXPLAIN work both right after the verb and trailing the
   # sentence — same plan either way — so the cases mix the two positions.
   check tcl-pgdescribe "$( \
     "$TCL" -a "$PGACCT" -c 'LIST DESCRIBE MWP STATE WITH STATE = "NSW"' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'LIST MWP WITH STATE = "NSW" AND PRICE > "500" DESCRIBE' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT EXPLAIN MWP BY PRICE FIRST 3' 2>&1; \
+    "$TCL" -a "$PGACCT" -c 'SORT MWP BY PRICE DESCRIBE' 2>&1; \
+    "$TCL" -a "$PGACCT" -c 'SORT MWP BY STATE DESCRIBE' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'LIST MWP WITH @ID = "O1" DESCRIBE' 2>&1)"
 
   # cross-process record locks (#16), including the mapped association subtables:
@@ -2520,6 +2525,65 @@ SQDEOF
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL sqlite push-down plan: $desc" ;;
   esac
+
+  # DESCRIBE tells the truth about the ORDER BY push (#172).  DESCRIBE has one
+  # job -- say what would run -- so it is only worth anything if it tracks the
+  # push-down rules exactly.  It used to describe an ORDER BY only when a FIRST
+  # was present, and could not describe an order on an unmapped attribute at
+  # all, so two of the three arms below reported "sorted in the verb" while the
+  # driver was in fact sorting.  DSC maps NAME and leaves CITY/QTY raw, which
+  # is what makes all three arms reachable from one file.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DSC' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdsc.b" <<'DSCEOF'
+OPEN "DSC" TO F ELSE PRINT "no DSC" ; STOP
+WRITE "Ada":@AM:"London":@AM:"30" ON F, "D1"
+WRITE "Bob":@AM:"Paris":@AM:"7" ON F, "D2"
+WRITE "Cy":@AM:"Berlin":@AM:"200" ON F, "D3"
+OPEN "DICT", "DSC" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L" ON D, "CITY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"4R" ON D, "QTY"
+DSCEOF
+  "$MVX" "$TESTROOT/sqdsc.b" -o "$TESTROOT/sqdsc" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdsc" >/dev/null 2>&1)
+  "$TCL" -a "$SQA" -c 'CREATE-MAP DSC NAME' >/dev/null 2>&1
+  # 1. mapped column, plain BY with no FIRST -- an ORDER BY, no LIMIT
+  d1="$("$TCL" -a "$SQA" -c 'SORT DSC BY NAME DESCRIBE' 2>&1)"
+  case "$d1" in
+    *'ORDER BY "NAME"'*LIMIT*) FAIL=$((FAIL+1))
+      echo "FAIL sqlite plain-BY plan has a LIMIT nobody asked for: $d1" ;;
+    *'ORDER BY "NAME"'*) PASS=$((PASS+1))
+      echo "  a plain BY on a mapped column is described as an ORDER BY" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite plain-BY plan: $d1" ;;
+  esac
+  # 2. RAW numeric attribute -- the guarded cast, the same expression
+  #    sq_order_expr builds for the query itself
+  d2="$("$TCL" -a "$SQA" -c 'SORT DSC BY QTY DESCRIBE' 2>&1)"
+  case "$d2" in
+    *"ORDER BY"*"CAST("*"AS REAL)"*"json_extract(doc,'\$.\"3\"')"*) PASS=$((PASS+1))
+      echo "  a numeric BY on an unmapped attribute is described too" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite raw-numeric BY plan: $d2" ;;
+  esac
+  # 3. RAW text attribute -- NOT pushable (MV's byte order over a whole
+  #    multivalued attribute is not what a column sort produces), so the plan
+  #    must still say the verb sorts.  Without this arm the fix could pass by
+  #    describing an ORDER BY for everything.
+  d3="$("$TCL" -a "$SQA" -c 'SORT DSC BY CITY DESCRIBE' 2>&1)"
+  case "$d3" in
+    *"ORDER BY"*) FAIL=$((FAIL+1))
+      echo "FAIL sqlite raw-text BY described as pushed, but it is not: $d3" ;;
+    *"sorted in the verb"*) PASS=$((PASS+1))
+      echo "  a text BY on an unmapped attribute still sorts in the verb" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite raw-text BY plan: $d3" ;;
+  esac
+  # 4. and the pushed order is the order MV wants: 7, 30, 200 numerically,
+  #    not "200" < "30" < "7" as bytes.  The plan above is only worth
+  #    printing if the query it names returns this.
+  o4="$("$TCL" -a "$SQA" -c 'SORT DSC BY QTY' 2>&1 | sed -n 's/^\(D[0-9]\).*/\1/p' | tr -d '\n')"
+  case "$o4" in
+    D2D1D3) PASS=$((PASS+1)); echo "  the pushed numeric order is MV's order" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite pushed numeric order: got '$o4', want D2D1D3" ;;
+  esac
   # MAPPING WITH AN ASSOCIATION -- the multi-table write.  A record's parent
   # columns go in the base table and each association's values become rows in a
   # child table, replaced wholesale on every write (DELETE + N INSERTs).  That
@@ -2730,6 +2794,15 @@ MYDEOF
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL mysql push-down plan: $desc" ;;
   esac
+  # ...and the ORDER BY push is described as well (#172).  QTY is attribute 3
+  # and unmapped, so this is the raw-attribute arm, on a plain BY with no
+  # FIRST -- the two conditions that DESCRIBE used to leave out.
+  dord="$("$TCL" -a "$MYA" -c 'SORT CUST BY QTY DESCRIBE' 2>&1)"
+  case "$dord" in
+    *"ORDER BY"*"REGEXP"*"CAST("*"AS DECIMAL"*) PASS=$((PASS+1))
+      echo "  a plain numeric BY is described as an ORDER BY" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql BY plan: $dord" ;;
+  esac
 
   # CREATE-INDEX on an UN-MAPPED attribute.  MySQL refuses a functional index
   # on an expression returning TEXT, so raw attributes were not indexable here
@@ -2809,11 +2882,16 @@ if [ -n "${MVX_MONGO:-}" ]; then
   # write two, read one (multivalue preserved), delete the other.
   printf 'OPEN "ORDERS" TO F ELSE STOP\nWRITE "Widget":@VM:"Gadget" ON F, "O1"\nWRITE "Acme" ON F, "O2"\nREAD V FROM F, "O1" THEN PRINT "read: ":V<1,1>:"/":V<1,2>\nDELETE F, "O2"\n' > "$TESTROOT/mg.b"
   "$MVX" "$TESTROOT/mg.b" -o "$TESTROOT/mgbin" 2>/dev/null
-  check tcl-mongo "$( \
+  # libmongoc writes "Falling back to malloc for counters" to stderr when it
+  # cannot map its shared-counter segment — intermittently, and depending on
+  # the container.  It is not output of ours; drop it, or whether the suite
+  # passes depends on whether the run that blessed it happened to see it.
+  nomgwarn() { grep -v 'WARNING:.*mongoc' || true; }
+  check tcl-mongo "$( { \
     "$TCL" -a "$MGACCT" -c 'CREATE-FILE ORDERS USING @mongotest' 2>&1; \
     (cd "$MGACCT" && MVXACCOUNT=. "$TESTROOT/mgbin"); \
     printf 'COUNT ORDERS\nSELECT ORDERS\nLIST ORDERS\n' | \
-      "$TCL" -a "$MGACCT" 2>&1)"
+      "$TCL" -a "$MGACCT" 2>&1; } | nomgwarn)"
 
   # relational mapping + native index + WITH/COUNT push-down (#62). CREATE-MAP
   # projects each mapped dict column onto its { _id, rec } document as a native
@@ -2839,11 +2917,6 @@ WRITE "D":@AM:"5":@AM:"MD0":@AM:"Qty":@AM:"5R":@AM:"LINES" ON D, "QTY"
 MMEOF
   "$MVX" "$TESTROOT/mgmap.b" -o "$TESTROOT/mgmapbin" 2>/dev/null
   (cd "$MGACCT" && MVXACCOUNT=. "$TESTROOT/mgmapbin")
-  # libmongoc writes "Falling back to malloc for counters" to stderr when it
-  # cannot map its shared-counter segment — intermittently, and depending on
-  # the container.  It is not output of ours; drop it, or whether the suite
-  # passes depends on whether the run that blessed it happened to see it.
-  nomgwarn() { grep -v 'WARNING:.*mongoc' || true; }
   check tcl-mongomap "$( { \
     "$TCL" -a "$MGACCT" -c 'CREATE-MAP MORD NAME STATE PRICE PRODUCT QTY' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD' 2>&1; \

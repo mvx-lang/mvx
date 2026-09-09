@@ -1466,10 +1466,16 @@ static mvx_cursor *pg_select_multi(mvx_file *fh, const mvx_pred *preds,
    SQL.  Same predicate shapes as pg_select_multi plus the ORDER BY / LIMIT tail
    from pg_select_order. */
 static int pg_explain(mvx_file *fh, const mvx_pred *preds, int npred,
-                      const char *ocol, int otext, int64_t limit,
-                      char *out, size_t cap) {
+                      const char *ocol, int64_t oattr, int onum, int otext,
+                      int64_t limit, char *out, size_t cap) {
     pg_file *f = (pg_file *)fh;
     if (npred < 0 || npred > 32) return 0;
+    /* An ORDER BY only where select_order would actually push one: a mapped
+       column, or a RAW attribute sorted numerically.  A raw TEXT order is not
+       pushable, and the caller does not ask for one here — it falls through to
+       a plan that says the verb sorts.  Rendering it anyway would describe a
+       query this driver never runs (#172). */
+    int order = (ocol && ocol[0]) || (oattr >= 1 && onum);
     char qt[512];
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
     char sql[4000];
@@ -1494,11 +1500,18 @@ static int pg_explain(mvx_file *fh, const mvx_pred *preds, int npred,
                               i ? " AND " : " WHERE ", expr);
         if (lit) PQfreemem(lit);
     }
-    if (ocol && ocol[0]) {
-        char *qo = PQescapeIdentifier(f->conn, ocol, strlen(ocol));
-        p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s%s",
-                              qo ? qo : "\"\"", otext ? " COLLATE \"C\"" : "");
-        if (qo) PQfreemem(qo);
+    if (order) {
+        char ordbuf[1800];
+        if (ocol && ocol[0]) {
+            char *qc = PQescapeIdentifier(f->conn, ocol, strlen(ocol));
+            snprintf(ordbuf, sizeof ordbuf, "%s%s", qc ? qc : "\"\"",
+                     otext ? " COLLATE \"C\"" : "");
+            if (qc) PQfreemem(qc);
+        } else {
+            pg_order_expr(oattr, onum, ordbuf, sizeof ordbuf);
+        }
+        p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", ordbuf);
+        if (p >= sizeof sql) return 0;
     }
     if (limit > 0)
         snprintf(sql + p, sizeof sql - p, " LIMIT %lld", (long long)limit);

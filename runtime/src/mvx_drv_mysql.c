@@ -1364,10 +1364,16 @@ static mvx_cursor *my_select_join(mvx_file *srch, int64_t sk,
 /* ------------------------------------------------------------ explain */
 
 static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
-                      const char *ocol, int otext, int64_t limit,
-                      char *out, size_t cap) {
+                      const char *ocol, int64_t oattr, int onum, int otext,
+                      int64_t limit, char *out, size_t cap) {
     my_file *f = (my_file *)fh;
-    (void)otext;
+    (void)otext;                          /* mysql collates bytes already */
+    /* An ORDER BY only where select_order would actually push one: a mapped
+       column, or a RAW attribute sorted numerically.  A raw TEXT order is not
+       pushable, and the caller does not ask for one here — it falls through to
+       a plan that says the verb sorts.  Rendering it anyway would describe a
+       query this driver never runs (#172). */
+    int order = (ocol && ocol[0]) || (oattr >= 1 && onum);
     char qt[300], sql[6000];
     quote_ident(f->table, qt, sizeof qt);
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT id FROM %s", qt);
@@ -1382,10 +1388,12 @@ static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
                               i ? " AND " : " WHERE ", ex);
         if (p >= sizeof sql) return 0;
     }
-    if (ocol && ocol[0]) {
-        char qo[300];
-        quote_ident(ocol, qo, sizeof qo);
+    if (order) {
+        char qo[2600];
+        if (ocol && ocol[0]) quote_ident(ocol, qo, sizeof qo);
+        else my_order_expr(oattr, onum, qo, sizeof qo);
         p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", qo);
+        if (p >= sizeof sql) return 0;
     }
     if (limit > 0)
         snprintf(sql + p, sizeof sql - p, " LIMIT %lld", (long long)limit);

@@ -249,13 +249,16 @@ typedef struct mvx_driver {
        an SQL backend that is the SQL text; a document store would render its
        native query.  Inputs match select_multi (the AND'd predicates) plus an
        optional ORDER BY column (`otext` -> byte-order collation to match MV's
-       sort) and LIMIT (0 = none).  Writes a NUL-terminated plan into `out`
+       sort) and LIMIT (0 = none).  `ocol` NULL with `oattr` set is an order on
+       a RAW attribute, exactly as select_order takes it — DESCRIBE has to
+       render the plan that would actually run, and since #157 that includes an
+       order on a field with no mapped column (#172).  Writes a NUL-terminated plan into `out`
        (truncated to `cap`); returns 1 if it rendered a server-side plan, 0 if
        it cannot (the caller then words the client-side fallback itself).  This
        is what backs the verbs' DESCRIBE modifier. */
     int (*explain)(mvx_file *f, const mvx_pred *preds, int npred,
-                   const char *ocol, int otext, int64_t limit,
-                   char *out, size_t cap);
+                   const char *ocol, int64_t oattr, int onum, int otext,
+                   int64_t limit, char *out, size_t cap);
     /* Optional (may be NULL): the number of ids a cursor snapshotted, so a
        long backfill can show a percentage.  select_begin captures the id list
        up front, so this is known at no extra cost.  NULL = total unknown. */
@@ -379,7 +382,7 @@ typedef struct mvx_file_base {
  * file created before the stamp existed has no note either. */
 #define MVX_FILE_FORMAT 2
 
-#define MVX_DRIVER_ABI 13
+#define MVX_DRIVER_ABI 14
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

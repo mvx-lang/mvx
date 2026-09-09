@@ -1194,9 +1194,15 @@ static mvx_cursor *sq_select_join(mvx_file *srch, int64_t sk,
  * select_multi/select_order so the description cannot drift from the
  * query: if this says it pushes, that is the statement that executes. */
 static int sq_explain(mvx_file *fh, const mvx_pred *preds, int npred,
-                      const char *ocol, int otext, int64_t limit,
-                      char *out, size_t cap) {
+                      const char *ocol, int64_t oattr, int onum, int otext,
+                      int64_t limit, char *out, size_t cap) {
     sq_file *f = (sq_file *)fh;
+    /* An ORDER BY only where select_order would actually push one: a mapped
+       column, or a RAW attribute sorted numerically.  A raw TEXT order is not
+       pushable, and the caller does not ask for one here — it falls through to
+       a plan that says the verb sorts.  Rendering it anyway would describe a
+       query this driver never runs (#172). */
+    int order = (ocol && ocol[0]) || (oattr >= 1 && onum);
     char qt[300];
     quote_ident(f->table, qt, sizeof qt);
     char sql[4096];
@@ -1204,22 +1210,28 @@ static int sq_explain(mvx_file *fh, const mvx_pred *preds, int npred,
     for (int i = 0; i < npred; i++) {
         const char *o = sql_op(preds[i].op);
         if (!o) return 0;                     /* cannot push: caller words it */
-        char ex[400];
-        field_expr(preds[i].col, preds[i].attr, ex, sizeof ex);
-        if (preds[i].numeric)
-            p += (size_t)snprintf(sql + p, sizeof sql - p,
-                                  "%sCAST(%s AS REAL) %s CAST(? AS REAL)",
-                                  i ? " AND " : " WHERE ", ex, o);
-        else
-            p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s ?",
-                                  i ? " AND " : " WHERE ", ex, o);
+        /* sq_pred, not a hand-rolled comparison: an attribute predicate is a
+           per-value EXISTS since #157, and rendering it any other way here
+           describes a query the driver does not run (#172). */
+        char ex[900], ph[16];
+        snprintf(ph, sizeof ph, "?%d", i + 1);
+        sq_pred(preds[i].col, preds[i].attr, o, ph, preds[i].numeric,
+                ex, sizeof ex);
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : " WHERE ", ex);
         if (p >= sizeof sql) return 0;
     }
-    if (ocol && ocol[0]) {
-        char qo[300];
-        quote_ident(ocol, qo, sizeof qo);
-        p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s%s",
-                              qo, otext ? " COLLATE BINARY" : "");
+    if (order) {
+        char qo[1600];
+        if (ocol && ocol[0]) {
+            char qc[300];
+            quote_ident(ocol, qc, sizeof qc);
+            snprintf(qo, sizeof qo, "%s%s", qc, otext ? " COLLATE BINARY" : "");
+        } else {
+            sq_order_expr(oattr, onum, qo, sizeof qo);
+        }
+        p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", qo);
+        if (p >= sizeof sql) return 0;
     }
     if (limit > 0)
         snprintf(sql + p, sizeof sql - p, " LIMIT %lld", (long long)limit);
