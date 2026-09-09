@@ -1,4 +1,5 @@
---- a version this runtime has
+--- a version this runtime has (derived, not hardcoded: a CI
+    checkout has no tags and reports 0.0.0-dev)
 linked @TESTROOT@/reqpkg
 --- one it has not
 @TESTROOT@/reqpkg needs mvx >=9.9.9, but this is @RUNTIME@

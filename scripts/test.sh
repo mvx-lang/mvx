@@ -990,11 +990,15 @@ reqtest() { # reqtest <manifest-requirement> -> the LINK-PKG line
   # would make this test fail on the next commit rather than on a regression,
   # so both are tokenised -- what is asserted is that it refused and said what
   # it wanted, not which build happened to run it.
-  "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1 | head -1 | normalise \
+  # The LAST line is the decision.  An untagged build (every CI run) prints a
+  # warning first, so head -1 would capture that here and the decision there.
+  "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1 | tail -1 | normalise \
     | sed -E -e 's/(but this is ).*/\1@RUNTIME@/'
 }
 check tcl-requires "$( \
-  echo '--- a version this runtime has'; reqtest '!mvx>=0.1.0' a; \
+  echo '--- a version this runtime has (derived, not hardcoded: a CI'; \
+  echo '    checkout has no tags and reports 0.0.0-dev)'; \
+  reqtest "!mvx>=$(printf '%s' "$VER" | sed -E 's/-.*//')" a; \
   echo '--- one it has not'; reqtest '!mvx>=9.9.9' b; \
   echo '--- an ABI it has'; reqtest '!mvx-abi>=1' c; \
   echo '--- one it has not'; reqtest '!mvx-abi>=99' d; \

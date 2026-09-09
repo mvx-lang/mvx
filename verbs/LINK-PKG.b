@@ -176,6 +176,18 @@ STOP
       IF RQHAVE < RQWANT THEN REQOK = 0
    CASE RQNAME = "mvx"
       RQHAVE = MVXVERSION()
+      * AN UNKNOWN VERSION WARNS, IT DOES NOT REFUSE.  A build from an
+      * untagged checkout -- every CI run and most developer trees -- reports
+      * 0.0.0-dev, and refusing everything then would block all package use on
+      * exactly the builds people work in.  The issue asks for a refusal only
+      * where "the version data is reliable"; here it says out loud that it is
+      * not.  The ABI below is always reliable, being a compile-time constant,
+      * so that one still refuses.
+      IF RQHAVE[1, 5] = "0.0.0" THEN
+         PRINT "warning: ":CUR:" wants mvx ":RQOP:RQWANT:
+         PRINT ", and this build does not know its version (":RQHAVE:")"
+         RETURN
+      END
       GOSUB 9400
       IF VCMP < 0 THEN REQOK = 0
    CASE 1
