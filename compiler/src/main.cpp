@@ -20,6 +20,8 @@
 // Errors go to stderr as "item:line: message" — parseable; the BASIC verb
 // will consume this later, so treat the format as an interface.
 
+#include "mvx_driver.h"   /* MVX_DRIVER_ABI, reported by --version */
+
 #include "codegen.h"
 #include "parser.h"
 #include "preprocess.h"
@@ -76,6 +78,7 @@ fs::path runtimeLibDir() {
 int usage() {
     std::cerr <<
         "usage: mvx-basic [options] file.b [file.b|file.o ...]\n"
+        "  --version    print the toolchain version and exit\n"
         "  -c           compile to object only (no link)\n"
         "  -o <path>    output path\n"
         "  -shared      produce a shared subroutine library\n"
@@ -102,8 +105,16 @@ void readExports(const fs::path &exportsFile, std::set<std::string> &out) {
 // system-installed packages (aggregated <system>/EXPORTS) plus, when compiling
 // in an account, that account's linked packages (PACKAGES -> each <pkg>/EXPORTS).
 // No per-compile flag: inclusion is configuration.
+// Built into libmvxrt, so they are callable with no package installed and
+// nothing to link (#169).  Seeded here rather than read from <system>/EXPORTS
+// because a built-in must not depend on a system account existing: `mvx-basic`
+// run against a bare tree still has to compile JSONENCODE.  Keep in step with
+// register_builtins() in runtime/src/mvx_ext.c.
+static const char *const kBuiltinExtFuncs[] = {"JSONENCODE", "JSONDECODE"};
+
 std::set<std::string> loadExtFuncs() {
     std::set<std::string> out;
+    for (const char *n : kBuiltinExtFuncs) out.insert(n);
     fs::path sys;
     if (const char *s = getenv("MVXSYSTEM"); s && *s) sys = s;
     else sys = exeDir().parent_path() / "system";
@@ -135,6 +146,12 @@ std::string shellQuote(const std::string &s) {
 } // namespace
 
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++)
+        if (std::string(argv[i]) == "--version") {   /* #117 */
+            std::printf("mvx-basic %s (driver ABI %d)\n",
+                        MVX_VERSION, MVX_DRIVER_ABI);
+            return 0;
+        }
     bool compileOnly = false, shared = false;
     mvx::CodegenOptions cg;
     std::string outPath;

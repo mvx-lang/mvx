@@ -221,11 +221,24 @@ typedef struct mvx_driver {
        mapped column `ocol` (text ordered COLLATE "C" to match MV's byte sort
        when `otext`, else natural order), limited to `limit` rows (0 = all),
        optionally filtered like the other push-downs.  So a "top-N by field"
-       fetches N ids server-side.  NULL result = cannot push (caller sorts). */
+       fetches N ids server-side.  NULL result = cannot push (caller sorts).
+
+       When `ocol` is NULL the sort field is the RAW attribute `oattr`, taken
+       from the document (#157) — mapped columns still exist and are still
+       typed, so they keep the `ocol` path; this is the case that used to fall
+       back to the verb because there was no column to name.  `onum` says the
+       dictionary calls it numeric, which is the same flag MV's own sort uses.
+
+       A NUMERIC sort of a raw attribute MUST be cast in the GUARDED form:
+       postgres and mongo fail the whole query on one un-castable value, while
+       sqlite and mysql silently read it as 0.  And the order MV produces is
+       numbers ascending FIRST, then the values that are not numbers — NOT the
+       other way round, whatever #157's prose says; it was measured against the
+       verb, which is the only authority on what a push-down has to reproduce. */
     mvx_cursor *(*select_order)(mvx_file *f, const char *fcol, int64_t fattr,
                                 const char *fop, const char *fval,
-                                int64_t fvlen, const char *ocol, int otext,
-                                int64_t limit);
+                                int64_t fvlen, const char *ocol, int64_t oattr,
+                                int onum, int otext, int64_t limit);
     /* Optional multi-condition WITH push-down (may be NULL): the ids matching
        every predicate (AND).  Each `mvx_pred` names a mapped column `col` or
        the raw record attribute `attr`, an op ("=","#",">","<",">=","<="), and
@@ -236,13 +249,16 @@ typedef struct mvx_driver {
        an SQL backend that is the SQL text; a document store would render its
        native query.  Inputs match select_multi (the AND'd predicates) plus an
        optional ORDER BY column (`otext` -> byte-order collation to match MV's
-       sort) and LIMIT (0 = none).  Writes a NUL-terminated plan into `out`
+       sort) and LIMIT (0 = none).  `ocol` NULL with `oattr` set is an order on
+       a RAW attribute, exactly as select_order takes it — DESCRIBE has to
+       render the plan that would actually run, and since #157 that includes an
+       order on a field with no mapped column (#172).  Writes a NUL-terminated plan into `out`
        (truncated to `cap`); returns 1 if it rendered a server-side plan, 0 if
        it cannot (the caller then words the client-side fallback itself).  This
        is what backs the verbs' DESCRIBE modifier. */
     int (*explain)(mvx_file *f, const mvx_pred *preds, int npred,
-                   const char *ocol, int otext, int64_t limit,
-                   char *out, size_t cap);
+                   const char *ocol, int64_t oattr, int onum, int otext,
+                   int64_t limit, char *out, size_t cap);
     /* Optional (may be NULL): the number of ids a cursor snapshotted, so a
        long backfill can show a percentage.  select_begin captures the id list
        up front, so this is known at no extra cost.  NULL = total unknown. */
@@ -307,6 +323,26 @@ typedef struct mvx_driver {
        write).  Only the caller that started one may commit or roll it back;
        an inner bracket that returned 0 must do neither. */
     int (*rollback)(mvx_file *f);
+
+    /* Convert every file in `loc` from the pre-#157 record blob to the
+       document form, in place.  Optional (NULL where a driver never stored a
+       blob, e.g. the local key-value backends, whose records ARE the bytes).
+       Location-wide rather than per file because a file in the old format
+       cannot be opened at all: `open` refuses it, and LISTF does not list it —
+       the enumeration has to come from the backend's own catalogue.
+       Returns the number of files converted, or -1 with `err` set.  Idempotent:
+       a file already in the document form is skipped, not rewritten. */
+    int (*migrate_docs)(const char *loc, char *err, size_t errlen);
+
+    /* Bytes a mapped TEXT column can hold, or 0 for "no practical limit"
+       (may be NULL, meaning the same).  Native mode reads a mapped attribute
+       back from its COLUMN, so a value the column cannot hold is a value the
+       record loses — and the runtime cannot know the width without asking:
+       mysql bounds its mapped columns at InnoDB's index key limit, while
+       postgres and sqlite do not bound them at all.  map_validate_one uses
+       this to refuse MAP-MODE native rather than let the switch quietly
+       shorten, or drop, a record (mvx#174). */
+    int64_t (*map_text_cap)(mvx_file *f);
 } mvx_driver;
 
 /* map_backfill sentinel: the transform is not expressible in this backend, so
@@ -331,7 +367,22 @@ typedef struct mvx_file_base {
    It must return NULL if `abi` is not an ABI version it supports,
    otherwise its driver vtable.  The search path is $MVXDRIVERS
    (colon-separated), then the runtime's built-in driver directory. */
-#define MVX_DRIVER_ABI 11
+/* The stored-file format a build understands.
+ *
+ *   1  the record is an opaque blob (pre-#157)
+ *   2  the record is a JSON document, one field per attribute
+ *
+ * Where the backend can carry a text note on the table — postgres and mysql
+ * both can — the drivers stamp `mvx: format=N` there, so the database says
+ * what it is and a DBA reading the schema can see it.  sqlite has no comment
+ * syntax at all (a comment written into CREATE TABLE does not survive: it
+ * normalises the DDL it stores) and mongo has no collection metadata, so on
+ * those the version is INFERRED from the shape — a `rec` column means 1, a
+ * `doc` column means 2.  The inference is the fallback everywhere, because a
+ * file created before the stamp existed has no note either. */
+#define MVX_FILE_FORMAT 2
+
+#define MVX_DRIVER_ABI 14
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

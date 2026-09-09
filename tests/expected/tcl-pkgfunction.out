@@ -1,0 +1,9 @@
+BUILD-PKG: . — 2 item(s) built, 0 error(s)
+--- both built into LIB/, not attempted as programs
+SHOUT
+TWICE
+linked @TESTROOT@/fnpkg
+[244] USEFN cataloged
+--- and a DEFFUN call resolves across the boundary
+TWICE=42
+SHOUT=HELLO!

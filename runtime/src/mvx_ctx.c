@@ -15,6 +15,7 @@
 #endif
 
 #include "mvx_runtime.h"
+#include "mvx_driver.h"   /* MVX_DRIVER_ABI, for SYSTEM(1001) */
 #include "mv_bytes.h"
 
 #include <dlfcn.h>
@@ -351,6 +352,27 @@ static void term_size(int64_t *w, int64_t *h) {
     *h = (l && atoi(l) > 0) ? atoi(l) : 24;
 }
 
+/* MVXVERSION(): the version, as text, because "0.1.4-27-g8646adc" is not a
+   number and SYSTEM() is typed as one.  Pair it with SYSTEM(1001) for the ABI:
+   the version says which release, the ABI says what a compiled artifact can
+   still be loaded by. */
+void mv_mvx_version(mv_value *dst) {
+    const char *v = mvx_version();
+    mv_set_str(dst, v, (int64_t)strlen(v));
+}
+
+/* The version this toolchain was built as -- the git tag, baked in by CMake.
+   "0.0.0-dev" when it was built from a checkout with no tag, which no
+   `requires` range satisfies: saying "unknown" is better than claiming a
+   version the binary may not have (#117). */
+const char *mvx_version(void) {
+#ifdef MVX_VERSION
+    return MVX_VERSION;
+#else
+    return "0.0.0-dev";
+#endif
+}
+
 void mv_system_fn(mvx_ctx *ctx, mv_value *dst, const mv_value *code) {
     int64_t s, ms;
     int64_t tw, th;
@@ -362,6 +384,20 @@ void mv_system_fn(mvx_ctx *ctx, mv_value *dst, const mv_value *code) {
     case 3:                        /* terminal depth, classic */
         term_size(&tw, &th);
         mv_set_int(dst, th);
+        return;
+    case 1001:                     /* the storage-driver ABI this runtime
+                                      speaks (#117).  A binary artifact -- a
+                                      driver, a package's compiled LIB -- is
+                                      tied to this number, not to the release
+                                      version: two releases with the same ABI
+                                      are interchangeable to it, and a bump is
+                                      exactly what makes an old one unloadable.
+                                      1000+ is MVX's own range; classic Pick
+                                      has no code for this, and squatting on a
+                                      low number another MV uses for something
+                                      else would be worse than an obviously
+                                      ours one. */
+        mv_set_int(dst, MVX_DRIVER_ABI);
         return;
     case 11:                       /* select list active? */
         mv_set_int(dst, mvx_list_active(ctx));

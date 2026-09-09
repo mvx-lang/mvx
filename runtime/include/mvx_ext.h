@@ -55,6 +55,12 @@ typedef struct mvx_ext {
 typedef const mvx_ext *(*mvx_ext_entry_fn)(int abi);
 const mvx_ext *mvx_ext_entry(int abi);
 
+/* Built-in extension tables: compiled into libmvxrt rather than dlopen'd, so
+   their functions exist with no package installed and nothing to link (#169).
+   Each provider returns its table; mvx_ext.c registers them before any library
+   is loaded, so a package cannot shadow a built-in name. */
+const mvx_ext *mvx_json_builtin(void);  /* JSONENCODE / JSONDECODE */
+
 /* Runtime side (mvx_ext.c), linked into libmvxrt. */
 void mvx_ext_load_libs(void);           /* dlopen package LIB/ libs (shared with CALL) */
 int  mvx_ext_has(const char *name);     /* is `name` a registered extension function? */

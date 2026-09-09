@@ -30,6 +30,8 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
+
+#include "mvx_driver.h"   /* MVX_DRIVER_ABI, stamped into every artifact */
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -77,7 +79,7 @@ const std::set<std::string> kIntIntrinsics = {
     "LEN", "COUNT", "DCOUNT", "SEQ", "INDEX", "NUM", "STATUS", "ALPHA", "CATALOGED",
     "CREATEFILE", "DELETEFILE", "COMPILE", "DATE",
     "INDEXBUILD", "INDEXDROP", "INDEXSELECT", "RND", "MAPBUILD", "MAPDROP",
-    "MAPCHECK", "QUERYSELECT", "TRANSSELECT", "QUERYCOUNT", "ORDERSELECT",
+    "MAPCHECK", "MAPRESTORE", "QUERYSELECT", "TRANSSELECT", "QUERYCOUNT", "ORDERSELECT",
     "MULTISELECT", "TRANSORDERSELECT",
     "OSWRITE", "OSDELETE", "OSEXEC", "MKDIR", "RMTREE", "UNTAR",
     "EDITFILE", "SETCRED", "SETCONN",
@@ -456,6 +458,44 @@ private:
         return slot;
     }
 
+    /* A literal operand's boxed value never changes, so it does not need
+       rebuilding on every pass of a loop.  The banked sieve marks a flag
+       with `BANK(B)<1,P> = 0` and tests it with `= 0`, and both were calling
+       mv_set_int per iteration to remake the same constant (#130).
+       Built once in the entry block and reused.
+
+       ONLY for operands that are read.  A CALL passes its arguments by
+       reference and a subroutine may assign to a parameter, so emitCall
+       keeps using a fresh temp -- sharing one there would let a callee
+       rewrite the constant for every later use of it. */
+    Value *constPtr(const Expr &e) {
+        std::string key;
+        if (e.kind == Expr::K::IntLit)      key = "i" + std::to_string(e.ival);
+        else if (e.kind == Expr::K::StrLit) key = "s" + e.sval;
+        else return nullptr;                       // not a literal: caller falls back
+        auto it = constPool_.find(key);
+        if (it != constPool_.end()) return it->second;
+        IRBuilder<>::InsertPoint save = b_.saveIP();
+        b_.SetInsertPoint(eb_.GetInsertBlock(), eb_.GetInsertPoint());
+        Value *slot = newSlot("k");
+        if (e.kind == Expr::K::IntLit)
+            callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_},
+                   {slot, ConstantInt::get(i64Ty_, e.ival)});
+        else
+            callRt("mv_set_str", voidTy_, {ptrTy_, ptrTy_, i64Ty_},
+                   {slot, stringConst(e.sval),
+                    ConstantInt::get(i64Ty_, (int64_t)e.sval.size())});
+        b_.restoreIP(save);
+        constPool_[key] = slot;
+        return slot;
+    }
+    /* evalPtr, but a literal comes from the constant pool. */
+    Value *evalPtrRO(const Expr &e) {
+        if (Value *k = constPtr(e)) return k;
+        return evalPtr(e);
+    }
+    std::map<std::string, Value *> constPool_;
+
     Value *acquireTemp() {
         if (tempUsed_ == tempPool_.size())
             tempPool_.push_back(newSlot());
@@ -763,6 +803,11 @@ private:
                               {ptrTy_, ptrTy_, ptrTy_},
                               {ctxArg_, evalPtr(*e.args[0]),
                                evalPtr(*e.args[1])});
+            if (f == "MAPRESTORE" && e.args.size() == 2)
+                return callRt("mvx_maprestore", i64Ty_,
+                              {ptrTy_, ptrTy_, ptrTy_},
+                              {ctxArg_, evalPtr(*e.args[0]),
+                               evalPtr(*e.args[1])});
             if (f == "MAPCHECK" && e.args.size() == 2)
                 return callRt("mvx_mapcheck", i64Ty_,
                               {ptrTy_, ptrTy_, ptrTy_},
@@ -907,7 +952,7 @@ private:
             return t;
         }
         if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0 &&
-            e.sval != "@USER.TYPE")
+            e.sval != "@USER.TYPE" && e.sval != "@SENTENCE")
             return getScalar(e.sval, e.line);
         if (e.kind == Expr::K::Paren && arrayNames_.count(e.sval))
             return arrayElemPtr(e);
@@ -936,6 +981,17 @@ private:
                     ConstantInt::get(i64Ty_, (int64_t)e.sval.size())});
             return;
         case Expr::K::Var: {
+            if (e.sval == "@SENTENCE") {
+                /* @SENTENCE is what UniData and UniVerse populate; mvx had
+                   only the SENTENCE() function, so portable code needed an
+                   $IFDEF MVX between the two spellings (#97).  Same source,
+                   so they cannot disagree -- and it was not even reserved
+                   before, so a program using the U2 spelling got an ordinary
+                   unassigned variable and silently read nothing. */
+                callRt("mv_sentence", voidTy_, {ptrTy_, ptrTy_},
+                       {ctxArg_, dest});
+                return;
+            }
             if (e.sval == "@USER.TYPE") {          // session type (0 = interactive)
                 callRt("mv_user_type", voidTy_, {ptrTy_, ptrTy_},
                        {ctxArg_, dest});
@@ -1068,10 +1124,18 @@ private:
                    {ctxArg_, dest, evalPtr(*e.args[0]), evalPtr(*e.args[1]),
                     evalPtr(*e.args[2]), evalPtr(*e.args[3])});
             return; }
-        if (f == "IEVAL") { need(2);
+        if (f == "IEVAL") {
+            /* IEVAL(rec, spec) still works; IEVAL(rec, spec, DICT) resolves
+               the bare names in an arithmetic I-type against that
+               dictionary (#121). */
+            if (e.args.size() != 2 && e.args.size() != 3)
+                err(e.line, "IEVAL takes 2 or 3 arguments");
+            llvm::Value *dv = e.args.size() == 3
+                                ? evalPtr(*e.args[2])
+                                : llvm::ConstantPointerNull::get(ptrTy_);
             callRt("mvx_ieval", voidTy_,
-                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_},
-                   {ctxArg_, dest, evalPtr(*e.args[0]), evalPtr(*e.args[1])});
+                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_, ptrTy_},
+                   {ctxArg_, dest, evalPtr(*e.args[0]), evalPtr(*e.args[1]), dv});
             return; }
         if (f == "QUERYSUM") { need(6);
             callRt("mvx_querysum", voidTy_,
@@ -1136,6 +1200,9 @@ private:
         if (f == "MOUSE") { need(0);
             callRt("mv_mouse", voidTy_, {ptrTy_, ptrTy_},
                    {ctxArg_, dest});
+            return; }
+        if (f == "MVXVERSION") { need(0);
+            callRt("mv_mvx_version", voidTy_, {ptrTy_}, {dest});
             return; }
         if (f == "SENTENCE") { need(0);
             callRt("mv_sentence", voidTy_, {ptrTy_, ptrTy_},
@@ -1299,8 +1366,8 @@ private:
                     default:        return b_.CreateFCmpOGE(l, r);
                     }
                 }
-                Value *pa = evalPtr(*e.lhs);
-                Value *pb = evalPtr(*e.rhs);
+                Value *pa = evalPtrRO(*e.lhs);
+                Value *pb = evalPtrRO(*e.rhs);
                 Value *c = callRt("mv_compare", i64Ty_, {ptrTy_, ptrTy_},
                                   {pa, pb});
                 Value *zero = ConstantInt::get(i64Ty_, 0);
@@ -1473,9 +1540,19 @@ private:
             break;
         case Stmt::K::Stop:
             if (s.value) {
-                // STOP <code>: end the whole program with a process exit status.
-                Value *code = b_.CreateTrunc(asI64(*s.value), i32Ty_);
-                callRt("mvx_exit", voidTy_, {i32Ty_}, {code});
+                // STOP/ABORT <expr>.  The operand is passed as a VALUE, not
+                // forced to a number here: an MV value has no compile-time
+                // type, and asI64 on a concatenation emitted invalid IR that
+                // aborted inside LLVM (#120).  The runtime decides -- numeric
+                // is an exit status, anything else is a message.
+                callRt("mvx_stop_value", voidTy_, {ptrTy_, i32Ty_},
+                       {evalPtr(*s.value),
+                        llvm::ConstantInt::get(i32Ty_, s.isAbort ? 1 : 0)});
+                b_.CreateUnreachable();
+            } else if (s.isAbort) {
+                callRt("mvx_stop_value", voidTy_, {ptrTy_, i32Ty_},
+                       {llvm::ConstantPointerNull::get(ptrTy_),
+                        llvm::ConstantInt::get(i32Ty_, 1)});
                 b_.CreateUnreachable();
             } else if (prog_.isSubroutine) {
                 // STOP ends the whole program, not just the subroutine.
@@ -1982,7 +2059,7 @@ private:
             else
                 err(t.line, "dynamic-array assignment target must be a "
                             "variable or array element");
-            Value *val = evalPtr(*s.value);
+            Value *val = evalPtrRO(*s.value);
             callRt("mv_replace_fn", voidTy_,
                    {ptrTy_, ptrTy_, i64Ty_, i64Ty_, i64Ty_, ptrTy_},
                    {bp, bp, subIdx(t, 0), subIdx(t, 1), subIdx(t, 2), val});
@@ -2504,6 +2581,29 @@ void CodeGen::run(const std::string &outPath) {
     mod_.addModuleFlag(Module::Warning, "Debug Info Version",
                        DEBUG_METADATA_VERSION);
     mod_.addModuleFlag(Module::Warning, "Dwarf Version", 4);
+
+    /* STAMP THE ARTIFACT WITH WHAT BUILT IT (#117).
+       The binary is the thing with the hard dependency, not the source, so
+       the answer has to travel inside it -- a sidecar file gets separated
+       from the .dylib it describes on the first copy.  Two symbols, readable
+       by dlsym at load time and by `nm` from a shell:
+
+         mvx_built_abi      the driver ABI this was compiled against
+         mvx_built_version  the release it was compiled by
+
+       weak_odr, because linking several objects into one program would
+       otherwise be a duplicate-symbol error; identical values merge. */
+    {
+        auto *abi = new GlobalVariable(
+            mod_, i32Ty_, true, GlobalValue::WeakODRLinkage,
+            ConstantInt::get(i32Ty_, MVX_DRIVER_ABI), "mvx_built_abi");
+        abi->setVisibility(GlobalValue::DefaultVisibility);
+        Constant *vs = ConstantDataArray::getString(llctx_, MVX_VERSION, true);
+        auto *ver = new GlobalVariable(
+            mod_, vs->getType(), true, GlobalValue::WeakODRLinkage, vs,
+            "mvx_built_version");
+        ver->setVisibility(GlobalValue::DefaultVisibility);
+    }
 
     buildFunction();
 

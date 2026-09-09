@@ -246,8 +246,10 @@ void    mvx_trans(mvx_ctx *ctx, mv_value *dst, const mv_value *fname,
                   const mv_value *control);
 /* IEVAL(rec, ispec): evaluate an I-descriptor (TRANS/DOCTAG) against a record
    — the runtime I-type evaluator the query verbs share. */
+const char *mvx_version(void);   /* the toolchain version, for #117 checks */
+void    mv_mvx_version(mv_value *dst);   /* MVXVERSION(): the same, as a value */
 void    mvx_ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
-                  const mv_value *spec);
+                  const mv_value *spec, const mv_value *dictf);
 int64_t mvx_open(mvx_ctx *ctx, const mv_value *dict, const mv_value *spec,
                  mv_value *fvar);
 int64_t mvx_read(mvx_ctx *ctx, mv_value *rec, const mv_value *fvar,
@@ -308,6 +310,10 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
 int64_t mvx_mapdrop(mvx_ctx *ctx, const mv_value *fvar,
                     const mv_value *spec);
 /* Count records failing native validation (0 = clean), -2 unsupported. */
+/* Rewrite each record's document with its mapped attributes filled in from
+   the columns — what going back from native to mirror needs (#157). */
+int64_t mvx_maprestore(mvx_ctx *ctx, const mv_value *fvar,
+                       const mv_value *spec);
 int64_t mvx_mapcheck(mvx_ctx *ctx, const mv_value *fvar,
                      const mv_value *spec);
 int     mvx_openaccount(void);   /* open account format on? ($MVX_OPENACCOUNT) */
@@ -392,6 +398,8 @@ int64_t mv_val_chars(const mv_value *v, char *numbuf, size_t cap,
 void mvx_fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 void mvx_stop(void) __attribute__((noreturn));      /* STOP: end the program */
 void mvx_exit(int32_t code) __attribute__((noreturn)); /* STOP <code>: exit status */
+/* STOP/ABORT <expr>: numeric -> exit status, otherwise print and stop (#120) */
+void mvx_stop_value(const mv_value *v, int32_t abort_) __attribute__((noreturn));
 void mvx_arity_check(const char *name, int32_t expected, int32_t got);
 
 /* Compiled main programs export this; the runtime crt calls it. */

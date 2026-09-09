@@ -24,6 +24,64 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MVX="$ROOT/build/bin/mvx-basic"
 TCL="$ROOT/build/bin/mvx"
+
+# --- packages under test ------------------------------------------------
+# The packages are separate products with their own releases; mvx no longer
+# carries them as submodules (#169).  The tests that exercise LINK-PKG fetch a
+# PINNED release and build it with mkpkg.sh -- exactly what they used to do to
+# the submodule working tree, except the tree is now the one users install.
+#
+# The SOURCE tarball, not the mvx binary artifact: mkpkg.sh compiles the
+# package here, and the published mvx binaries are linux-x86_64 only, so a
+# binary artifact would make this suite unrunnable on any other host.
+#
+# Bump a version here deliberately.  A pinned version is why a failure means
+# "mvx broke", not "a package released this morning".
+PKG_VERSION_cmd=1.4.1
+PKG_VERSION_getopt=1.1.0
+PKG_VERSION_git=2.0.3
+PKG_ASSET_cmd=cmd
+PKG_ASSET_getopt=getopt
+PKG_ASSET_git=mvx-lang_git
+PKG_REPO_cmd=mvx-lang/mv_cmd
+PKG_REPO_getopt=mvx-lang/getopt
+PKG_REPO_git=mvx-lang/mv_git
+
+# Cached across runs so a re-run is offline and fast; blow it away to re-fetch.
+#
+# Laid out as <cache>/pkgs/<name> -- BY NAME, no version in the directory --
+# because LINK-PKG resolves a dependency by looking for a sibling of that name
+# ("searched: linked packages, <pkg>/../, $MVXPKGPATH").  Versioned directory
+# names silently broke that: linking git stopped pulling cmd and getopt, and
+# the test still passed as far as exit status went -- only the recorded output
+# showed one `linked` line where there had been three.  The pinned version
+# lives in a stamp file instead, so a bump still re-fetches.
+PKGCACHE="${MVX_PKG_CACHE:-$ROOT/.pkgcache}"
+
+pkg_dir() { # pkg_dir <name> -> path to the unpacked, mkpkg-built package
+  _pn="$1"
+  eval "_pv=\$PKG_VERSION_$_pn"; eval "_pa=\$PKG_ASSET_$_pn"; eval "_pr=\$PKG_REPO_$_pn"
+  _pd="$PKGCACHE/pkgs/$_pn"
+  if [ "$(cat "$_pd/.version" 2>/dev/null)" != "$_pv" ]; then
+    rm -rf "$_pd"; mkdir -p "$_pd"
+    _url="https://github.com/$_pr/releases/download/$_pv/$_pa-$_pv-source.tar.gz"
+    if ! curl -fsSL "$_url" | tar xzf - -C "$_pd" 2>/dev/null; then
+      rm -rf "$_pd"
+      echo "test.sh: could not fetch $_pn $_pv from $_url" >&2
+      echo "         (set MVX_PKG_CACHE to a cache holding pkgs/$_pn to run offline)" >&2
+      exit 1
+    fi
+    printf '%s\n' "$_pv" > "$_pd/.version"
+  fi
+  # MVX_ROOT explicitly.  A package with a native part (git) finds the runtime
+  # headers at <pkg>/../.. by default, which happened to be the mvx tree only
+  # because the package sat in $ROOT/packages/.  Out of that position the
+  # default resolves to the cache directory and the native build fails --
+  # quietly, leaving a package whose GIT verb is missing while the suite still
+  # ran.  Say where the tree is instead of relying on where the package sits.
+  MVX_ROOT="$ROOT" "$ROOT/scripts/mkpkg.sh" "$_pd" >/dev/null
+  printf '%s' "$_pd"
+}
 EXP="$ROOT/tests/expected"
 
 BLESS=0
@@ -74,10 +132,15 @@ normalise() {
   # Substitute absolute roots, then collapse the column padding that
   # trails a substituted path.  A verb that FMT-pads a path column (e.g.
   # LIST-PKGS) sizes the padding from the *absolute* path length, which
-  # differs by platform; @ROOT@ hides the path but not the trailing
+  # differs by platform; the token hides the path but not the trailing
   # spaces, so squeeze 2+ spaces after a normalised path token to one.
-  sed -E -e "s#$TESTROOT#@TESTROOT@#g" -e "s#$ROOT#@ROOT@#g" \
-         -e "s#(@(TEST)?ROOT@[^ ]*)  +#\1 #g" \
+  # EVERY token has to be in that list.  @PKG@ was not, and the padding
+  # for a fetched package's path then depended on where the checkout
+  # lived -- passing here and failing on the CI runner (#169).
+  sed -E -e "s#$TESTROOT#@TESTROOT@#g" \
+         -e "s#$PKGCACHE/pkgs#@PKG@#g" \
+         -e "s#$ROOT#@ROOT@#g" \
+         -e "s#(@(TESTROOT|ROOT|PKG)@[^ ]*)  +#\1 #g" \
          -e 's/^([a-z][a-z0-9_-]*)@[0-9][^ ]* +/\1@VER /'
 }
 
@@ -664,6 +727,139 @@ check tcl-multiwith "$( \
 # DESCRIBE (#51) on a local (LMDB) file: no SQL backend, so the plan states the
 # selection resolves in the driver and the verb applies the conditions. An SQL
 # backend renders the actual query instead (tcl-pgdescribe). MWF reused.
+# The R83 command stack (#114).  Semantics are D3's, from the Pick Systems
+# Reference Manual: only UNIQUE commands are kept, entry 1 is the most recent,
+# and re-running or editing an entry moves it to the top.  Those three rules
+# are what make the numbers mean anything, so they are what is asserted here
+# rather than just "the dot commands do not error".
+#
+# MVXSTACK points the stack somewhere disposable; without it these would write
+# to whoever is running the suite.
+STK="$TESTROOT/stack"
+stk() { rm -f "$STK"; MVXSTACK="$STK" "$TCL" -a "$ACCT" 2>&1; }
+check tcl-stack "$( \
+  printf 'COUNT VOC\nLISTF\nCOUNT VOC\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- .L n and .L m-n'; \
+  printf 'A1\nA2\nA3\nA4\n.L 2\n.L 2-3\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- .X n runs it and pops it to the top'; \
+  printf 'COUNT VOC\nLISTF\n.X 2\n.L\n' | stk | grep -E '^ +[0-9]+ |record\(s\) counted'; \
+  echo '--- .R n/old/new edits, and the edit moves to the top'; \
+  printf 'COUNT VOC\nLISTF\n.R 2/COUNT/CT\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- .DE, .DE n, .DE n/str'; \
+  printf 'A1\nA2\nA3\n.DE\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  printf 'A1\nA2\nA3\nA4\n.DE 2\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  printf 'A1\nA2\nA3\nA4\n.DE 3/A2\n.L\n' | stk | grep -E '^ +[0-9]+ '; \
+  echo '--- a bad entry number is refused, not guessed at'; \
+  printf 'WHO\n.X 9\n.R 9\n.R 1/nope/x\n.L junk\n' | stk | grep -E '^\[1[0-9]+\]'; \
+  echo '--- a dot command is not itself stacked'; \
+  printf 'WHO\n.L\n.L\n' | stk | grep -E '^ +[0-9]+ ' | tail -2; \
+  echo '--- .FOO is a verb, not a stack command'; \
+  printf '.FOO\n' | stk | tail -1)"
+
+# STOP / ABORT with a string operand (#120).  `STOP "cannot open ":FN` is the
+# ordinary portable idiom and it used to abort the COMPILER inside LLVM with
+# invalid IR; a plain `STOP "no"` failed as an "internal error"; and ABORT was
+# not a statement at all.  Classic Pick prints the message and stops, so a
+# numeric operand stays an exit status and anything else is a message.
+stopcase() { # stopcase <source> -> "<stdout+stderr>|<exit status>"
+  printf '%s\n' "$1" > "$TESTROOT/stopc.b"
+  if ! "$MVX" "$TESTROOT/stopc.b" -o "$TESTROOT/stopc" 2>"$TESTROOT/stopc.err"; then
+    printf 'COMPILE FAILED: %s' "$(head -1 "$TESTROOT/stopc.err")"
+    return
+  fi
+  out="$("$TESTROOT/stopc" 2>&1)"; printf '%s|%s' "$out" "$?"
+}
+check tcl-stopstring "$( \
+  echo '--- the concatenated operand that used to crash the compiler'; \
+  stopcase 'FN = "STATES"
+IF FN = "STATES" THEN STOP "cannot open ":FN
+PRINT "not reached"'; echo; \
+  echo '--- a plain string operand'; \
+  stopcase 'STOP "no"'; echo; \
+  echo '--- a numeric operand is still an exit status'; \
+  stopcase 'STOP 3'; echo; \
+  echo '--- and bare STOP is still a clean end'; \
+  stopcase 'PRINT "ran"
+STOP'; echo; \
+  echo '--- ABORT, with and without a message'; \
+  stopcase 'ABORT "gave up"'; echo; \
+  stopcase 'ABORT'; echo)"
+
+# Arithmetic and aggregate I-types (#121).  The evaluator used to handle TRANS
+# and DOCTAG only and returned "" for everything else, so the commonest kind of
+# I-type there is -- arithmetic over sibling attributes -- listed as a blank
+# column with nothing said.  Values are internal (24900 is $249.00 under MD2$),
+# which is what the arithmetic operates on.
+IACC="$TESTROOT/iacct"; mkdir -p "$IACC"
+"$TCL" -a "$IACC" -c 'CREATE-FILE IORD' >/dev/null 2>&1
+cat > "$TESTROOT/iseed.b" <<'IEOF'
+OPEN "IORD" TO F ELSE STOP
+WRITE "Acme":@AM:"4":@VM:"10":@VM:"3":@AM:"24900":@VM:"1250":@VM:"100" ON F, "1001"
+OPEN "DICT", "IORD" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Customer":@AM:"10L" ON D, "CUST"
+WRITE "D":@AM:"2":@AM:"":@AM:"Qty":@AM:"5R":@AM:"LINES" ON D, "QTY"
+WRITE "D":@AM:"3":@AM:"MD2$":@AM:"Price":@AM:"10R":@AM:"LINES" ON D, "PRICE"
+WRITE "I":@AM:"QTY * PRICE":@AM:"MD2$":@AM:"Ext":@AM:"10R":@AM:"LINES" ON D, "EPRICE"
+WRITE "I":@AM:"SUM(EPRICE)":@AM:"MD2$":@AM:"Total":@AM:"12R" ON D, "TOT"
+WRITE "I":@AM:"(QTY + 1) * 2":@AM:"":@AM:"Parens":@AM:"8R":@AM:"LINES" ON D, "PAR"
+WRITE "I":@AM:"0 - QTY":@AM:"":@AM:"Neg":@AM:"8R":@AM:"LINES" ON D, "NEG"
+WRITE "I":@AM:"QTY / 0":@AM:"":@AM:"DivZero":@AM:"8R":@AM:"LINES" ON D, "DZ"
+WRITE "I":@AM:"NOT AN EXPRESSION((":@AM:"":@AM:"Bad":@AM:"8L" ON D, "BAD"
+IEOF
+"$MVX" "$TESTROOT/iseed.b" -o "$TESTROOT/iseed" >/dev/null 2>&1
+(cd "$IACC" && MVXACCOUNT=. "$TESTROOT/iseed" >/dev/null 2>&1)
+check tcl-ityped "$( \
+  echo '--- per-value extension, and the SUM that folds it'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD QTY PRICE EPRICE TOT' 2>/dev/null; \
+  echo '--- parentheses, unary minus, and a divide by zero that does not abort'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD PAR NEG DZ' 2>/dev/null; \
+  echo '--- WITH selects on an arithmetic I-type'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD CUST TOT WITH TOT > "100000"' 2>/dev/null; \
+  echo '--- and a spec it cannot parse is REPORTED, not silently blank'; \
+  "$TCL" -a "$IACC" -c 'LIST IORD CUST BAD' 2>&1 >/dev/null)"
+
+# TCL macros and the stack's macro forms (#177).  D3's model: a VOC item whose
+# attribute 1 is M (show each command for editing) or N (run it), one command
+# per attribute after that, and parameters typed after the name reaching the
+# FIRST command only.  The M path off a terminal prints each command before
+# running it, which is the half of "display then execute" that survives a pipe.
+MACC="$TESTROOT/macct"; mkdir -p "$MACC"
+"$TCL" -a "$MACC" -c 'CREATE-FILE VOC' >/dev/null 2>&1
+cat > "$TESTROOT/mkmac.b" <<'MACEOF'
+OPEN "VOC" TO V ELSE STOP
+WRITE "N":@AM:"COUNT":@AM:"LISTF" ON V, "NMAC"
+WRITE "M":@AM:"COUNT":@AM:"LISTF" ON V, "MMAC"
+WRITE "N":@AM:"COUNT":@VM:"stacked" ON V, "SMAC"
+MACEOF
+"$MVX" "$TESTROOT/mkmac.b" -o "$TESTROOT/mkmac" >/dev/null 2>&1
+(cd "$MACC" && MVXACCOUNT=. "$TESTROOT/mkmac" >/dev/null 2>&1)
+mstk() { rm -f "$STK"; MVXSTACK="$STK" "$TCL" -a "$MACC" 2>&1; }
+check tcl-macro "$( \
+  echo '--- N runs each command; the parameter reaches only the first'; \
+  printf 'NMAC VOC\n' | mstk | grep -E 'record\(s\) counted|^VOC '; \
+  echo '--- M shows each command before running it'; \
+  printf 'MMAC VOC\n' | mstk | grep -E '^COUNT VOC$|^LISTF$|record\(s\) counted'; \
+  echo '--- .C files a macro from stack entries, .C again refuses, .CO replaces'; \
+  printf 'COUNT VOC\nLISTF\n.C MK 2,1\n.C MK 1\n.CO MK 1\n' | mstk \
+    | grep -E 'created|exists'; \
+  echo '--- and it was filed in D3 form'; \
+  printf 'CT VOC MK\n' | mstk | grep -E '^00[12] '; \
+  echo '--- a verb still wins over a macro of the same name'; \
+  printf 'COUNT VOC\n' | mstk | grep -E 'record\(s\) counted'; \
+  echo '--- .X name, and a missing one is reported'; \
+  printf '.X MK\n.X NOPE\n' | mstk | grep -E '^\[13|^LISTF$'; \
+  echo '--- stacked input is refused out loud, not dropped in silence'; \
+  printf 'SMAC VOC\n' | mstk | grep -E '^\[1321\]')"
+
+# An existing libedit history file has to become the stack, not be discarded
+# and not be shown back with its own format header as entry 1.
+printf '_HiStOrY_V2_\nOLD ONE\nOLD TWO\n' > "$TESTROOT/mig"
+check tcl-stack-migrate "$( \
+  printf '.L\n' | MVXSTACK="$TESTROOT/mig" "$TCL" -a "$ACCT" 2>&1 | grep -E '^ +[0-9]+ '; \
+  printf 'WHO\n' | MVXSTACK="$TESTROOT/mig" "$TCL" -a "$ACCT" >/dev/null 2>&1; \
+  echo '--- and the header is gone from the file'; \
+  head -3 "$TESTROOT/mig")"
+
 check tcl-describe "$( \
   printf '%s\n' \
     'LIST DESCRIBE MWF STATE WITH STATE = "NSW"' \
@@ -726,23 +922,175 @@ printf 'I\nDOCTAG(file)\n\nFile\n10L\n' > "$ACCT/BP.DICT/FILE"
 printf 'I\nDOCTAG(version)\n\nVersion\n8L\n' > "$ACCT/BP.DICT/VERSION"
 check tcl-docblock "$(printf 'LIST BP FILE VERSION\n' | tclrun)"
 
-# packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/getopt" >/dev/null
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/cmd" >/dev/null
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/git" >/dev/null
+# packages: build, link (dependency pulls cmd -> getopt), GIT help, unlink rules.
+# @SENTENCE, the spelling UniData and UniVerse populate (#97).  mvx had only
+# the SENTENCE() function, so portable code carried an $IFDEF MVX between the
+# two -- and @SENTENCE was not even reserved, so the U2 spelling compiled as an
+# ordinary unassigned variable and silently read nothing.  Both forms now come
+# from one source, which is what stops them disagreeing.
+SNA="$TESTROOT/sentacct"; mkdir -p "$SNA/BP"
+"$ROOT/scripts/mkaccount.sh" "$SNA" >/dev/null 2>&1
+printf 'PRINT "fn: ":SENTENCE()\nPRINT "at: ":@SENTENCE\n' > "$SNA/BP/SHOWSENT"
+MVXPRIV=developer "$TCL" -a "$SNA" -c 'CATALOG BP SHOWSENT' >/dev/null 2>&1
+printf '@SENTENCE = "nope"\n' > "$TESTROOT/rosent.b"
+check tcl-atsentence "$( \
+  echo '--- both spellings, through a cataloged verb from TCL'; \
+  "$TCL" -a "$SNA" -c 'SHOWSENT alpha beta' 2>&1; \
+  echo '--- and it is read-only, like any system variable'; \
+  "$MVX" "$TESTROOT/rosent.b" -o "$TESTROOT/rosent" 2>&1 | sed 's#.*/##')"
+
+# The toolchain says what it is, and a package can say what it needs (#117).
+# Two numbers answering different questions: the VERSION is which release, and
+# is what a `requires` range is matched against; the DRIVER ABI is what decides
+# whether a compiled artifact can be loaded at all.
+#
+# The version is a git describe, so it differs per checkout -- these assert the
+# SHAPE and the decisions, never the value.
+VER="$("$TCL" -c 'VERSION SHORT' 2>&1)"
+ABI="$("$TCL" -c 'VERSION ABI' 2>&1)"
+case "$VER" in
+  [0-9]*.[0-9]*) PASS=$((PASS+1)); echo "  VERSION reports a dotted version" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL VERSION SHORT: '$VER'" ;;
+esac
+case "$ABI" in
+  [0-9]*) PASS=$((PASS+1)); echo "  VERSION ABI reports a number" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL VERSION ABI: '$ABI'" ;;
+esac
+# the CLI and the verb must agree -- two places to report one fact is two
+# places for it to drift
+CLIV="$("$TCL" --version 2>&1)"
+case "$CLIV" in
+  *"$VER"*"$ABI"*) PASS=$((PASS+1)); echo "  --version agrees with the verb" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL --version '$CLIV' vs verb '$VER'/'$ABI'" ;;
+esac
+# every compiled artifact carries what built it, so the binary answers the
+# question rather than a sidecar file that gets separated from it
+printf 'SUBROUTINE STAMPED(X)\nX = "hi"\n' > "$TESTROOT/stamped.b"
+"$MVX" -shared "$TESTROOT/stamped.b" -o "$TESTROOT/stamped.lib" >/dev/null 2>&1
+if nm -g "$TESTROOT/stamped.lib" 2>/dev/null | grep -q "mvx_built_abi"; then
+  PASS=$((PASS+1)); echo "  a compiled artifact is stamped with its ABI"
+else
+  FAIL=$((FAIL+1)); echo "FAIL no mvx_built_abi in a compiled artifact"
+fi
+# and a library needing a NEWER ABI is refused, by name, instead of loading and
+# failing later as an undefined symbol
+STA="$TESTROOT/stampacct"; mkdir -p "$STA/LIB"
+"$ROOT/scripts/mkaccount.sh" "$STA" >/dev/null 2>&1
+printf 'const int mvx_built_abi = 99;\nconst char mvx_built_version[] = "9.9.9";\nvoid mvx_sub_FAKE(void) {}\n' \
+  > "$TESTROOT/fakeabi.c"
+# .dylib on macOS, .so elsewhere -- the loader scans for its own suffix
+LIBSFX=.so
+[ "$(uname)" = Darwin ] && LIBSFX=.dylib
+if cc -shared -o "$STA/LIB/FAKE$LIBSFX" "$TESTROOT/fakeabi.c" 2>/dev/null; then
+  printf 'CALL NOSUCHSUB\n' > "$TESTROOT/callit.b"
+  "$MVX" "$TESTROOT/callit.b" -o "$TESTROOT/callit" >/dev/null 2>&1
+  ab="$( (cd "$STA" && MVXACCOUNT=. "$TESTROOT/callit") 2>&1 | head -1)"
+  case "$ab" in
+    *"needs driver ABI 99"*"speaks"*) PASS=$((PASS+1))
+      echo "  a too-new library is refused, naming both ABIs" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL too-new library: $ab" ;;
+  esac
+else
+  echo "  (skipping the ABI-stamp refusal — no cc)"
+fi
+# a package declares what it needs, and LINK-PKG refuses rather than letting the
+# failure arrive later as an undefined symbol
+RQP="$TESTROOT/reqpkg"; mkdir -p "$RQP"
+printf '# MVX account descriptor\nname=reqpkg\nversion=1\n' > "$RQP/.mvx"
+reqtest() { # reqtest <manifest-requirement> -> the LINK-PKG line
+  printf 'reqpkg\n1.0.0\ndesc\nmvx\n%s\n' "$1" > "$RQP/PKG"
+  d="$TESTROOT/rq$2"; mkdir -p "$d"
+  "$ROOT/scripts/mkaccount.sh" "$d" >/dev/null 2>&1
+  # The refusal names what this runtime IS, and that changes with every commit
+  # (the version is a git describe) and on every ABI bump.  Blessing either
+  # would make this test fail on the next commit rather than on a regression,
+  # so both are tokenised -- what is asserted is that it refused and said what
+  # it wanted, not which build happened to run it.
+  # The LAST line is the decision.  An untagged build (every CI run) prints a
+  # warning first, so head -1 would capture that here and the decision there.
+  "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1 | tail -1 | normalise \
+    | sed -E -e 's/(but this is ).*/\1@RUNTIME@/'
+}
+# The ABI cases are the same everywhere -- it is a compile-time constant -- so
+# they go in a fixture.
+check tcl-requires "$( \
+  echo '--- an ABI this runtime has'; reqtest '!mvx-abi>=1' c; \
+  echo '--- one it has not'; reqtest '!mvx-abi>=99' d; \
+  echo '--- and a requirement it does not understand is ignored, not fatal'; \
+  reqtest '!something-else>=3' e)"
+
+# The VERSION cases are NOT the same everywhere, and that is the behaviour
+# rather than a flaw in the test: a tagged build knows what it is and refuses a
+# version it does not have; an untagged one (every CI checkout) says so and
+# continues.  Asserting the rule covers both, where a fixture could only ever
+# match the machine it was blessed on.
+case "$VER" in
+  0.0.0*) vknown=0 ;;
+  *)      vknown=1 ;;
+esac
+r="$(reqtest '!mvx>=9.9.9' f)"
+if [ "$vknown" = 1 ]; then
+  case "$r" in
+    *"needs mvx >=9.9.9"*) PASS=$((PASS+1))
+      echo "  a version this build has not is refused" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL tagged build should refuse >=9.9.9: $r" ;;
+  esac
+else
+  case "$r" in
+    *linked*) PASS=$((PASS+1))
+      echo "  an untagged build warns about a version it cannot check, and links" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL untagged build should warn, not refuse: $r" ;;
+  esac
+fi
+r="$(reqtest "!mvx>=$(printf '%s' "$VER" | sed -E 's/-.*//')" g)"
+case "$r" in
+  *linked*) PASS=$((PASS+1)); echo "  a version this build does have is accepted" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL should accept its own version: $r" ;;
+esac
+
+# A package can export a FUNCTION, and a DEFFUN'd caller resolves it across the
+# package boundary (#101).  BUILD-PKG and CATALOG classified only SUBROUTINE as
+# library-producing, so a FUNCTION was compiled as a PROGRAM and the link failed
+# on a missing _mvx_main -- which is why getopt had to ship subroutine accessors
+# (CALL GETOPT.VAL("m", MSG)) instead of the function-style OPT("m").
+#
+# The ABI was never the problem and this does not change it: the compiler already
+# marks a FUNCTION isSubroutine and reserves argv[0] for the result, and the call
+# site already passes it there.  Only the classification was missing.
+FNPKG="$TESTROOT/fnpkg"; mkdir -p "$FNPKG/BP"
+printf '# MVX account descriptor\nname=fnpkg\nversion=1\n' > "$FNPKG/.mvx"
+printf 'fnpkg\n1.0.0\nfunctions across a package boundary\n' > "$FNPKG/PKG"
+printf 'FUNCTION TWICE(X)\nRETURN(X * 2)\n' > "$FNPKG/BP/TWICE"
+printf 'FUNCTION SHOUT(S)\nRETURN(OCONV(S, "MCU"):"!")\n' > "$FNPKG/BP/SHOUT"
+FNACC="$TESTROOT/fnacc"; mkdir -p "$FNACC/BP"
+"$ROOT/scripts/mkaccount.sh" "$FNACC" >/dev/null 2>&1
+printf 'DEFFUN TWICE(1)\nDEFFUN SHOUT(1)\nPRINT "TWICE=":TWICE(21)\nPRINT "SHOUT=":SHOUT("hello")\n' \
+  > "$FNACC/BP/USEFN"
+check tcl-pkgfunction "$( \
+  MVXPRIV=developer "$TCL" -a "$FNPKG" -c 'BUILD-PKG .' 2>&1; \
+  echo '--- both built into LIB/, not attempted as programs'; \
+  ls "$FNPKG/LIB" 2>/dev/null | grep -v dSYM | sed 's/\.[a-z]*$//' | sort; \
+  "$TCL" -a "$FNACC" -c "LINK-PKG $FNPKG" 2>&1 | normalise; \
+  MVXPRIV=developer "$TCL" -a "$FNACC" -c 'CATALOG BP USEFN' 2>&1; \
+  echo '--- and a DEFFUN call resolves across the boundary'; \
+  (cd "$FNACC" && MVXACCOUNT=. ./CATALOG/USEFN) 2>&1 | normalise)"
+
+# Fetched and built once here, reused by every package test below.
+PKG_GETOPT="$(pkg_dir getopt)"
+PKG_CMD="$(pkg_dir cmd)"
+PKG_GIT="$(pkg_dir git)"
 check tcl-packages "$(printf '%s\n' \
-  "LINK-PKG $ROOT/packages/git" \
+  "LINK-PKG $PKG_GIT" \
   'LIST-PKGS' \
   'GIT' \
-  "UNLINK-PKG $ROOT/packages/cmd" \
-  "UNLINK-PKG $ROOT/packages/git" \
-  "UNLINK-PKG $ROOT/packages/cmd" | tclrun)"
+  "UNLINK-PKG $PKG_CMD" \
+  "UNLINK-PKG $PKG_GIT" \
+  "UNLINK-PKG $PKG_CMD" | tclrun)"
 
 # getopt: the declarative option parser exercised through the real LINK-PKG path.
 # A consumer verb declares flags once; GETOPT.PARSE splits the sentence (quoted
 # multi-word value, --flag, positionals) and the accessors read the result out
 # of COMMON /GETOPT/ across the package boundary.
-"$ROOT/scripts/mkpkg.sh" "$ROOT/packages/getopt" >/dev/null
 GOP="$TESTROOT/gotest"
 mkdir -p "$GOP/BP" "$GOP/VOC"
 printf 'gotest\n1.0\ngetopt consumer\nmvx\n' > "$GOP/PKG"
@@ -760,9 +1108,9 @@ EOF
 printf 'V\nCATALOG/GOTEST' > "$GOP/VOC/GOTEST"
 check tcl-getopt "$( \
   printf 'BUILD-PKG %s\n' "$GOP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
-  printf '%s\n' "LINK-PKG $ROOT/packages/getopt" "LINK-PKG $GOP" \
+  printf '%s\n' "LINK-PKG $PKG_GETOPT" "LINK-PKG $GOP" \
     'GOTEST -m "hi there" one --open two' \
-    "UNLINK-PKG $GOP" "UNLINK-PKG $ROOT/packages/getopt" | tclrun)"
+    "UNLINK-PKG $GOP" "UNLINK-PKG $PKG_GETOPT" | tclrun)"
 
 # cmd declarative flags: a subcommand declares flags with CMD.FLAG; CMD.RUN parses
 # the sentence against them via getopt and the handler reads GETOPT.VAL/HAS/ARG.
@@ -789,11 +1137,11 @@ EOF
 printf 'V\nCATALOG/CFTEST' > "$CFP/VOC/CFTEST"
 check tcl-cmdflags "$( \
   printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
-  printf '%s\n' "LINK-PKG $ROOT/packages/getopt" "LINK-PKG $ROOT/packages/cmd" "LINK-PKG $CFP" \
+  printf '%s\n' "LINK-PKG $PKG_GETOPT" "LINK-PKG $PKG_CMD" "LINK-PKG $CFP" \
     'CFTEST COMMIT -m "hello world" --all f1 f2' \
     'CFTEST COMMIT --help' \
     'CFTEST COMMIT -z' \
-    "UNLINK-PKG $CFP" "UNLINK-PKG $ROOT/packages/cmd" "UNLINK-PKG $ROOT/packages/getopt" | tclrun)"
+    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun)"
 
 # native package build: BUILD-PKG compiles a package's BP -> CATALOG/LIB
 # through the runtime (no shell, no mkpkg on PATH), needing only developer
@@ -1280,7 +1628,7 @@ EOF
   printf 'OPEN "CUST" TO F ELSE STOP\nWRITE "Ada":@AM:"London" ON F, "C1"\n' > "$TESTROOT/vba.b"
   "$MVX" "$TESTROOT/vba.b" -o "$TESTROOT/vba.bin" 2>/dev/null
   (cd "$VBA" && MVXACCOUNT=. "$TESTROOT/vba.bin") >/dev/null
-  "$TCL" -a "$VBA" -c "LINK-PKG $ROOT/packages/git" >/dev/null 2>&1
+  "$TCL" -a "$VBA" -c "LINK-PKG $PKG_GIT" >/dev/null 2>&1
   "$TCL" -a "$VBA" -c 'GIT INIT' >/dev/null 2>&1
   "$TCL" -a "$VBA" -c 'GIT CONFIG user.name t' >/dev/null 2>&1
   "$TCL" -a "$VBA" -c 'GIT CONFIG user.email t@t' >/dev/null 2>&1
@@ -1320,7 +1668,7 @@ GSEOF
 "$MVX" "$gseed" -o "$TESTROOT/gseedbin" 2>/dev/null
 (cd "$GACCT" && MVXACCOUNT=. "$TESTROOT/gseedbin")
 check tcl-gitnative "$( \
-  printf "LINK-PKG $ROOT/packages/git\nGIT INIT\nGIT ADD CUST\nGIT STATUS\nGIT COMMIT -m initial\nGIT LOG\n" | \
+  printf "LINK-PKG $PKG_GIT\nGIT INIT\nGIT ADD CUST\nGIT STATUS\nGIT COMMIT -m initial\nGIT LOG\n" | \
     "$TCL" -a "$GACCT" 2>&1 \
       | normalise \
       | sed -E -e 's/[0-9a-f]{7,40}/HASH/g' \
@@ -1382,7 +1730,7 @@ DCEOF
 "$MVX" "$custom" -o "$TESTROOT/dcustombin" 2>/dev/null
 check tcl-delivery "$( \
   export MVXACCOUNT="$DACCT"; \
-  { printf "LINK-PKG $ROOT/packages/git\nGIT INIT\nGIT ADD MENU\nGIT COMMIT -m stock\nGIT BRANCH site\nGIT CHECKOUT site\n" | "$TCL" -a "$DACCT" 2>&1; \
+  { printf "LINK-PKG $PKG_GIT\nGIT INIT\nGIT ADD MENU\nGIT COMMIT -m stock\nGIT BRANCH site\nGIT CHECKOUT site\n" | "$TCL" -a "$DACCT" 2>&1; \
     (cd "$DACCT" && "$TESTROOT/dcustombin"); \
     printf 'GIT ADD MENU\nGIT COMMIT -m acme-custom\nGIT CHECKOUT main\nGIT CHERRY-PICK site\nCT MENU M9\nGIT BRANCH\n' | "$TCL" -a "$DACCT" 2>&1; \
   } | sed -E 's/\[[0-9a-f]{7,40}\]/[HASH]/g; s/^[0-9a-f]{7,40} /HASH /g' | normalise; \
@@ -1404,7 +1752,7 @@ IGEOF
 "$MVX" "$igseed" -o "$TESTROOT/igseedbin" 2>/dev/null
 (cd "$IGACCT" && MVXACCOUNT=. "$TESTROOT/igseedbin")
 check tcl-gitignore "$(printf '%s\n' \
-  "LINK-PKG $ROOT/packages/git" \
+  "LINK-PKG $PKG_GIT" \
   'GIT INIT' \
   'GIT IGNORE ORDERS' \
   'GIT ADD ORDERS' \
@@ -1846,8 +2194,10 @@ FTEOF
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE BY PRICE FIRST 2' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE BY STATE FIRST 2' 2>&1)"
 
-  # range push-down (#48): numeric range pushes NULLIF(mvx_attr,'')::numeric;
-  # text range falls back to the scan. Result must equal the local tcl-range.
+  # range push-down (#48): a numeric range pushes the GUARDED cast of the
+  # document field (a bare ::numeric fails the whole query on one non-numeric
+  # value, #157); a text range falls back to the scan.  Result must equal the
+  # local tcl-range.
   check tcl-pgrange "$( \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE WITH PRICE > "500" BY @ID' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT FSTP STATE PRICE WITH PRICE <= "450" BY @ID' 2>&1; \
@@ -1877,14 +2227,19 @@ MWEOF
 
   # DESCRIBE (#51): the verb renders the backend query it would run instead of
   # running it — an identity-column equality, a numeric range on the blob, an
-  # ORDER BY / LIMIT push, and a non-pushable @ID condition that scans and
-  # filters in the verb.  Reuses MWP (mapped STATE, PRICE above).
+  # ORDER BY / LIMIT push, the same push with no FIRST behind it, a text sort
+  # of a mapped column, and a non-pushable @ID condition that scans and filters
+  # in the verb.  Reuses MWP (mapped STATE, PRICE above).  The two plain-BY
+  # cases are #172: an ORDER BY was only ever described when a FIRST came with
+  # it, so a bare BY reported a sort in the verb that was not happening.
   # DESCRIBE / EXPLAIN work both right after the verb and trailing the
   # sentence — same plan either way — so the cases mix the two positions.
   check tcl-pgdescribe "$( \
     "$TCL" -a "$PGACCT" -c 'LIST DESCRIBE MWP STATE WITH STATE = "NSW"' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'LIST MWP WITH STATE = "NSW" AND PRICE > "500" DESCRIBE' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'SORT EXPLAIN MWP BY PRICE FIRST 3' 2>&1; \
+    "$TCL" -a "$PGACCT" -c 'SORT MWP BY PRICE DESCRIBE' 2>&1; \
+    "$TCL" -a "$PGACCT" -c 'SORT MWP BY STATE DESCRIBE' 2>&1; \
     "$TCL" -a "$PGACCT" -c 'LIST MWP WITH @ID = "O1" DESCRIBE' 2>&1)"
 
   # cross-process record locks (#16), including the mapped association subtables:
@@ -2311,19 +2666,28 @@ PDNEOF
       "$TCL" -a "$VMACCT" -c 'LIST PDN NAME CREDIT WITH CREDIT = "1500"' 2>&1)"
 
     # expression indexes (#43): CREATE-INDEX on an un-mapped field builds a
-    # Postgres expression index on the blob (via the IMMUTABLE mvx_attr
-    # helper), so the blob push-down becomes an index scan. A mapped identity
-    # field still gets a column index. PDN has STATE mapped, TIER unmapped.
+    # Postgres expression index on the document field the push-down uses, so
+    # that push-down becomes an index scan.  It needed an IMMUTABLE mvx_attr()
+    # installed into the schema until records became documents (#157); doc->>'n'
+    # is built in.  A mapped identity field still gets a column index.
+    # PDN has STATE mapped, TIER unmapped.
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX PDN STATE' >/dev/null 2>&1
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX PDN TIER' >/dev/null 2>&1
-    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%mvx_attr(rec, 4)%' \
+    # The unmapped attribute indexes the document field the push-down uses.
+    # It was mvx_attr(rec, 4) — a function this driver had to install — until
+    # records became documents (#157); postgres renders the expression as
+    # ((doc ->> '4'::text)).
+    IDXDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%COALESCE%doc ->> ''4''%' \
       THEN 'expression' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_TIER_idx'")
     STDEF=$(psql_ext "SELECT CASE WHEN indexdef LIKE '%(\"STATE\")%' \
       THEN 'column' ELSE 'other' END FROM pg_indexes \
       WHERE schemaname='vmtest' AND indexname='PDN_STATE_idx'")
+    # The expression must be IDENTICAL to the one the driver builds, or the
+    # index does not match it.  Both come from pg_attr_expr, COALESCE included
+    # (an attribute past the end reads as empty in MV, #157).
     EXPLN=$(psql_ext "SET enable_seqscan=off; EXPLAIN SELECT id FROM \
-      vmtest.\"PDN\" WHERE vmtest.mvx_attr(rec,4)='gold'")
+      vmtest.\"PDN\" WHERE COALESCE(doc->>'4','')='gold'")
     USES=$(printf '%s' "$EXPLN" | grep -q 'PDN_TIER_idx' && echo yes || echo no)
     check tcl-exprindex "$(printf '%s\n' \
       "TIER (unmapped) index kind: $IDXDEF" \
@@ -2345,7 +2709,7 @@ RIXEOF
     "$MVX" "$TESTROOT/vmrix.b" -o "$TESTROOT/vmrixbin" 2>/dev/null
     (cd "$VMACCT" && MVXACCOUNT=. "$TESTROOT/vmrixbin")
     "$TCL" -a "$VMACCT" -c 'CREATE-INDEX RIX STATE' >/dev/null 2>&1
-    rixkind() { psql_ext "SELECT CASE WHEN indexdef LIKE '%mvx_attr%' THEN \
+    rixkind() { psql_ext "SELECT CASE WHEN indexdef LIKE '%doc ->>%' THEN \
       'expression' WHEN indexdef LIKE '%(\"STATE\")%' THEN 'column' ELSE '?' \
       END FROM pg_indexes WHERE schemaname='vmtest' AND indexname='RIX_STATE_idx'"; }
     RBEFORE=$(rixkind)
@@ -2442,9 +2806,68 @@ SQDEOF
   esac
   desc="$("$TCL" -a "$SQA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
   case "$desc" in
-    *"SELECT id FROM"*"mvx_attr"*) PASS=$((PASS+1))
+    *"SELECT id FROM"*"json_extract(doc,"*) PASS=$((PASS+1))
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL sqlite push-down plan: $desc" ;;
+  esac
+
+  # DESCRIBE tells the truth about the ORDER BY push (#172).  DESCRIBE has one
+  # job -- say what would run -- so it is only worth anything if it tracks the
+  # push-down rules exactly.  It used to describe an ORDER BY only when a FIRST
+  # was present, and could not describe an order on an unmapped attribute at
+  # all, so two of the three arms below reported "sorted in the verb" while the
+  # driver was in fact sorting.  DSC maps NAME and leaves CITY/QTY raw, which
+  # is what makes all three arms reachable from one file.
+  "$TCL" -a "$SQA" -c 'CREATE-FILE DSC' >/dev/null 2>&1
+  cat > "$TESTROOT/sqdsc.b" <<'DSCEOF'
+OPEN "DSC" TO F ELSE PRINT "no DSC" ; STOP
+WRITE "Ada":@AM:"London":@AM:"30" ON F, "D1"
+WRITE "Bob":@AM:"Paris":@AM:"7" ON F, "D2"
+WRITE "Cy":@AM:"Berlin":@AM:"200" ON F, "D3"
+OPEN "DICT", "DSC" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L" ON D, "CITY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"4R" ON D, "QTY"
+DSCEOF
+  "$MVX" "$TESTROOT/sqdsc.b" -o "$TESTROOT/sqdsc" >/dev/null 2>&1
+  (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdsc" >/dev/null 2>&1)
+  "$TCL" -a "$SQA" -c 'CREATE-MAP DSC NAME' >/dev/null 2>&1
+  # 1. mapped column, plain BY with no FIRST -- an ORDER BY, no LIMIT
+  d1="$("$TCL" -a "$SQA" -c 'SORT DSC BY NAME DESCRIBE' 2>&1)"
+  case "$d1" in
+    *'ORDER BY "NAME"'*LIMIT*) FAIL=$((FAIL+1))
+      echo "FAIL sqlite plain-BY plan has a LIMIT nobody asked for: $d1" ;;
+    *'ORDER BY "NAME"'*) PASS=$((PASS+1))
+      echo "  a plain BY on a mapped column is described as an ORDER BY" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite plain-BY plan: $d1" ;;
+  esac
+  # 2. RAW numeric attribute -- the guarded cast, the same expression
+  #    sq_order_expr builds for the query itself
+  d2="$("$TCL" -a "$SQA" -c 'SORT DSC BY QTY DESCRIBE' 2>&1)"
+  case "$d2" in
+    *"ORDER BY"*"CAST("*"AS REAL)"*"json_extract(doc,'\$.\"3\"')"*) PASS=$((PASS+1))
+      echo "  a numeric BY on an unmapped attribute is described too" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite raw-numeric BY plan: $d2" ;;
+  esac
+  # 3. RAW text attribute -- NOT pushable (MV's byte order over a whole
+  #    multivalued attribute is not what a column sort produces), so the plan
+  #    must still say the verb sorts.  Without this arm the fix could pass by
+  #    describing an ORDER BY for everything.
+  d3="$("$TCL" -a "$SQA" -c 'SORT DSC BY CITY DESCRIBE' 2>&1)"
+  case "$d3" in
+    *"ORDER BY"*) FAIL=$((FAIL+1))
+      echo "FAIL sqlite raw-text BY described as pushed, but it is not: $d3" ;;
+    *"sorted in the verb"*) PASS=$((PASS+1))
+      echo "  a text BY on an unmapped attribute still sorts in the verb" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite raw-text BY plan: $d3" ;;
+  esac
+  # 4. and the pushed order is the order MV wants: 7, 30, 200 numerically,
+  #    not "200" < "30" < "7" as bytes.  The plan above is only worth
+  #    printing if the query it names returns this.
+  o4="$("$TCL" -a "$SQA" -c 'SORT DSC BY QTY' 2>&1 | sed -n 's/^\(D[0-9]\).*/\1/p' | tr -d '\n')"
+  case "$o4" in
+    D2D1D3) PASS=$((PASS+1)); echo "  the pushed numeric order is MV's order" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL sqlite pushed numeric order: got '$o4', want D2D1D3" ;;
   esac
   # MAPPING WITH AN ASSOCIATION -- the multi-table write.  A record's parent
   # columns go in the base table and each association's values become rows in a
@@ -2652,10 +3075,81 @@ MYDEOF
   esac
   desc="$("$TCL" -a "$MYA" -c 'LIST CUST WITH CITY = "London" DESCRIBE' 2>&1)"
   case "$desc" in
-    *"SELECT id FROM"*"SUBSTRING_INDEX"*) PASS=$((PASS+1))
+    *"SELECT id FROM"*"JSON_EXTRACT(doc,"*) PASS=$((PASS+1))
       echo "  WITH is pushed into SQL, not scanned in the verb" ;;
     *) FAIL=$((FAIL+1)); echo "FAIL mysql push-down plan: $desc" ;;
   esac
+  # ...and the ORDER BY push is described as well (#172).  QTY is attribute 3
+  # and unmapped, so this is the raw-attribute arm, on a plain BY with no
+  # FIRST -- the two conditions that DESCRIBE used to leave out.
+  dord="$("$TCL" -a "$MYA" -c 'SORT CUST BY QTY DESCRIBE' 2>&1)"
+  case "$dord" in
+    *"ORDER BY"*"REGEXP"*"CAST("*"AS DECIMAL"*) PASS=$((PASS+1))
+      echo "  a plain numeric BY is described as an ORDER BY" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL mysql BY plan: $dord" ;;
+  esac
+
+  # CREATE-INDEX on an UN-MAPPED attribute.  MySQL refuses a functional index
+  # on an expression returning TEXT, so raw attributes were not indexable here
+  # at all — the driver returned -1 and the runtime built its own index.  It
+  # now adds a STORED generated column carrying the push-down expression and a
+  # prefix index on it (#157).
+  #
+  # This asserts the path works and still answers correctly.  That the index is
+  # USED was measured by hand, and is worth recording because it is easy to get
+  # a false negative: the generated column stores its literals in the
+  # CONNECTION's character set, so an EXPLAIN issued from a client on a
+  # different charset does not match the expression and reports a full scan —
+  #   _utf8mb4'$."2"'  (mvx's connection)  vs  _latin1'$."2"'  (mysql CLI default)
+  # On a matching connection: `key: mvxix_CITY`, ref access, 1 row.
+  "$TCL" -a "$MYA" -c 'DELETE-FILE IXR' >/dev/null 2>&1
+  "$TCL" -a "$MYA" -c 'CREATE-FILE IXR' >/dev/null 2>&1
+  cat > "$TESTROOT/myixr.b" <<'MYIEOF'
+OPEN "IXR" TO F ELSE STOP
+OPEN "DICT", "IXR" TO D ELSE STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "Ada":@AM:"London" ON F, "R1"
+WRITE "Grace":@AM:"York" ON F, "R2"
+WRITE "Alan":@AM:"London" ON F, "R3"
+MYIEOF
+  "$MVX" "$TESTROOT/myixr.b" -o "$TESTROOT/myixrbin" 2>/dev/null
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myixrbin")
+  check tcl-mysql-rawindex "$( \
+    "$TCL" -a "$MYA" -c 'CREATE-INDEX IXR CITY' 2>&1; \
+    "$TCL" -a "$MYA" -c 'LIST-INDEXES IXR' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "London"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "York"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'DELETE-INDEX IXR CITY' 2>&1; \
+    "$TCL" -a "$MYA" -c 'COUNT IXR WITH CITY = "London"' 2>&1)"
+
+  # A MULTIVALUED TRANS() key.  Only postgres had this (tcl-transjoinmv), and
+  # the gap hid a real break: the join asks "is the target id one of the source
+  # key's values", which was a delimiter-wrapped LOCATE over the blob's
+  # @VM-joined text.  A multivalued attribute is a JSON ARRAY now (#157), so
+  # that text became `["C1", "C2"]` and the test silently stopped matching —
+  # measured at 1 row where 2 are right, and 0 where 1 is.  JSON_CONTAINS is
+  # the membership test for an array and a scalar alike.
+  for jf in MYCUSJ MYORDMV; do
+    "$TCL" -a "$MYA" -c "DELETE-FILE $jf" >/dev/null 2>&1
+    "$TCL" -a "$MYA" -c "CREATE-FILE $jf" >/dev/null 2>&1
+  done
+  cat > "$TESTROOT/myjnmv.b" <<'MYJEOF'
+OPEN "MYCUSJ" TO C ELSE STOP
+WRITE "Alpha":@AM:"Sydney" ON C, "C1"
+WRITE "Beta":@AM:"Melbourne" ON C, "C2"
+OPEN "MYORDMV" TO O ELSE STOP
+WRITE "C1":@AM:"Single" ON O, "M1"
+WRITE "C1":@VM:"C2":@AM:"Multi" ON O, "M2"
+OPEN "DICT", "MYORDMV" TO D ELSE STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"Product":@AM:"10L" ON D, "PRODUCT"
+WRITE "I":@AM:"TRANS(MYCUSJ,1,2,X)":@AM:"":@AM:"City":@AM:"10L" ON D, "CITY"
+MYJEOF
+  "$MVX" "$TESTROOT/myjnmv.b" -o "$TESTROOT/myjnmvbin" 2>/dev/null
+  (cd "$MYA" && MVXACCOUNT=. "$TESTROOT/myjnmvbin")
+  # Sydney -> M1 (C1) + M2 (C1 is one of its values) = 2; Melbourne -> M2 = 1.
+  check tcl-mysql-transjoinmv "$( \
+    "$TCL" -a "$MYA" -c 'SELECT MYORDMV WITH CITY = "Sydney"' 2>&1; \
+    "$TCL" -a "$MYA" -c 'SELECT MYORDMV WITH CITY = "Melbourne"' 2>&1)"
 else
   echo "  (mysql test skipped — set MVX_MYSQL to run)"
 fi
@@ -2673,11 +3167,16 @@ if [ -n "${MVX_MONGO:-}" ]; then
   # write two, read one (multivalue preserved), delete the other.
   printf 'OPEN "ORDERS" TO F ELSE STOP\nWRITE "Widget":@VM:"Gadget" ON F, "O1"\nWRITE "Acme" ON F, "O2"\nREAD V FROM F, "O1" THEN PRINT "read: ":V<1,1>:"/":V<1,2>\nDELETE F, "O2"\n' > "$TESTROOT/mg.b"
   "$MVX" "$TESTROOT/mg.b" -o "$TESTROOT/mgbin" 2>/dev/null
-  check tcl-mongo "$( \
+  # libmongoc writes "Falling back to malloc for counters" to stderr when it
+  # cannot map its shared-counter segment — intermittently, and depending on
+  # the container.  It is not output of ours; drop it, or whether the suite
+  # passes depends on whether the run that blessed it happened to see it.
+  nomgwarn() { grep -v 'WARNING:.*mongoc' || true; }
+  check tcl-mongo "$( { \
     "$TCL" -a "$MGACCT" -c 'CREATE-FILE ORDERS USING @mongotest' 2>&1; \
     (cd "$MGACCT" && MVXACCOUNT=. "$TESTROOT/mgbin"); \
     printf 'COUNT ORDERS\nSELECT ORDERS\nLIST ORDERS\n' | \
-      "$TCL" -a "$MGACCT" 2>&1)"
+      "$TCL" -a "$MGACCT" 2>&1; } | nomgwarn)"
 
   # relational mapping + native index + WITH/COUNT push-down (#62). CREATE-MAP
   # projects each mapped dict column onto its { _id, rec } document as a native
@@ -2703,14 +3202,14 @@ WRITE "D":@AM:"5":@AM:"MD0":@AM:"Qty":@AM:"5R":@AM:"LINES" ON D, "QTY"
 MMEOF
   "$MVX" "$TESTROOT/mgmap.b" -o "$TESTROOT/mgmapbin" 2>/dev/null
   (cd "$MGACCT" && MVXACCOUNT=. "$TESTROOT/mgmapbin")
-  check tcl-mongomap "$( \
+  check tcl-mongomap "$( { \
     "$TCL" -a "$MGACCT" -c 'CREATE-MAP MORD NAME STATE PRICE PRODUCT QTY' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD WITH STATE = "NSW"' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'COUNT MORD WITH NAME = "Bolt"' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH STATE = "NSW" BY @ID' 2>&1; \
     "$TCL" -a "$MGACCT" -c 'CREATE-INDEX MORD NAME' 2>&1; \
-    "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH NAME = "Bolt"' 2>&1)"
+    "$TCL" -a "$MGACCT" -c 'LIST MORD NAME WITH NAME = "Bolt"' 2>&1; } | nomgwarn)"
 else
   echo "  (mongo test skipped — set MVX_MONGO to run)"
 fi
@@ -2795,6 +3294,234 @@ fi
 # only moment that change is provably behaviour-neutral.  This is what keeps
 # them in: a rule nothing checks is a rule that decays, and this one has to hold
 # across six files that have no other reason to agree with each other.
+echo "== records as documents"
+# Compiled here rather than by CMake: it is a test, not something to install,
+# and building it against build/lib is the same thing build-native.sh does.
+if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/doc-roundtrip.c" \
+      -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/doc-roundtrip" 2>"$TESTROOT/dcerr"; then
+  if DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+     "$TESTROOT/doc-roundtrip" > "$TESTROOT/docout" 2>&1; then
+    PASS=$((PASS + 1)); sed -n 's/^doc-roundtrip: /  /p' "$TESTROOT/docout" | tail -1
+  else
+    echo "FAIL doc-roundtrip:"; sed 's/^/    /' "$TESTROOT/docout" | grep -A3 FAIL | head -20
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "FAIL doc-roundtrip: did not compile"; sed 's/^/    /' "$TESTROOT/dcerr" | head -10
+  FAIL=$((FAIL + 1))
+fi
+
+# NATIVE MODE STORES A MAPPED ATTRIBUTE ONCE.
+#
+# The column is authoritative there and map_recompose reads it back from the
+# column unconditionally, so keeping it in the document as well is a second
+# copy that is never read and can only drift (#157).  Going BACK to mirror has
+# to put them into the documents again, because mirror reads the document and
+# never consults the columns — without that every record would read with its
+# mapped attributes empty while the values sat in columns nobody looks at.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== native mode stores a mapped attribute once"
+  NDA="$TESTROOT/ndacct"; mkdir -p "$NDA"
+  printf '# MVX account descriptor\nname=nd\nversion=1\n' > "$NDA/.mvx"
+  printf '* sqlite %s/nd.sqlite\n' "$NDA" > "$NDA/BINDINGS"
+  "$TCL" -a "$NDA" -c 'CREATE-FILE CUST' >/dev/null 2>&1
+  cat > "$TESTROOT/nd.b" <<'NDEOF'
+OPEN "CUST" TO F ELSE STOP
+OPEN "DICT", "CUST" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L" ON D, "CITY"
+WRITE "Ada":@AM:"London":@AM:"unmapped-extra" ON F, "C1"
+NDEOF
+  "$MVX" "$TESTROOT/nd.b" -o "$TESTROOT/ndbin" 2>/dev/null
+  (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndbin")
+  cat > "$TESTROOT/ndrw.b" <<'NDWEOF'
+OPEN "CUST" TO F ELSE STOP
+WRITE "Ada":@AM:"London":@AM:"unmapped-extra" ON F, "C1"
+READ R FROM F, "C1" THEN
+   PRINT "record: [":R<1>:"][":R<2>:"][":R<3>:"]"
+END ELSE PRINT "LOST"
+NDWEOF
+  "$MVX" "$TESTROOT/ndrw.b" -o "$TESTROOT/ndrwbin" 2>/dev/null
+  "$TCL" -a "$NDA" -c 'CREATE-MAP CUST NAME CITY' >/dev/null 2>&1
+  printf 'y\n' | "$TCL" -a "$NDA" -c 'MAP-MODE CUST native' >/dev/null 2>&1
+  (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") >/dev/null 2>&1
+  # the document holds ONLY the un-mapped attribute; the record still reads whole
+  NDDOC=$(sqlite3 "$NDA/nd.sqlite" 'SELECT doc FROM CUST;' 2>/dev/null)
+  NDREAD=$( (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") 2>&1 | tail -1)
+  "$TCL" -a "$NDA" -c 'MAP-MODE CUST mirror' >/dev/null 2>&1
+  NDDOC2=$(sqlite3 "$NDA/nd.sqlite" 'SELECT doc FROM CUST;' 2>/dev/null)
+  NDREAD2=$( (cd "$NDA" && MVXACCOUNT=. "$TESTROOT/ndrwbin") 2>&1 | tail -1)
+  check tcl-native-onecopy "$(printf '%s\n' \
+    "native  doc: $NDDOC" \
+    "native  $NDREAD" \
+    "mirror  doc: $NDDOC2" \
+    "mirror  $NDREAD2")"
+fi
+
+# A LONG MAPPED VALUE SURVIVES NATIVE MODE.
+#
+# In native mode a mapped attribute is read back from its COLUMN, so anything
+# the column cannot hold is lost — and it was: the runtime projected through a
+# fixed 256-byte cell, so every mapped value over 255 bytes was silently cut,
+# and the check meant to refuse an unfittable record used the same buffer and
+# so could not see it (mvx#174).  300 bytes is the shape that failed.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a long mapped value in native mode"
+  NVA="$TESTROOT/nvacct"; mkdir -p "$NVA"
+  printf '# MVX account descriptor\nname=nv\nversion=1\n' > "$NVA/.mvx"
+  printf '* sqlite %s/nv.sqlite\n' "$NVA" > "$NVA/BINDINGS"
+  "$TCL" -a "$NVA" -c 'CREATE-FILE ITM' >/dev/null 2>&1
+  cat > "$TESTROOT/nv.b" <<'NVEOF'
+OPEN "ITM" TO F ELSE STOP
+OPEN "DICT", "ITM" TO D ELSE STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L" ON D, "NAME"
+WRITE STR("A", 300) ON F, "L1"
+NVEOF
+  "$MVX" "$TESTROOT/nv.b" -o "$TESTROOT/nvbin" 2>/dev/null
+  (cd "$NVA" && MVXACCOUNT=. "$TESTROOT/nvbin")
+  "$TCL" -a "$NVA" -c 'CREATE-MAP ITM NAME' >/dev/null 2>&1
+  printf 'y\n' | "$TCL" -a "$NVA" -c 'MAP-MODE ITM native' >/dev/null 2>&1
+  cat > "$TESTROOT/nvr.b" <<'NVREOF'
+OPEN "ITM" TO F ELSE STOP
+READ R FROM F, "L1" THEN
+   PRINT "native read-back length = " : LEN(R<1>)
+END ELSE PRINT "L1 NOT FOUND"
+NVREOF
+  "$MVX" "$TESTROOT/nvr.b" -o "$TESTROOT/nvrbin" 2>/dev/null
+  check tcl-native-longvalue "$( \
+    "$TCL" -a "$NVA" -c 'MAP-MODE ITM' 2>&1; \
+    (cd "$NVA" && MVXACCOUNT=. "$TESTROOT/nvrbin"))"
+fi
+
+# ---------------------------------------------------------------------------
+# The backends agree with each other, and with the verb.
+#
+# Non-negotiable 6: nothing above the driver may depend on backend-specific
+# behaviour.  A push-down is only correct if it returns what the client-side
+# scan returns, so lmdb — which has no push-down and filters in the verb — is
+# the reference every other backend is compared against.
+#
+# This exists because storing records as documents (#157) broke that quietly
+# twice.  A missing attribute became NULL where the blob expression had
+# returned '', so a shorter record stopped matching `# value` on sqlite and
+# postgres; and mongo matches array elements natively, so a multivalued
+# attribute matched `= value` there and nowhere else.  Both passed every
+# existing test: each backend was self-consistent, and nothing compared them.
+echo "== backends agree"
+AGACC="$TESTROOT/agree"; mkdir -p "$AGACC"
+cat > "$TESTROOT/agseed.b" <<'AGEOF'
+OPEN "CUST" TO F ELSE PRINT "no CUST" ; STOP
+OPEN "DICT", "CUST" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Name":@AM:"12L":@AM:"S" ON D, "NAME"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Qty":@AM:"6R":@AM:"S" ON D, "QTY"
+WRITE "Ada":@AM:"London":@AM:"9" ON F, "C1"
+WRITE "Grace":@AM:"York":@AM:"10" ON F, "C2"
+WRITE "Alan":@AM:"London":@VM:"York":@AM:"100" ON F, "C3"
+WRITE "Edsger":@AM:"":@AM:"abc" ON F, "C4"
+WRITE "Barbara":@AM:"Perth":@AM:"7":@VM:"8" ON F, "C5"
+AGEOF
+"$MVX" "$TESTROOT/agseed.b" -o "$TESTROOT/agseedbin" >/dev/null 2>&1
+
+# answers <account-dir> -> the three counts, on one line
+ag_answers() {
+  a="$1"
+  n1=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  n2=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY # "London"' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  n3=$("$TCL" -a "$a" -c 'COUNT CUST WITH CITY = ""' 2>&1 | sed -n 's/^\([0-9][0-9]*\) record.*/\1/p')
+  # ORDER BY a RAW attribute, both ways.  QTY is right-justified, so BY QTY is
+  # MV's NUMERIC sort (9 before 10 before 100) while BY CITY is its byte sort —
+  # and a pushed-down ORDER has to produce what the verb produces, including
+  # where a multivalued and an empty attribute land.
+  o1=$("$TCL" -a "$a" -c 'SORT CUST BY QTY @ID' 2>&1 | sed -n 's/^\(C[0-9]\) .*/\1/p' | tr -d '\n')
+  o2=$("$TCL" -a "$a" -c 'SORT CUST BY CITY @ID' 2>&1 | sed -n 's/^\(C[0-9]\) .*/\1/p' | tr -d '\n')
+  printf '=London:%s #London:%s =empty:%s byQTY:%s byCITY:%s' \
+         "${n1:-?}" "${n2:-?}" "${n3:-?}" "${o1:-?}" "${o2:-?}"
+}
+ag_seed() { # ag_seed <dir> [create-args]
+  d="$1"; shift
+  mkdir -p "$d"
+  printf '# MVX account descriptor\nname=agree\nversion=1\n' > "$d/.mvx"
+  [ -n "${AG_BIND:-}" ] && printf '%s\n' "$AG_BIND" > "$d/BINDINGS"
+  # the backend section above may have left its own CUST behind
+  "$TCL" -a "$d" -c 'DELETE-FILE CUST' >/dev/null 2>&1
+  "$TCL" -a "$d" -c "CREATE-FILE CUST $*" >/dev/null 2>&1
+  (cd "$d" && MVXACCOUNT=. "$TESTROOT/agseedbin") >/dev/null 2>&1
+}
+
+AG_BIND="" ag_seed "$AGACC/lmdb"
+REF=$(ag_answers "$AGACC/lmdb")
+AGOUT="verb (reference)  $REF"
+AGN=0                                 # backends actually compared
+AGBAD=0                               # ...and how many disagreed
+# ag_row <label> <answers> — add a row, count it, flag a disagreement
+ag_row() {
+  AGN=$((AGN + 1))
+  [ "$2" = "$REF" ] || AGBAD=$((AGBAD + 1))
+  AGOUT="$AGOUT
+$1$2$([ "$2" = "$REF" ] || echo '   <-- DISAGREES')"
+}
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  AG_BIND="* sqlite $AGACC/sq.sqlite" ag_seed "$AGACC/sqlite"
+  G=$(ag_answers "$AGACC/sqlite")
+  ag_row "sqlite            " "$G"
+fi
+if [ -n "${MVX_PG:-}" ]; then
+  psql_ext "DROP SCHEMA IF EXISTS agree CASCADE" >/dev/null 2>&1
+  mkdir -p "$AGACC/pg"
+  printf 'SET-CONNECTION cn driver=postgres %s namespace=agree\n' "$MVX_PG" | \
+    "$TCL" -a "$AGACC/pg" >/dev/null 2>&1
+  AG_BIND="CUST @cn" ag_seed "$AGACC/pg" "USING @cn"
+  G=$(ag_answers "$AGACC/pg")
+  ag_row "postgres          " "$G"
+fi
+if [ -n "${MVX_MONGO:-}" ]; then
+  mkdir -p "$AGACC/mg"
+  printf 'SET-CONNECTION cn driver=mongo address=%s namespace=agree\n' \
+    "$(printf '%s' "$MVX_MONGO" | sed -n 's/.*address=\([^ ]*\).*/\1/p')" | \
+    "$TCL" -a "$AGACC/mg" >/dev/null 2>&1
+  AG_BIND="CUST @cn" ag_seed "$AGACC/mg" "USING @cn"
+  G=$(ag_answers "$AGACC/mg")
+  ag_row "mongo             " "$G"
+fi
+if [ -n "${MVX_MYSQL:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 2>&1; then
+  AG_BIND="* mysql $MVX_MYSQL" ag_seed "$AGACC/my"
+  G=$(ag_answers "$AGACC/my")
+  ag_row "mysql             " "$G"
+fi
+# AND THE INDEX MUST NOT CHANGE THE ANSWER.  This is the axis the comparison
+# above cannot see: the scan and all four push-downs agreed with each other
+# while all disagreeing with the INDEX path, which is the one implementing the
+# documented semantics (ARCHITECTURE.md 5.2).  Building an index changed query
+# results (mvx#173) and nothing noticed.
+AG_BIND="" ag_seed "$AGACC/ix"
+IXBEFORE=$(ag_answers "$AGACC/ix")
+"$TCL" -a "$AGACC/ix" -c 'CREATE-INDEX CUST CITY' >/dev/null 2>&1
+"$TCL" -a "$AGACC/ix" -c 'CREATE-INDEX CUST QTY' >/dev/null 2>&1
+IXAFTER=$(ag_answers "$AGACC/ix")
+AGOUT="$AGOUT
+unindexed         $IXBEFORE
+indexed           $IXAFTER$([ "$IXAFTER" = "$IXBEFORE" ] || echo '   <-- INDEX CHANGED THE ANSWER')"
+# Assert the agreement, do not diff a transcript of it.  Which backends are
+# present depends on the environment -- CI has postgres and mongo but no mysql,
+# a laptop may have none of them -- so a blessed transcript encodes the machine
+# it was blessed on and fails everywhere else.  What this test actually claims
+# is that every backend that DID run agrees with the verb, and that is true
+# whatever ran.
+if [ "$AGN" -lt 1 ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL backends agree: no backend was compared (sqlite should always be)"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+elif [ "$AGBAD" -ne 0 ] || [ "$IXAFTER" != "$IXBEFORE" ]; then
+  FAIL=$((FAIL + 1))
+  echo "FAIL backends agree: $AGBAD of $AGN disagreed with the verb"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+else
+  PASS=$((PASS + 1))
+  echo "  $AGN backend(s) agree with the verb, indexed and not"
+  printf '%s\n' "$AGOUT" | sed 's/^/    /'
+fi
+
 echo "== byte accessor discipline"
 stray=$(grep -rn -- '->data' "$ROOT"/runtime/src/*.c 2>/dev/null \
         | grep -v '^.*mv_str\.c:' || true)

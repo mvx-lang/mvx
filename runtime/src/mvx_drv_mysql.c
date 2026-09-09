@@ -38,6 +38,7 @@
 
 #include "mvx_driver.h"
 #include "mvx_runtime.h"
+#include "mvx_doc.h"
 
 #include <mysql.h>
 #include <stdio.h>
@@ -97,20 +98,22 @@ static void quote_ident(const char *s, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* The nth @AM attribute of a column, as a SQL expression.
+/* The nth attribute, as a SQL expression.
  *
- * SUBSTRING_INDEX(x, d, n) returns everything before the nth delimiter,
- * and with a negative count everything after it -- so nesting the two
- * picks out field n.  The IF guards the end: asked for a field past the
- * last one, SUBSTRING_INDEX would hand back the whole string, where MV
- * says "".  Field count is (delimiters + 1), and the delimiter count is
- * the length lost when they are all removed. */
+ * A field of the document (#157).  This used to be a nest of SUBSTRING_INDEX
+ * over the record blob, with an IF to catch the end -- SUBSTRING_INDEX hands
+ * back the whole string when asked for a field past the last one, where MV
+ * says "".  Worse, an expression that shape cannot be indexed without a
+ * generated column, so raw attributes were not indexable here at all.
+ *
+ * JSON_UNQUOTE(JSON_EXTRACT(...)) rather than the ->> shorthand, which
+ * MariaDB does not accept.  COALESCE because an ABSENT KEY IS NULL while an
+ * attribute past the end reads as EMPTY in MV -- the same trap that made
+ * `# value` stop matching shorter records on postgres. */
 static void attr_expr(const char *col, int64_t n, char *out, size_t cap) {
     snprintf(out, cap,
-             "IF(%lld <= 1 + LENGTH(%s) - LENGTH(REPLACE(%s, CHAR(254), '')), "
-             "SUBSTRING_INDEX(SUBSTRING_INDEX(%s, CHAR(254), %lld), CHAR(254), -1), "
-             "'')",
-             (long long)n, col, col, col, (long long)n);
+             "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(%s, '$.\"%lld\"')), '')",
+             col, (long long)n);
 }
 
 /* The comparison expression for a field: a mapped column, or the blob
@@ -126,9 +129,66 @@ static void field_expr(const char *col, int64_t attr, const char *tbl_alias,
         char recref[64];
         snprintf(recref, sizeof recref, "%s%s",
                  (tbl_alias && tbl_alias[0]) ? tbl_alias : "",
-                 (tbl_alias && tbl_alias[0]) ? ".rec" : "rec");
+                 (tbl_alias && tbl_alias[0]) ? ".doc" : "doc");
         attr_expr(recref, attr, out, cap);
     }
+}
+
+/* A complete WITH predicate, placeholder included.  Returns 0 when this
+ * backend cannot express it, so the caller falls back to the verb.
+ *
+ * ANY VALUE MATCHES: a multivalued attribute is compared value by value, not
+ * as one string (ARCHITECTURE.md 5.2, and what the index path has always
+ * done).  A whole-attribute push-down made CREATE-INDEX change results (#173).
+ *
+ *   =   JSON_CONTAINS(attr, value)         — true if any value equals it,
+ *                                            and for a scalar attribute too
+ *   #   NOT JSON_CONTAINS([value], attr)   — "some value differs" is the
+ *                                            negation of "every value is it",
+ *                                            i.e. the attribute's values are
+ *                                            not all contained in {value}
+ *
+ * RANGES ARE NOT PUSHED for a raw attribute.  The per-value form needs
+ * JSON_TABLE, and JSON_TABLE does not correlate to an outer table from inside
+ * an EXISTS — measured: it silently matched nothing for `=` and everything for
+ * `#`.  A wrong push-down is worse than none, so those return 0.
+ *
+ * The CASE coerces a scalar — and an ABSENT attribute — to a one-element
+ * array, because MV reads a short record's attribute as one EMPTY value, which
+ * must still satisfy `# 'London'`. */
+static int my_pred(const char *col, int64_t attr, const char *op,
+                   const char *ph, int numeric, char *out, size_t cap) {
+    if (col && col[0]) {
+        char qc[300];
+        quote_ident(col, qc, sizeof qc);
+        if (numeric)
+            snprintf(out, cap, "CAST(%s AS DECIMAL(38,10)) %s "
+                     "CAST(%s AS DECIMAL(38,10))", qc, op, ph);
+        else
+            snprintf(out, cap, "%s %s %s", qc, op, ph);
+        return 1;
+    }
+    char ext[200], arr[420];
+    snprintf(ext, sizeof ext, "JSON_EXTRACT(doc, '$.\"%lld\"')", (long long)attr);
+    snprintf(arr, sizeof arr,
+             "CASE WHEN JSON_TYPE(%s) = 'ARRAY' THEN %s "
+             "ELSE JSON_ARRAY(COALESCE(JSON_UNQUOTE(%s),'')) END", ext, ext, ext);
+    /* CAST(... AS CHAR) around the value.  The driver binds it as BLOB, and a
+       binary string does not become a JSON string — JSON_ARRAY of it is
+       ["base64:type15:TG9uZG9u"], so the containment never matches and `#`
+       matched EVERY record.  Hand-written SQL hid this because a literal is
+       already text; it only shows through the bound parameter. */
+    if (strcmp(op, "=") == 0) {
+        snprintf(out, cap, "JSON_CONTAINS(%s, JSON_QUOTE(CAST(%s AS CHAR)))",
+                 ext, ph);
+        return 1;
+    }
+    if (strcmp(op, "<>") == 0 || strcmp(op, "!=") == 0) {
+        snprintf(out, cap, "NOT JSON_CONTAINS(JSON_ARRAY(CAST(%s AS CHAR)), %s)",
+                 ph, arr);
+        return 1;
+    }
+    return 0;                             /* a range: the verb answers it */
 }
 
 static const char *sql_op(const char *op) {
@@ -288,12 +348,74 @@ static mvx_cursor *run_ids(MYSQL *db, const char *sql,
 
 /* ---------------------------------------------------- record operations */
 
+/* A file written before records became documents (#157): a `rec` blob column
+   and no `doc`.  Nothing converts one — a pre-1.0 format break — but it must
+   SAY so.  Undetected it is not a clean break: LISTF reports no files (it
+   looks for `doc`), COUNT reports the rows it can see, and every READ says
+   the record is not there.  Three answers about one file and no error, which
+   reads as "mvx lost my data". */
+/* The stored format of `table`: the stamped table comment when there is one,
+   else 0 so the caller falls back to the shape.  SHOW CREATE TABLE shows it,
+   which is where someone looking at the schema would find it. */
+static int my_format_of(MYSQL *db, const char *table) {
+    char q[600], esc[300];
+    mysql_real_escape_string(db, esc, table, (unsigned long)strlen(table));
+    snprintf(q, sizeof q,
+             "SELECT table_comment FROM information_schema.tables "
+             "WHERE table_schema = DATABASE() AND table_name = '%s'", esc);
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(db);
+    int fmt = 0;
+    if (r) {
+        MYSQL_ROW row = mysql_fetch_row(r);
+        if (row && row[0]) {
+            const char *m = strstr(row[0], "mvx: format=");
+            if (m) fmt = atoi(m + 12);
+        }
+        mysql_free_result(r);
+    }
+    return fmt;
+}
+
+static int my_is_pre157(MYSQL *db, const char *table) {
+    char q[600];
+    char esc[300];
+    mysql_real_escape_string(db, esc, table, (unsigned long)strlen(table));
+    snprintf(q, sizeof q,
+             "SELECT SUM(column_name='doc'), SUM(column_name='rec') "
+             "FROM information_schema.columns "
+             "WHERE table_schema = DATABASE() AND table_name = '%s'", esc);
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(db);
+    int old = 0;
+    if (r) {
+        MYSQL_ROW row = mysql_fetch_row(r);
+        if (row) old = (!row[0] || atoi(row[0]) == 0) && row[1] && atoi(row[1]) > 0;
+        mysql_free_result(r);
+    }
+    return old;
+}
+
 static mvx_file *my_open(const char *spec, char *err, size_t errlen) {
     char loc[1024];
     const char *tbl = split_spec(spec, loc, sizeof loc);
     MYSQL *db = my_connect(loc, err, errlen);
     if (!db) return NULL;
     if (!table_exists(db, tbl)) return NULL;   /* not found: normal ELSE path */
+    int fmt = my_format_of(db, tbl);
+    if (fmt > MVX_FILE_FORMAT) {
+        snprintf(err, errlen,
+                 "mysql: %s is stored in format %d; this build understands %d "
+                 "— it was written by a newer mvx", tbl, fmt, MVX_FILE_FORMAT);
+        return NULL;
+    }
+    if ((fmt > 0 && fmt < MVX_FILE_FORMAT) || (fmt == 0 && my_is_pre157(db, tbl))) {
+        snprintf(err, errlen,
+                 "mysql: %s was written before records became documents "
+                 "(it has a `rec` column and no `doc`).  Convert it with:  "
+                 "mvx-doc-migrate mysql <connection>", tbl);
+        return NULL;
+    }
     my_file *f = calloc(1, sizeof(my_file));
     if (!f) mvx_fatal("out of memory opening %s", spec);
     f->base.driver = &mvx_driver_mysql;
@@ -313,7 +435,7 @@ static int my_read(mvx_file *fh, const char *id, int64_t idlen, mv_value *rec) {
     my_file *f = (my_file *)fh;
     char qt[300], sql[400];
     quote_ident(f->table, qt, sizeof qt);
-    snprintf(sql, sizeof sql, "SELECT rec FROM %s WHERE id = ?", qt);
+    snprintf(sql, sizeof sql, "SELECT doc FROM %s WHERE id = ?", qt);
     MYSQL_STMT *st = mysql_stmt_init(f->db);
     if (!st) return 0;
     if (mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) != 0) {
@@ -345,7 +467,12 @@ static int my_read(mvx_file *fh, const char *id, int64_t idlen, mv_value *rec) {
         if (!buf) mvx_fatal("out of memory in mysql read");
         ob.buffer = buf; ob.buffer_length = outlen;
         if (mysql_stmt_fetch_column(st, &ob, 0, 0) == 0) {
-            mv_set_str(rec, buf, (int64_t)outlen);
+            /* The document IS the record (#157) — no blob behind it. */
+            mv_value doc;
+            mv_init(&doc);
+            mv_set_str(&doc, buf, (int64_t)outlen);
+            mvx_doc_decode(rec, &doc);
+            mv_clear(&doc);
             got = 1;
         }
         free(buf);
@@ -361,26 +488,32 @@ static int my_write(mvx_file *fh, const char *id, int64_t idlen,
     quote_ident(f->table, qt, sizeof qt);
     /* Upsert: MV's WRITE replaces whatever was there. */
     snprintf(sql, sizeof sql,
-             "INSERT INTO %s (id, rec) VALUES (?, ?) "
-             "ON DUPLICATE KEY UPDATE rec = VALUES(rec)", qt);
+             "INSERT INTO %s (id, doc) VALUES (?, ?) "
+             "ON DUPLICATE KEY UPDATE doc = VALUES(doc)", qt);
     MYSQL_STMT *st = mysql_stmt_init(f->db);
     if (!st) return 0;
     if (mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) != 0) {
         mysql_stmt_close(st); return 0;
     }
+    mv_value jdoc;
+    mv_init(&jdoc);
+    mvx_doc_encode(&jdoc, rec);
     char buf[256];
     const char *rp;
-    int64_t rl = mv_val_chars((mv_value *)rec, buf, sizeof buf, &rp);
+    int64_t rl = mv_val_chars(&jdoc, buf, sizeof buf, &rp);
     MYSQL_BIND b[2];
     unsigned long il = (unsigned long)idlen, rlen = (unsigned long)rl;
     memset(b, 0, sizeof b);
     b[0].buffer_type = MYSQL_TYPE_BLOB; b[0].buffer = (void *)id;
     b[0].buffer_length = il; b[0].length = &il;
-    b[1].buffer_type = MYSQL_TYPE_BLOB; b[1].buffer = (void *)rp;
+    /* STRING, not BLOB: a JSON column takes text, and the document is valid
+       UTF-8 by construction (bytes that are not get base64-wrapped). */
+    b[1].buffer_type = MYSQL_TYPE_STRING; b[1].buffer = (void *)rp;
     b[1].buffer_length = rlen; b[1].length = &rlen;
     mysql_stmt_bind_param(st, b);
     int ok = mysql_stmt_execute(st) == 0;
     mysql_stmt_close(st);
+    mv_clear(&jdoc);
     return ok;
 }
 
@@ -446,7 +579,8 @@ static int my_create(const char *spec, char *err, size_t errlen) {
        limit.  The record itself is a LONGBLOB and unbounded. */
     snprintf(sql, sizeof sql,
              "CREATE TABLE %s (id VARBINARY(255) NOT NULL PRIMARY KEY, "
-             "rec LONGBLOB) ENGINE=InnoDB", qt);
+             "doc JSON) ENGINE=InnoDB COMMENT = 'mvx: format=%d'",
+             qt, MVX_FILE_FORMAT);
     if (!exec_sql(db, sql)) {
         snprintf(err, errlen, "mysql: %s", mysql_error(db));
         return 0;
@@ -478,7 +612,7 @@ static int my_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     if (!db) return 0;
     if (!exec_sql(db,
             "SELECT table_name FROM information_schema.columns "
-            "WHERE table_schema = DATABASE() AND column_name = 'rec' "
+            "WHERE table_schema = DATABASE() AND column_name = 'doc' "
             "ORDER BY table_name")) {
         snprintf(err, errlen, "mysql: %s", mysql_error(db));
         return 0;
@@ -586,12 +720,19 @@ static const char *my_sqltype(const char *t) {
        binary float would make SUM disagree with the verb's own arithmetic
        in the last place.  VARBINARY for everything else, so comparison and
        ORDER BY are byte-wise like MV -- and bounded, because MySQL cannot
-       index a full-length blob.  A mapped field longer than this is
-       truncated IN THE COLUMN ONLY; the record blob keeps the whole value,
-       and native reads come back from the column, so keep mapped fields
-       inside it. */
+       index a full-length blob.
+       3072, not 255: that is InnoDB's index key limit on a DYNAMIC row, so
+       it is the widest a fully-indexed column can be.  At 255 a mapped value
+       longer than that was silently cut, and in NATIVE mode -- where the
+       column IS the read -- the record came back short (mvx#174).  The old
+       comment said "the record blob keeps the whole value"; the document does
+       keep it, but a native read never looks there, so the value was lost in
+       practice.
+       A value longer than 3072 still does not fit.  That is a real backend
+       limit rather than a buffer, and it is why map_validate_one has to
+       measure the whole value before MAP-MODE native is allowed. */
     if (t && strcmp(t, "NUMERIC") == 0) return "DECIMAL(38,10)";
-    return "VARBINARY(255)";
+    return "VARBINARY(3072)";
 }
 
 /* 1060 = ER_DUP_FIELDNAME: adding a column that is already there is what
@@ -896,13 +1037,40 @@ static void index_name(my_file *f, const char *item, char *out, size_t cap) {
 static int my_index_create(mvx_file *fh, const char *item, const char *col,
                            int64_t attr) {
     my_file *f = (my_file *)fh;
-    (void)attr;
-    if (!col || !col[0]) return -1;
     char qt[300], qc[300], nm[512], qn[600], sql[1400];
     quote_ident(f->table, qt, sizeof qt);
-    quote_ident(col, qc, sizeof qc);
     index_name(f, item, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
+
+    if (!col || !col[0]) {
+        /* AN UN-MAPPED ATTRIBUTE gets a MULTI-VALUED index (8.0.17+), which is
+           the one kind JSON_CONTAINS can use — and JSON_CONTAINS is what the
+           any-value `=` push-down emits (#173).  An earlier version indexed a
+           STORED generated column carrying the whole-attribute expression;
+           that served a whole-attribute compare, which is the semantics #173
+           removed, so it would now sit unused.  Measured with this one:
+           `key: mvix`, range access.
+           MySQL refuses a plain functional index here — "ERROR 3757: Cannot
+           create a functional index on an expression that returns a BLOB or
+           TEXT" — which is why raw attributes were not indexable at all. */
+        if (attr < 1) return -1;
+        snprintf(sql, sizeof sql,
+                 "CREATE INDEX %s ON %s ((CAST(doc->'$.\"%lld\"' "
+                 "AS CHAR(255) ARRAY)))", qn, qt, (long long)attr);
+        if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1061) return -1;
+        char csql2[400];
+        snprintf(csql2, sizeof csql2, "SELECT COUNT(*) FROM %s", qt);
+        int rn = 0;
+        if (exec_sql(f->db, csql2)) {
+            MYSQL_RES *r = mysql_store_result(f->db);
+            MYSQL_ROW row = r ? mysql_fetch_row(r) : NULL;
+            if (row && row[0]) rn = atoi(row[0]);
+            if (r) mysql_free_result(r);
+        }
+        return rn;
+    }
+
+    quote_ident(col, qc, sizeof qc);
     snprintf(sql, sizeof sql, "CREATE INDEX %s ON %s (%s)", qn, qt, qc);
     /* 1061 = ER_DUP_KEYNAME: already indexed is success, not failure. */
     if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1061) return -1;
@@ -977,8 +1145,9 @@ static mvx_cursor *my_select_attr(mvx_file *fh, int64_t attr, const char *op,
     if (!o || attr < 1) return NULL;
     char qt[300], ex[400], sql[1200];
     quote_ident(f->table, qt, sizeof qt);
-    field_expr(NULL, attr, NULL, ex, sizeof ex);
-    snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE %s %s ?", qt, ex, o);
+    char pex[900];
+    if (!my_pred(NULL, attr, o, "?", 0, pex, sizeof pex)) return NULL;
+    snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE %s", qt, pex);
     return run_ids(f->db, sql, &val, &vlen, 1);
 }
 
@@ -994,19 +1163,16 @@ static mvx_cursor *my_select_multi(mvx_file *fh, const mvx_pred *preds,
     for (int i = 0; i < npred; i++) {
         const char *o = sql_op(preds[i].op);
         if (!o) return NULL;
-        char ex[600];
-        field_expr(preds[i].col, preds[i].attr, NULL, ex, sizeof ex);
         /* A numeric comparison casts both sides, so 9 < 10 rather than
            "10" < "9" -- the distinction MV draws between a numeric and a
-           text field. */
-        if (preds[i].numeric)
-            p += (size_t)snprintf(sql + p, sizeof sql - p,
-                                  "%sCAST(%s AS DECIMAL(38,10)) %s "
-                                  "CAST(? AS DECIMAL(38,10))",
-                                  i ? " AND " : "", ex, o);
-        else
-            p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s ?",
-                                  i ? " AND " : "", ex, o);
+           text field.  my_pred returns 0 for a raw-attribute RANGE, which it
+           cannot express here, and the whole multi-predicate push is then
+           abandoned so the verb answers all of it consistently. */
+        char ex[900];
+        if (!my_pred(preds[i].col, preds[i].attr, o, "?", preds[i].numeric,
+                     ex, sizeof ex)) return NULL;
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : "", ex);
         if (p >= sizeof sql) return NULL;
         vals[i] = preds[i].val;
         lens[i] = preds[i].vlen;
@@ -1016,25 +1182,55 @@ static mvx_cursor *my_select_multi(mvx_file *fh, const mvx_pred *preds,
 
 /* ORDER BY / LIMIT.  No COLLATE clause: the columns are VARBINARY, which
    already orders by bytes -- which is what MV's sort is. */
+/* The ORDER BY expression for a RAW attribute, reproducing MV's own sort.
+   Numbers ascending FIRST, then everything that is not a number — measured
+   against the verb.  The cast is guarded: mysql reads a non-numeric as 0
+   without complaint, which would interleave it among the numbers. */
+static void my_order_expr(int64_t attr, int onum, char *out, size_t cap) {
+    char v[600];
+    field_expr(NULL, attr, NULL, v, sizeof v);
+    if (onum)
+        snprintf(out, cap,
+                 "(%s REGEXP '^-?[0-9]+([.][0-9]+)?$') DESC, "
+                 "CASE WHEN %s REGEXP '^-?[0-9]+([.][0-9]+)?$' "
+                 "THEN CAST(%s AS DECIMAL(38,10)) END, %s",
+                 v, v, v, v);
+    else
+        snprintf(out, cap, "%s", v);
+}
+
 static mvx_cursor *my_select_order(mvx_file *fh, const char *fcol,
                                    int64_t fattr, const char *fop,
                                    const char *fval, int64_t fvlen,
-                                   const char *ocol, int otext,
-                                   int64_t limit) {
+                                   const char *ocol, int64_t oattr, int onum,
+                                   int otext, int64_t limit) {
     my_file *f = (my_file *)fh;
     (void)otext;
-    if (!ocol || !ocol[0]) return NULL;
-    char qt[300], qo[300], sql[1600];
+    /* RAW attribute: only a NUMERIC sort is pushed.
+       A text sort of a raw attribute would have to reproduce MV's byte order
+       over the whole attribute, and a multivalued one is a JSON ARRAY whose
+       text begins with '[' — so it collates after 'York' where MV puts
+       "London<VM>York" between "London" and "York".  Measured against the
+       verb.  Rebuilding MV's text (json_each + group_concat, or the postgres
+       equivalent) would fix the order but is not indexable and is unlikely to
+       beat sorting in the verb, which is what happens when this returns NULL.
+       The numeric case has no such problem: the cast is exact, and it is the
+       one that makes a top-N worth pushing. */
+    if (!ocol || !ocol[0]) {
+        if (oattr < 1 || !onum) return NULL;
+    }
+    char qt[300], qo[2600], sql[4000];
     quote_ident(f->table, qt, sizeof qt);
-    quote_ident(ocol, qo, sizeof qo);
+    if (ocol && ocol[0]) quote_ident(ocol, qo, sizeof qo);
+    else my_order_expr(oattr, onum, qo, sizeof qo);
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT id FROM %s", qt);
     int nb = 0;
     if (fop && fop[0]) {
         const char *o = sql_op(fop);
         if (!o) return NULL;
-        char ex[600];
-        field_expr(fcol, fattr, NULL, ex, sizeof ex);
-        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?", ex, o);
+        char ex[900];
+        if (!my_pred(fcol, fattr, o, "?", 0, ex, sizeof ex)) return NULL;
+        p += (size_t)snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
         nb = 1;
     }
     p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", qo);
@@ -1055,9 +1251,9 @@ static int64_t my_count_where(mvx_file *fh, const char *col, int64_t attr,
     if (op && op[0]) {
         const char *o = sql_op(op);
         if (!o) return -1;
-        char ex[600];
-        field_expr(col, attr, NULL, ex, sizeof ex);
-        snprintf(sql + p, sizeof sql - p, " WHERE %s %s ?", ex, o);
+        char ex[900];
+        if (!my_pred(col, attr, o, "?", 0, ex, sizeof ex)) return -1;
+        snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
         nb = 1;
     }
     MYSQL_STMT *st = mysql_stmt_init(f->db);
@@ -1101,10 +1297,11 @@ static int my_sum_where(mvx_file *fh, const char *sumcol, const char *fcol,
     if (fop && fop[0]) {
         const char *o = sql_op(fop);
         if (!o) return 0;
-        char ex[600];
-        field_expr(fcol, fattr, NULL, ex, sizeof ex);
+        char ex[900], lit[600];
         mysql_real_escape_string(f->db, esc, fval, (unsigned long)fvlen);
-        snprintf(sql + p, sizeof sql - p, " WHERE %s %s '%s'", ex, o, esc);
+        snprintf(lit, sizeof lit, "'%s'", esc);
+        if (!my_pred(fcol, fattr, o, lit, 0, ex, sizeof ex)) return 0;
+        snprintf(sql + p, sizeof sql - p, " WHERE %s", ex);
     }
     if (!exec_sql(f->db, sql)) return 0;
     MYSQL_RES *r = mysql_store_result(f->db);
@@ -1136,44 +1333,67 @@ static mvx_cursor *my_select_join(mvx_file *srch, int64_t sk,
        makes LOCATE an EXACT element test -- without it "10" would match
        inside "100".  DISTINCT collapses a source record matching through
        more than one of its key values. */
+    /* How "the target id is one of the source key's values" is asked depends
+       on what the source key IS.
+       A MAPPED COLUMN still holds MV's own @VM-joined text, so the delimiter-
+       wrapped LOCATE is still the exact element test.
+       A RAW ATTRIBUTE is now a field of the document, and a multivalued one is
+       a JSON ARRAY (#157) — against which the LOCATE test silently stopped
+       matching, because the text it searched became `["C1", "C2"]`.  Measured
+       before this: a two-value key matched one row instead of two, and its
+       second value matched none at all.  JSON_CONTAINS is the membership test
+       for both shapes: true for an array holding the value, true for a scalar
+       equal to it, NULL (falsy in a JOIN) when the attribute is absent. */
+    char onx[1200];
+    if (src_keycol && src_keycol[0])
+        snprintf(onx, sizeof onx,
+                 "LOCATE(CONCAT(CHAR(253), t.id, CHAR(253)), "
+                 "CONCAT(CHAR(253), %s, CHAR(253))) > 0", skx);
+    else
+        snprintf(onx, sizeof onx,
+                 "JSON_CONTAINS(JSON_EXTRACT(s.doc, '$.\"%lld\"'), "
+                 "JSON_QUOTE(CONVERT(t.id USING utf8mb4)))",
+                 (long long)sk);
     char sql[2400];
     snprintf(sql, sizeof sql,
-             "SELECT DISTINCT s.id FROM %s s JOIN %s t "
-             "ON LOCATE(CONCAT(CHAR(253), t.id, CHAR(253)), "
-             "CONCAT(CHAR(253), %s, CHAR(253))) > 0 "
-             "WHERE %s = ?", sqt, tqt, skx, tax);
+             "SELECT DISTINCT s.id FROM %s s JOIN %s t ON %s WHERE %s = ?",
+             sqt, tqt, onx, tax);
     return run_ids(s->db, sql, &val, &vlen, 1);
 }
 
 /* ------------------------------------------------------------ explain */
 
 static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
-                      const char *ocol, int otext, int64_t limit,
-                      char *out, size_t cap) {
+                      const char *ocol, int64_t oattr, int onum, int otext,
+                      int64_t limit, char *out, size_t cap) {
     my_file *f = (my_file *)fh;
-    (void)otext;
+    (void)otext;                          /* mysql collates bytes already */
+    /* An ORDER BY only where select_order would actually push one: a mapped
+       column, or a RAW attribute sorted numerically.  A raw TEXT order is not
+       pushable, and the caller does not ask for one here — it falls through to
+       a plan that says the verb sorts.  Rendering it anyway would describe a
+       query this driver never runs (#172). */
+    int order = (ocol && ocol[0]) || (oattr >= 1 && onum);
     char qt[300], sql[6000];
     quote_ident(f->table, qt, sizeof qt);
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT id FROM %s", qt);
     for (int i = 0; i < npred; i++) {
         const char *o = sql_op(preds[i].op);
         if (!o) return 0;
-        char ex[600];
-        field_expr(preds[i].col, preds[i].attr, NULL, ex, sizeof ex);
-        if (preds[i].numeric)
-            p += (size_t)snprintf(sql + p, sizeof sql - p,
-                                  "%sCAST(%s AS DECIMAL(38,10)) %s "
-                                  "CAST(? AS DECIMAL(38,10))",
-                                  i ? " AND " : " WHERE ", ex, o);
-        else
-            p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s %s ?",
-                                  i ? " AND " : " WHERE ", ex, o);
+        /* The plan shown must be the plan run, per-value form included. */
+        char ex[900];
+        if (!my_pred(preds[i].col, preds[i].attr, o, "?", preds[i].numeric,
+                     ex, sizeof ex)) return 0;
+        p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s",
+                              i ? " AND " : " WHERE ", ex);
         if (p >= sizeof sql) return 0;
     }
-    if (ocol && ocol[0]) {
-        char qo[300];
-        quote_ident(ocol, qo, sizeof qo);
+    if (order) {
+        char qo[2600];
+        if (ocol && ocol[0]) quote_ident(ocol, qo, sizeof qo);
+        else my_order_expr(oattr, onum, qo, sizeof qo);
         p += (size_t)snprintf(sql + p, sizeof sql - p, " ORDER BY %s", qo);
+        if (p >= sizeof sql) return 0;
     }
     if (limit > 0)
         snprintf(sql + p, sizeof sql - p, " LIMIT %lld", (long long)limit);
@@ -1183,6 +1403,132 @@ static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
 }
 
 /* ------------------------------------------------------------- vtable */
+
+/* ------------------------------------------------------- doc migration */
+
+/* Convert every pre-#157 file in this database to the document form.  Same
+   shape as the other SQL drivers, different dialect: add `doc JSON`, encode
+   each record into it, prove every row converted, drop `rec`.  One
+   transaction per file. */
+static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
+    MYSQL *db = my_connect(loc, err, errlen);
+    if (!db) return -1;
+    if (mysql_query(db,
+            "SELECT c.table_name FROM information_schema.columns c "
+            "WHERE c.table_schema = DATABASE() AND c.column_name = 'rec' "
+            "AND NOT EXISTS (SELECT 1 FROM information_schema.columns d "
+            "  WHERE d.table_schema = c.table_schema "
+            "  AND d.table_name = c.table_name AND d.column_name = 'doc') "
+            "ORDER BY c.table_name") != 0) {
+        snprintf(err, errlen, "mysql: %s", mysql_error(db));
+        return -1;
+    }
+    MYSQL_RES *lr = mysql_store_result(db);
+    if (!lr) { snprintf(err, errlen, "mysql: %s", mysql_error(db)); return -1; }
+    int n = (int)mysql_num_rows(lr);
+    char (*names)[128] = n ? calloc((size_t)n, sizeof *names) : NULL;
+    for (int i = 0; i < n; i++) {
+        MYSQL_ROW row = mysql_fetch_row(lr);
+        snprintf(names[i], sizeof names[0], "%s", row && row[0] ? row[0] : "");
+    }
+    mysql_free_result(lr);
+
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        char qt[300], sql[900];
+        quote_ident(names[i], qt, sizeof qt);
+        mysql_query(db, "START TRANSACTION");
+        snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc JSON", qt);
+        if (mysql_query(db, sql) != 0) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        snprintf(sql, sizeof sql, "SELECT id, rec FROM %s", qt);
+        if (mysql_query(db, sql) != 0) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        MYSQL_RES *rows = mysql_store_result(db);
+        if (!rows) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        int rn = (int)mysql_num_rows(rows), failed = 0;
+        snprintf(sql, sizeof sql, "UPDATE %s SET doc = ? WHERE id = ?", qt);
+        MYSQL_ROW row;
+        while (!failed && (row = mysql_fetch_row(rows))) {
+            unsigned long *lens = mysql_fetch_lengths(rows);
+            mv_value rec, doc;
+            mv_init(&rec); mv_init(&doc);
+            mv_set_str(&rec, row[1] ? row[1] : "", (int64_t)(lens ? lens[1] : 0));
+            mvx_doc_encode(&doc, &rec);
+            char nb[64];
+            const char *dp;
+            int64_t dl = mv_val_chars(&doc, nb, sizeof nb, &dp);
+            MYSQL_STMT *st = mysql_stmt_init(db);
+            if (st && mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) == 0) {
+                MYSQL_BIND b[2];
+                unsigned long dlen = (unsigned long)dl;
+                unsigned long ilen = lens ? lens[0] : 0;
+                memset(b, 0, sizeof b);
+                b[0].buffer_type = MYSQL_TYPE_STRING;
+                b[0].buffer = (void *)dp; b[0].buffer_length = dlen;
+                b[0].length = &dlen;
+                b[1].buffer_type = MYSQL_TYPE_BLOB;
+                b[1].buffer = (void *)row[0]; b[1].buffer_length = ilen;
+                b[1].length = &ilen;
+                mysql_stmt_bind_param(st, b);
+                if (mysql_stmt_execute(st) != 0 ||
+                    mysql_stmt_affected_rows(st) != 1)
+                    failed = 1;             /* wrote nothing: do not drop */
+            } else failed = 1;
+            if (st) mysql_stmt_close(st);
+            mv_clear(&rec); mv_clear(&doc);
+        }
+        mysql_free_result(rows);
+        /* PROVE EVERY ROW CONVERTED BEFORE DROPPING THE OLD COLUMN. */
+        if (!failed) {
+            snprintf(sql, sizeof sql,
+                     "SELECT COUNT(*) FROM %s WHERE doc IS NULL", qt);
+            long nulls = -1;
+            if (mysql_query(db, sql) == 0) {
+                MYSQL_RES *ck = mysql_store_result(db);
+                if (ck) {
+                    MYSQL_ROW cr = mysql_fetch_row(ck);
+                    if (cr && cr[0]) nulls = atol(cr[0]);
+                    mysql_free_result(ck);
+                }
+            }
+            if (nulls != 0) {
+                snprintf(err, errlen,
+                         "mysql: %s: %ld of %d record(s) did not convert — "
+                         "left in the old format", names[i], nulls, rn);
+                mysql_query(db, "ROLLBACK"); free(names); return -1;
+            }
+        }
+        if (!failed) {
+            snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
+            if (mysql_query(db, sql) != 0) failed = 1;
+        }
+        if (!failed) {                    /* say what it is now (mvx#171) */
+            snprintf(sql, sizeof sql, "ALTER TABLE %s COMMENT = 'mvx: format=%d'",
+                     qt, MVX_FILE_FORMAT);
+            mysql_query(db, sql);         /* best effort: the data is converted */
+        }
+        if (failed) {
+            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(names); return -1;
+        }
+        mysql_query(db, "COMMIT");
+        done++;
+    }
+    free(names);
+    return done;
+}
+
+/* InnoDB's index key limit on a DYNAMIC row, which is how wide my_sqltype
+   makes a mapped text column.  A longer value cannot round-trip through it. */
+static int64_t my_map_text_cap(mvx_file *fh) { (void)fh; return 3072; }
 
 static const mvx_driver mvx_driver_mysql = {
     "mysql",
@@ -1215,6 +1561,8 @@ static const mvx_driver mvx_driver_mysql = {
     NULL,                                 /* select_join_order: the verb sorts
                                              the reference itself */
     my_rollback,                          /* abort a failed logical write */
+    my_migrate_docs,                      /* pre-#157 blob -> document */
+    my_map_text_cap,                      /* mapped columns are bounded here */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

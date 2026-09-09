@@ -17,6 +17,7 @@
  * any lib exporting mvx_ext_entry it registers that lib's function table. */
 
 #include "mvx_ext.h"
+#include "mvx_driver.h"   /* MVX_DRIVER_ABI, checked against an artifact stamp */
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -77,7 +78,32 @@ static void load_dir(const char *dir) {
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */
-        if (!h) continue;                                 /* failure: symbols stay absent */
+        if (!h) {
+            /* SAY WHY (#117).  This used to fail silently, so a library built
+               against a newer runtime just never loaded and the user met it
+               later as "subroutine is not cataloged" -- a long way from the
+               cause.  The message names the file and what the loader said. */
+            const char *why = dlerror();
+            fprintf(stderr, "mvx: cannot load %s: %s\n", path,
+                    why ? why : "unknown error");
+            continue;
+        }
+        /* What was this compiled against?  mvx-basic stamps every artifact
+           with the driver ABI it saw (#117).  An older stamp is fine -- the
+           ABI only breaks forward -- but a NEWER one means this runtime does
+           not have what the library was built to call, and loading it would
+           trade a clear message here for an undefined symbol later. */
+        const int32_t *built = (const int32_t *)dlsym(h, "mvx_built_abi");
+        if (built && *built > MVX_DRIVER_ABI) {
+            const char *bv = (const char *)dlsym(h, "mvx_built_version");
+            fprintf(stderr,
+                    "mvx: %s needs driver ABI %d but this runtime speaks %d"
+                    "%s%s%s -- rebuild it, or upgrade mvx\n",
+                    path, (int)*built, MVX_DRIVER_ABI,
+                    bv ? " (built by mvx " : "", bv ? bv : "", bv ? ")" : "");
+            dlclose(h);
+            continue;
+        }
         mvx_ext_entry_fn entry = (mvx_ext_entry_fn)dlsym(h, "mvx_ext_entry");
         if (entry) {
             const mvx_ext *ext = entry(MVX_EXT_ABI);
@@ -87,10 +113,22 @@ static void load_dir(const char *dir) {
     closedir(d);
 }
 
+/* The tables compiled into libmvxrt.  Registered before any dlopen, so a
+   package shipping the same name cannot displace a built-in ("first
+   registration wins" in register_ext) -- which is the point of a built-in:
+   JSONENCODE means the same thing in every account, whatever is installed. */
+static void register_builtins(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    register_ext(mvx_json_builtin());
+}
+
 void mvx_ext_load_libs(void) {
     if (g_loaded) return;
     g_loaded = 1;
 
+    register_builtins();                        /* before any dlopen */
     load_dir("LIB");                            /* account catalog */
 
     FILE *fp = fopen("PACKAGES", "r");          /* linked packages */
@@ -117,6 +155,7 @@ void mvx_ext_load_libs(void) {
 }
 
 int mvx_ext_has(const char *name) {
+    register_builtins();          /* available before any library is searched */
     if (find_ext(name)) return 1;
     if (!g_loaded) { mvx_ext_load_libs(); return find_ext(name) != NULL; }
     return 0;
@@ -124,6 +163,7 @@ int mvx_ext_has(const char *name) {
 
 void mvx_ext_invoke(mvx_ctx *ctx, const char *name, mv_value *ret,
                     int32_t argc, mv_value **argv) {
+    register_builtins();
     reg_ent *r = find_ext(name);
     if (!r && !g_loaded) { mvx_ext_load_libs(); r = find_ext(name); }
     if (!r)

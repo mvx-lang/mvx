@@ -1,9 +1,9 @@
-linked @ROOT@/packages/git
-linked @ROOT@/packages/cmd
-linked @ROOT@/packages/getopt
-git@VER ok     @ROOT@/packages/git requires cmd [mvx udt uv]
-cmd@VER ok     @ROOT@/packages/cmd requires getopt (builds with mvpkg) [mvx udt]
-getopt@VER ok     @ROOT@/packages/getopt builds with mvpkg [mvx udt]
+linked @PKG@/git
+linked @PKG@/cmd
+linked @PKG@/getopt
+git@VER ok     @PKG@/git requires cmd [mvx udt uv]
+cmd@VER ok     @PKG@/cmd requires getopt (builds with mvpkg) [mvx udt uv jbase]
+getopt@VER ok     @PKG@/getopt builds with mvpkg [mvx udt uv jbase]
 3 package(s) linked
 GIT - version-control hash-file records
 usage: GIT <command>
@@ -33,6 +33,6 @@ commands:
   attr         view or edit account / file attributes ({file})
   tag          list or manage tags (name {commit} | -a name -m msg | -d name)
   help         show this help
-cannot unlink cmd: @ROOT@/packages/git depends on it
-unlinked @ROOT@/packages/git
-unlinked @ROOT@/packages/cmd
+cannot unlink cmd: @PKG@/git depends on it
+unlinked @PKG@/git
+unlinked @PKG@/cmd

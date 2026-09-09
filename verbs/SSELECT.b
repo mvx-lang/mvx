@@ -175,7 +175,13 @@ IF SYSTEM(11) = 0 THEN
       IF WANOS<1> = -1 AND WSPECS<1>[1, 6] = "TRANS(" THEN
          IXUSED = TRANSSELECT(F, WSPECS<1>, WOPS<1>, WVS<1>)
       END
-      IF IXUSED = 0 AND WOPS<1> = "=" AND WANOS<1> > 0 THEN
+      * NOT for an EMPTY search value.  An index holds one entry per VALUE and
+      * an empty attribute has none, so WITH X = "" finds nothing through the
+      * index while the scan matches every record whose X is empty — the index
+      * would change the answer, which is the whole of mvx#173.  Indexing
+      * empties instead would put an entry on every record with a sparse
+      * attribute, so the scan answers this one.
+      IF IXUSED = 0 AND WOPS<1> = "=" AND WANOS<1> > 0 AND WVS<1> # "" THEN
          IXUSED = INDEXSELECT(F, WIS<1>, WVS<1>)
       END
    END
@@ -205,27 +211,45 @@ UNTIL DONE DO
          CASE WANOS<K> = 0
             RV = ID
          CASE WANOS<K> = -1
-            RV = IEVAL(R, WSPECS<K>)
+            IF DOPEN THEN
+               RV = IEVAL(R, WSPECS<K>, DC)
+            END ELSE
+               RV = IEVAL(R, WSPECS<K>)
+            END
          CASE 1
             RV = R<WANOS<K>>
          END CASE
          WOP = WOPS<K>
          WV = WVS<K>
          CK = 0
-         BEGIN CASE
-         CASE WOP = "="
-            IF RV = WV THEN CK = 1
-         CASE WOP = "#"
-            IF RV # WV THEN CK = 1
-         CASE WOP = ">"
-            IF RV > WV THEN CK = 1
-         CASE WOP = "<"
-            IF RV < WV THEN CK = 1
-         CASE WOP = ">="
-            IF RV >= WV THEN CK = 1
-         CASE WOP = "<="
-            IF RV <= WV THEN CK = 1
-         END CASE
+         * ANY VALUE MATCHES.  A multivalued attribute is compared VALUE BY
+         * VALUE, not as one string, so WITH CITY = "London" matches a record
+         * whose CITY is London]York.  The INDEX path has always done this
+         * (ARCHITECTURE.md 5.2, and classic Pick), so before this the same
+         * query answered differently depending on whether an index happened
+         * to exist -- CREATE-INDEX changed results (mvx#173).
+         * DCOUNT of an empty attribute is 0, but MV reads it as ONE empty
+         * value: without the clamp a record with an empty CITY would stop
+         * matching WITH CITY # "London", which it must.
+         WNV = DCOUNT(RV, @VM)
+         IF WNV = 0 THEN WNV = 1
+         FOR WI = 1 TO WNV
+            WVAL = RV<1, WI>
+            BEGIN CASE
+            CASE WOP = "="
+               IF WVAL = WV THEN CK = 1
+            CASE WOP = "#"
+               IF WVAL # WV THEN CK = 1
+            CASE WOP = ">"
+               IF WVAL > WV THEN CK = 1
+            CASE WOP = "<"
+               IF WVAL < WV THEN CK = 1
+            CASE WOP = ">="
+               IF WVAL >= WV THEN CK = 1
+            CASE WOP = "<="
+               IF WVAL <= WV THEN CK = 1
+            END CASE
+         NEXT WI
          IF CK = 0 THEN OK = 0
       END
    NEXT K
@@ -234,7 +258,11 @@ UNTIL DONE DO
       CASE BANO = 0
          K = ID
       CASE BANO = -1
-         K = IEVAL(R, BSPEC)
+         IF DOPEN THEN
+            K = IEVAL(R, BSPEC, DC)
+         END ELSE
+            K = IEVAL(R, BSPEC)
+         END
       CASE 1
          K = R<BANO>
       END CASE

@@ -1,0 +1,18 @@
+--- per-value extension, and the SUM that folds it
+@ID            Qty      Price        Ext        Total
+1001             4    $249.00    $996.00     $1124.00
+                10     $12.50    $125.00             
+                 3      $1.00      $3.00             
+1 record(s) listed
+--- parentheses, unary minus, and a divide by zero that does not abort
+@ID            Parens      Neg  DivZero
+1001               10       -4        0
+                   22      -10        0
+                    8       -3        0
+1 record(s) listed
+--- WITH selects on an arithmetic I-type
+@ID          Customer          Total
+1001         Acme           $1124.00
+1 record(s) listed
+--- and a spec it cannot parse is REPORTED, not silently blank
+ieval: cannot evaluate "NOT AN EXPRESSION(("

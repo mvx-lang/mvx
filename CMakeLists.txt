@@ -1,6 +1,29 @@
 cmake_minimum_required(VERSION 3.24)
 project(mvx LANGUAGES C CXX)
 
+# The toolchain's own version, so a package can say which mvx it needs and
+# something can check it (#117).  Taken from the git tag, because the tag is
+# what a release IS -- a VERSION file would be a second place to forget.  A
+# checkout with no tags, or a source tarball, reports 0.0.0-dev, which no
+# `requires` range will satisfy: better to say "unknown" out loud than to
+# claim a version the binary may not have.
+find_package(Git QUIET)
+set(MVX_VERSION "0.0.0-dev")
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+  # --match v*: the release workflow keeps a rolling `dev` tag on develop's
+  # HEAD, and without this that tag is what describe finds -- so every develop
+  # build would report "unknown" instead of "newer than the last release".
+  execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
+                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                  OUTPUT_VARIABLE MVX_GIT_DESC
+                  OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+  if(MVX_GIT_DESC MATCHES "^v[0-9]")
+    string(REGEX REPLACE "^v" "" MVX_VERSION "${MVX_GIT_DESC}")
+  endif()
+endif()
+message(STATUS "MVX version ${MVX_VERSION}")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,10 +72,13 @@ option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
   ${_mvx_daemon_default})
 # Packages built into the system account at build time (#54): always available
 # to every compile and process (their EXPORTS + verbs + extension libraries),
-# with no LINK-PKG.  Defaults to `json` (the JSON codec is now a package —
-# JSONENCODE/JSONDECODE come from packages/json).  Set to "" to exclude it, or
-# add more (semicolon-separated) to bundle them into a distribution.
-set(MVX_PACKAGES "json;http" CACHE STRING "Packages built into the system account")
+# with no LINK-PKG.  Set to "" to exclude them, or add more (semicolon-
+# separated) to bundle them into a distribution.
+#
+# json used to be listed here, which meant JSONENCODE/JSONDECODE existed only
+# because the packages/json submodule happened to be checked out.  The codec is
+# built into libmvxrt now (#169), so it needs no package and no configuration.
+set(MVX_PACKAGES "http" CACHE STRING "Packages built into the system account")
 
 # --- runtime -----------------------------------------------------------
 # A SHARED library so its code is mapped once and shared across every mvx
@@ -67,6 +93,8 @@ add_library(mvxrt SHARED
   runtime/src/mv_conv.c
   runtime/src/mvx_ctx.c
   runtime/src/mvx_map.c
+  runtime/src/mvx_json.c
+  runtime/src/mvx_doc.c
   runtime/src/mvx_ext.c
   runtime/src/mvx_store.c
   runtime/src/mvx_exec.c
@@ -88,6 +116,7 @@ if(M_LIBRARY)
   target_link_libraries(mvxrt PRIVATE ${M_LIBRARY})
 endif()
 target_compile_definitions(mvxrt PRIVATE
+  MVX_VERSION="${MVX_VERSION}"
   MVX_DRIVER_DIR="${CMAKE_BINARY_DIR}/lib"
   MVX_BIN_DIR="${CMAKE_BINARY_DIR}/bin"
   MVX_SYSTEM_DIR="${CMAKE_BINARY_DIR}/system")
@@ -249,6 +278,12 @@ target_link_libraries(mvx-git-adopt PRIVATE mvxrt)
 set_target_properties(mvx-git-adopt PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# --- mvx-doc-migrate: pre-#157 record blobs -> the document form -------
+add_executable(mvx-doc-migrate tools/mvx_doc_migrate.c)
+target_link_libraries(mvx-doc-migrate PRIVATE mvxrt ${CMAKE_DL_LIBS})
+set_target_properties(mvx-doc-migrate PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # --- classic TCL shell -------------------------------------------------
 add_executable(mvx tcl/mvx_tcl.c)
 target_link_libraries(mvx PRIVATE mvxrt ${CMAKE_DL_LIBS})
@@ -333,6 +368,10 @@ add_dependencies(mvx-basic mvxrt mvx_crt)
 llvm_map_components_to_libnames(LLVM_LIBS
   core support passes native irreader targetparser)
 target_link_libraries(mvx-basic PRIVATE ${LLVM_LIBS})
+# The compiler reports the same version as the runtime, without linking it:
+# mvx-basic does not depend on libmvxrt and should not start now (#117).
+target_compile_definitions(mvx-basic PRIVATE MVX_VERSION="${MVX_VERSION}")
+target_include_directories(mvx-basic PRIVATE runtime/include)
 
 # --- install -----------------------------------------------------------
 # A relocatable prefix: bin/ holds the executables, lib/ the shared

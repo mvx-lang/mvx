@@ -2,22 +2,6 @@
 	path = docs
 	url = https://github.com/mvx-lang/mvx.wiki.git
 	branch = master
-[submodule "packages/git"]
-	path = packages/git
-	url = git@github.com:mvx-lang/mv_git.git
-[submodule "packages/cmd"]
-	path = packages/cmd
-	url = git@github.com:mvx-lang/mv_cmd.git
-	branch = main
-[submodule "packages/mapfield"]
-	path = packages/mapfield
-	url = git@github.com:mvx-lang/mapfield.git
-[submodule "packages/json"]
-	path = packages/json
-	url = git@github.com:mvx-lang/json.git
-[submodule "packages/getopt"]
-	path = packages/getopt
-	url = git@github.com:mvx-lang/getopt.git
 [submodule "demo"]
 	path = demo
 	url = git@github.com:mvx-lang/demo.git

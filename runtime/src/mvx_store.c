@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -211,7 +212,8 @@ static int map_project_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
 static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
                        int64_t idlen, const mv_value *rec,
                        const mv_value *old);
-static int map_validate_one(mvx_ctx *ctx, mapmeta *m, const mv_value *rec);
+static int map_validate_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
+                            const mv_value *rec);
 static int map_recompose(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
                          const char *id, int64_t idlen, mv_value *rec);
 static const char *map_identity_col(open_file *o, int64_t attr);
@@ -837,6 +839,10 @@ static trans_ent *trans_file(mvx_ctx *ctx, const char *nm, int64_t nl) {
 
 static void ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
                   const char *sp, int64_t sl, int depth);
+/* ieval plus the dictionary a bare name resolves against (#121). */
+static void ieval_ex(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
+                     const char *sp, int64_t sl, int depth,
+                     const mv_value *dictf);
 static void trans_core(mvx_ctx *ctx, mv_value *dst, const char *np, int64_t nl,
                        const mv_value *key, const char *attr, int64_t attrl,
                        char ctl, int depth);
@@ -922,7 +928,7 @@ static void dict_eval(mvx_ctx *ctx, mv_value *dst, trans_ent *t,
             char sbf[256];
             const char *sp;
             int64_t sl = mv_val_chars(&spec, sbf, sizeof sbf, &sp);
-            ieval(ctx, dst, rec, sp, sl, depth + 1);
+            ieval_ex(ctx, dst, rec, sp, sl, depth + 1, &t->dfvar);
             mv_clear(&spec);
         } else {
             mv_value amc;
@@ -939,10 +945,316 @@ static void dict_eval(mvx_ctx *ctx, mv_value *dst, trans_ent *t,
     mv_clear(&di);
 }
 
+/* --- arithmetic and aggregate I-types (#121) -------------------------------
+ *
+ * An I-descriptor like `PRICE * QTY` or `SUM(EPRICE)` used to evaluate to ""
+ * with nothing said, because the evaluator only ever recognised TRANS and
+ * DOCTAG.  Arithmetic over sibling attributes is the commonest I-type there
+ * is, and every account arriving from UniData or UniVerse has them.
+ *
+ * This is a small recursive-descent evaluator over the dictionary-expression
+ * subset -- `+ - * /`, parentheses, unary minus, numbers, quoted strings,
+ * dictionary names, and TRANS / DOCTAG / SUM -- and NOT a second BASIC.  The
+ * issue asks whether to reuse the compiler's parser instead: that would mean
+ * linking the C++ compiler into a runtime the verbs dlopen, to gain a grammar
+ * far larger than a D-item can hold.  The cost of two evaluators is real, so
+ * the boundary is drawn tightly and stated here: if an I-type ever needs
+ * conditionals or functions beyond these, that is the point to reconsider,
+ * not to grow this one quietly.
+ *
+ * MULTIVALUES.  `QTY * PRICE` inside an association has to work value by
+ * value -- that is what makes a line-item extension, and a scalar broadcasts
+ * across them (a single PRICE against three QTYs gives three answers).  That
+ * rule is what SUM() then folds up. */
+
+/* Say once, on stderr, that a spec could not be evaluated.  A LIST calls the
+   evaluator per record, so this remembers what it has already complained
+   about -- otherwise the diagnostic buries the report it is describing. */
+#define IEVAL_SEEN 32
+static char g_ie_seen[IEVAL_SEEN][160];
+static int  g_ie_nseen;
+static void ieval_complain(const char *sp, int64_t sl, int nodict) {
+    if (sl > 150) sl = 150;
+    char k[160];
+    snprintf(k, sizeof k, "%.*s", (int)sl, sp);
+    for (int i = 0; i < g_ie_nseen; i++)
+        if (strcmp(g_ie_seen[i], k) == 0) return;
+    if (g_ie_nseen < IEVAL_SEEN) snprintf(g_ie_seen[g_ie_nseen++],
+                                          sizeof g_ie_seen[0], "%s", k);
+    fprintf(stderr, "ieval: cannot evaluate \"%s\"%s\n", k,
+            nodict ? " (no dictionary in scope for its names)" : "");
+}
+
+/* Format a number back to MV text: integral values stay integral, so
+   24900 * 64 is 1593600 and not 1593600.000000, because a D-item's
+   conversion (MD2$ and friends) is applied to the digits afterwards. */
+static void ie_num(mv_value *dst, double v) {
+    char b[64];
+    if (v == (double)(long long)v && v < 9e18 && v > -9e18)
+        snprintf(b, sizeof b, "%lld", (long long)v);
+    else {
+        snprintf(b, sizeof b, "%.10f", v);
+        char *e = b + strlen(b) - 1;
+        while (e > b && *e == '0') *e-- = '\0';
+        if (e > b && *e == '.') *e = '\0';
+    }
+    mv_set_str(dst, b, (int64_t)strlen(b));
+}
+
+static double ie_num_of(const mv_value *v) {
+    char b[64];
+    const char *p;
+    int64_t n = mv_val_chars(v, b, sizeof b, &p);
+    if (n <= 0) return 0;
+    char t[64];
+    if (n >= (int64_t)sizeof t) n = sizeof t - 1;
+    memcpy(t, p, (size_t)n);
+    t[n] = '\0';
+    return atof(t);
+}
+
+/* Apply `op` value by value, broadcasting a single value across many. */
+static void ie_arith(mv_value *dst, const mv_value *a, const mv_value *b,
+                     char op) {
+    mv_value vm;
+    mv_init(&vm);
+    mv_set_str(&vm, "\xFD", 1);
+    int64_t na = mv_dcount_fn(a, &vm), nb = mv_dcount_fn(b, &vm);
+    mv_clear(&vm);
+    if (na < 1) na = 1;
+    if (nb < 1) nb = 1;
+    int64_t n = na > nb ? na : nb;
+    mv_value out, ea, eb, one;
+    mv_init(&out); mv_init(&ea); mv_init(&eb); mv_init(&one);
+    mv_set_str(&out, "", 0);
+    for (int64_t i = 1; i <= n; i++) {
+        mv_extract_fn(&ea, a, 1, na == 1 ? 1 : i, 0);
+        mv_extract_fn(&eb, b, 1, nb == 1 ? 1 : i, 0);
+        double x = ie_num_of(&ea), y = ie_num_of(&eb), r = 0;
+        switch (op) {
+            case '+': r = x + y; break;
+            case '-': r = x - y; break;
+            case '*': r = x * y; break;
+            /* Division by zero yields 0 rather than aborting: a dictionary
+               column is display, and one bad row should not take the report
+               down with it. */
+            case '/': r = (y == 0) ? 0 : x / y; break;
+        }
+        ie_num(&one, r);
+        mv_replace_fn(&out, &out, 1, i, 0, &one);
+    }
+    mv_copy(dst, &out);
+    mv_clear(&out); mv_clear(&ea); mv_clear(&eb); mv_clear(&one);
+}
+
+
+/* The expression parser.  `dictf` is the dictionary a bare name is resolved
+   against -- the file's own DICT, which is what makes PRICE mean attribute 4
+   rather than a literal.  NULL when the caller had none, and then a name is
+   an error rather than a silent blank. */
+typedef struct {
+    mvx_ctx        *ctx;
+    const mv_value *rec;
+    const mv_value *dictf;
+    int             depth;
+    const char     *p, *end;
+    int             err;          /* set once; the whole expression is void */
+} iexp;
+
+static void ie_expr(iexp *x, mv_value *dst);
+
+static void ie_ws(iexp *x) { while (x->p < x->end && *x->p == ' ') x->p++; }
+
+/* A bare name: read it out of the dictionary and evaluate what it points at. */
+static void ie_name(iexp *x, mv_value *dst, const char *np, int64_t nl) {
+    mv_set_str(dst, "", 0);
+    if (nl == 2 && strncasecmp(np, "ID", 2) == 0) return;   /* no id in scope */
+    if (!x->dictf) { x->err = 1; return; }
+    mv_value key, di;
+    mv_init(&key); mv_init(&di);
+    mv_set_str(&key, np, nl);
+    if (mvx_read(x->ctx, &di, x->dictf, &key, 0) > 0) {
+        mv_value ty, a2;
+        mv_init(&ty); mv_init(&a2);
+        mv_extract_fn(&ty, &di, 1, 0, 0);
+        mv_extract_fn(&a2, &di, 2, 0, 0);
+        char tb[8];
+        const char *tp;
+        int64_t tl = mv_val_chars(&ty, tb, sizeof tb, &tp);
+        if (tl > 0 && (tp[0] == 'I' || tp[0] == 'i')) {
+            char sbf[512];
+            const char *sp;
+            int64_t sl = mv_val_chars(&a2, sbf, sizeof sbf, &sp);
+            ieval_ex(x->ctx, dst, x->rec, sp, sl, x->depth + 1, x->dictf);
+        } else {
+            int64_t ano = mv_get_int(&a2);
+            if (ano >= 1) mv_extract_fn(dst, x->rec, ano, 0, 0);
+        }
+        mv_clear(&ty); mv_clear(&a2);
+    } else {
+        x->err = 1;                      /* a name that is not in the DICT */
+    }
+    mv_clear(&key); mv_clear(&di);
+}
+
+/* SUM(x): fold x's values into one.  This is what turns a line-item
+   extension into an order total. */
+static void ie_sum(iexp *x, mv_value *dst, const mv_value *v) {
+    (void)x;
+    mv_value vm, e;
+    mv_init(&vm); mv_init(&e);
+    mv_set_str(&vm, "\xFD", 1);
+    int64_t n = mv_dcount_fn(v, &vm);
+    mv_clear(&vm);
+    if (n < 1) n = 1;
+    double t = 0;
+    for (int64_t i = 1; i <= n; i++) {
+        mv_extract_fn(&e, v, 1, i, 0);
+        t += ie_num_of(&e);
+    }
+    mv_clear(&e);
+    ie_num(dst, t);
+}
+
+static void ie_factor(iexp *x, mv_value *dst) {
+    mv_set_str(dst, "", 0);
+    ie_ws(x);
+    if (x->p >= x->end) { x->err = 1; return; }
+    if (*x->p == '-') { x->p++; mv_value t; mv_init(&t); ie_factor(x, &t);
+                        mv_value z; mv_init(&z); mv_set_str(&z, "0", 1);
+                        ie_arith(dst, &z, &t, '-');
+                        mv_clear(&t); mv_clear(&z); return; }
+    if (*x->p == '(') { x->p++; ie_expr(x, dst); ie_ws(x);
+                        if (x->p < x->end && *x->p == ')') x->p++;
+                        else x->err = 1;
+                        return; }
+    if (*x->p == '"' || *x->p == '\'') {          /* a literal */
+        char q = *x->p++;
+        const char *s = x->p;
+        while (x->p < x->end && *x->p != q) x->p++;
+        mv_set_str(dst, s, x->p - s);
+        if (x->p < x->end) x->p++; else x->err = 1;
+        return;
+    }
+    if (isdigit((unsigned char)*x->p) || *x->p == '.') {
+        const char *s = x->p;
+        while (x->p < x->end && (isdigit((unsigned char)*x->p) || *x->p == '.'))
+            x->p++;
+        mv_set_str(dst, s, x->p - s);
+        return;
+    }
+    if (isalpha((unsigned char)*x->p) || *x->p == '@' || *x->p == '_') {
+        const char *s = x->p;
+        if (*x->p == '@') x->p++;
+        while (x->p < x->end && (isalnum((unsigned char)*x->p) ||
+                                 *x->p == '.' || *x->p == '_' || *x->p == '$'))
+            x->p++;
+        const char *ns = (*s == '@') ? s + 1 : s;
+        int64_t nl = x->p - ns;
+        ie_ws(x);
+        if (x->p < x->end && *x->p == '(') {      /* a function call */
+            x->p++;
+            const char *as = x->p;
+            int par = 1;
+            while (x->p < x->end && par) {        /* to the matching ')' */
+                if (*x->p == '(') par++;
+                else if (*x->p == ')') par--;
+                if (par) x->p++;
+            }
+            if (par) { x->err = 1; return; }
+            int64_t al = x->p - as;
+            x->p++;                               /* past ')' */
+            if (nl == 3 && strncasecmp(ns, "SUM", 3) == 0) {
+                iexp inner = *x;
+                inner.p = as; inner.end = as + al;
+                mv_value v;
+                mv_init(&v);
+                ie_expr(&inner, &v);
+                if (inner.err) x->err = 1;
+                ie_sum(x, dst, &v);
+                mv_clear(&v);
+                return;
+            }
+            /* TRANS and DOCTAG keep their existing implementations: rebuild
+               the call text and hand it to the evaluator that already knows
+               them, rather than growing a second copy here. */
+            char call[600];
+            if (nl + al + 3 >= (int64_t)sizeof call) { x->err = 1; return; }
+            int k = snprintf(call, sizeof call, "%.*s(%.*s)",
+                             (int)nl, ns, (int)al, as);
+            ieval_ex(x->ctx, dst, x->rec, call, k, x->depth + 1, x->dictf);
+            return;
+        }
+        ie_name(x, dst, ns, nl);
+        return;
+    }
+    x->err = 1;
+}
+
+static void ie_term(iexp *x, mv_value *dst) {
+    ie_factor(x, dst);
+    for (;;) {
+        ie_ws(x);
+        if (x->p >= x->end || (*x->p != '*' && *x->p != '/')) return;
+        char op = *x->p++;
+        mv_value r, l;
+        mv_init(&r); mv_init(&l);
+        ie_factor(x, &r);
+        mv_copy(&l, dst);
+        ie_arith(dst, &l, &r, op);
+        mv_clear(&r); mv_clear(&l);
+    }
+}
+
+static void ie_expr(iexp *x, mv_value *dst) {
+    ie_term(x, dst);
+    for (;;) {
+        ie_ws(x);
+        if (x->p >= x->end || (*x->p != '+' && *x->p != '-')) return;
+        char op = *x->p++;
+        mv_value r, l;
+        mv_init(&r); mv_init(&l);
+        ie_term(x, &r);
+        mv_copy(&l, dst);
+        ie_arith(dst, &l, &r, op);
+        mv_clear(&r); mv_clear(&l);
+    }
+}
+
 /* Evaluate an I-descriptor `sp[0..sl)` against record `rec`. */
 static void ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
                   const char *sp, int64_t sl, int depth) {
+    ieval_ex(ctx, dst, rec, sp, sl, depth, NULL);
+}
+
+static void ieval_ex(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
+                     const char *sp, int64_t sl, int depth,
+                     const mv_value *dictf) {
     mv_set_str(dst, "", 0);
+    if (depth >= IEVAL_MAXDEPTH || sl <= 0) return;
+    /* TRANS(...) and DOCTAG(...) stay exactly as they were; anything else
+       now goes to the expression evaluator instead of returning "" (#121). */
+    if (!(sl >= 8 && sp[sl - 1] == ')' &&
+          (strncmp(sp, "TRANS(", 6) == 0 || strncmp(sp, "DOCTAG(", 7) == 0))) {
+        iexp x;
+        x.ctx = ctx; x.rec = rec; x.dictf = dictf; x.depth = depth;
+        x.p = sp; x.end = sp + sl; x.err = 0;
+        mv_value v;
+        mv_init(&v);
+        ie_expr(&x, &v);
+        ie_ws(&x);
+        if (!x.err && x.p == x.end) mv_copy(dst, &v);
+        else {
+            /* A spec this cannot parse is REPORTED, not silently blank --
+               the issue's third ask.  Once per spec per process, because a
+               LIST calls this for every record and a per-row diagnostic
+               would bury the report it is describing. */
+            ieval_complain(sp, sl, dictf == NULL);
+            mv_set_str(dst, "", 0);
+        }
+        mv_clear(&v);
+        return;
+    }
     if (depth >= IEVAL_MAXDEPTH || sl < 8 || sp[sl - 1] != ')') return;
     if (sl >= 9 && strncmp(sp, "DOCTAG(", 7) == 0) {
         ieval_doctag(dst, rec, sp + 7, sl - 8);
@@ -1082,11 +1394,14 @@ void mvx_trans(mvx_ctx *ctx, mv_value *dst, const mv_value *fname,
 /* IEVAL(rec, ispec): evaluate an I-descriptor against a record — the runtime
    evaluator exposed to the verbs (and to programs).  "" for an unknown spec. */
 void mvx_ieval(mvx_ctx *ctx, mv_value *dst, const mv_value *rec,
-               const mv_value *spec) {
+               const mv_value *spec, const mv_value *dictf) {
     char sb[256];
     const char *sp;
     int64_t sl = mv_val_chars(spec, sb, sizeof sb, &sp);
-    ieval(ctx, dst, rec, sp, sl, 0);
+    /* dictf is the file's own DICT, so a bare name in the expression means
+       the sibling D-item it names.  NULL keeps the old two-argument
+       behaviour, where a name has nothing to resolve against. */
+    ieval_ex(ctx, dst, rec, sp, sl, 0, dictf);
 }
 
 /* Returns 0 on success, or -2 on a backend write failure when the caller
@@ -1112,7 +1427,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
     if (o) {
         map_load(o);
         if (o->map.nf > 0 && o->map.native &&
-            !map_validate_one(ctx, &o->map, rec)) {
+            !map_validate_one(ctx, f, &o->map, rec)) {
             if (onerr) return -2;
             mvx_fatal("WRITE rejected by native map on %s id %.*s",
                       b->spec, (int)idlen, ip);
@@ -1140,14 +1455,44 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
     if (o && o->map.nf > 0 && b->driver->bulk_begin && b->driver->bulk_commit)
         txn = b->driver->bulk_begin(f);
 
+    /* NATIVE MODE STORES THE RECORD ONCE.  A mapped attribute lives in its
+       column, and map_recompose reads it back from there unconditionally — so
+       keeping it in the document as well is a second copy that is never read
+       and can only drift (#157).  Strip those attributes from what is stored;
+       the FULL record still goes to ix_diff and map_project below, which is
+       what the index and the columns are built from.
+       Mirror mode keeps everything: there the document is the authority and
+       the columns are the derived copy, which is the whole difference between
+       the two modes. */
+    mv_value stored;
+    const mv_value *towrite = rec;
+    int stripped = 0;
+    if (o && o->map.nf > 0 && o->map.native) {
+        char nb[64];
+        const char *rp;
+        int64_t rl = mv_val_chars((mv_value *)rec, nb, sizeof nb, &rp);
+        mv_init(&stored);
+        mv_set_str(&stored, rl > 0 ? rp : "", rl > 0 ? rl : 0);
+        mv_value empty;
+        mv_init(&empty);
+        mv_set_str(&empty, "", 0);
+        for (int i = 0; i < o->map.nf; i++)
+            if (o->map.anos[i] > 0)
+                mv_replace_fn(&stored, &stored, o->map.anos[i], 0, 0, &empty);
+        mv_clear(&empty);
+        towrite = &stored;
+        stripped = 1;
+    }
+
     if (o && o->ix.n > 0 && b->driver->write_ix) {
         mvx_ixop ops[IX_MAX_ITEMS * IX_MAX_VALS * 2];
         static ixvals pool[IX_MAX_ITEMS * 2];
         int nops = ix_diff(o, &old, had_old, rec, ops, pool);
-        ok = b->driver->write_ix(f, ip, idlen, rec, ops, nops);
+        ok = b->driver->write_ix(f, ip, idlen, towrite, ops, nops);
     } else {
-        ok = b->driver->write(f, ip, idlen, rec);
+        ok = b->driver->write(f, ip, idlen, towrite);
     }
+    if (stripped) mv_clear(&stored);
     if (!ok) {
         if (txn && b->driver->rollback) b->driver->rollback(f);
         if (need_old) mv_clear(&old);
@@ -1407,25 +1752,72 @@ int64_t mvx_index_build(mvx_ctx *ctx, const mv_value *fvar,
    driver materialises columns / child tables and persists.  Returns the
    record count, -1 on error, or -2 when the backend has no mapping. */
 
+/* map_cell into a buffer that GROWS to fit.
+ *
+ * map_cell truncates silently at `cap` and returns the truncated length, so a
+ * caller with a fixed cell cannot tell a 255-byte value from a 300-byte one
+ * cut short.  Both places that projected or validated a mapped value used a
+ * 256-byte cell, so every mapped value over 255 bytes was quietly shortened —
+ * and in NATIVE mode, where the column is the read, the record came back
+ * short (mvx#174).
+ *
+ * Detect the truncation by its symptom: map_cell filled the buffer exactly.
+ * A value that genuinely ends at cap-1 costs one extra call and the same
+ * answer.  The buffer is the caller's to free. */
+static int64_t map_cell_grow(mvx_ctx *ctx, const mv_value *rec, int64_t ano,
+                             int64_t seq, const char *conv, const char *type,
+                             mv_value *av, mv_value *ov, mv_value *code,
+                             char **buf, size_t *cap) {
+    if (!*buf) {
+        *cap = 256;
+        *buf = malloc(*cap);
+        if (!*buf) mvx_fatal("out of memory projecting a mapped value");
+    }
+    for (;;) {
+        int64_t n = map_cell(ctx, rec, ano, seq, conv, type, av, ov, code,
+                             *buf, *cap);
+        if (n < 0 || (size_t)n < *cap - 1) return n;
+        if (*cap >= (size_t)16 << 20) return n;    /* absurd: take what fits */
+        size_t nc = *cap * 4;
+        char *nb = realloc(*buf, nc);
+        if (!nb) mvx_fatal("out of memory projecting a mapped value");
+        *buf = nb; *cap = nc;
+    }
+}
+
 /* Validate a record against a mapping without touching the backend: 1 if
    every typed cell fits its column, 0 if any non-empty value mismatches.
    Native mode calls this to reject a bad WRITE before it commits. */
-static int map_validate_one(mvx_ctx *ctx, mapmeta *m, const mv_value *rec) {
+static int map_validate_one(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
+                            const mv_value *rec) {
+    mvx_file_base *b = (mvx_file_base *)f;
+    /* What a mapped TEXT column can hold here, 0 = no practical limit.  In
+       native mode the column is the read, so a value it cannot hold is a
+       value the record loses — silently, and only on the backends that bound
+       their columns (mvx#174). */
+    int64_t tcap = (b && b->driver->map_text_cap) ? b->driver->map_text_cap(f) : 0;
     mv_value av, ov, code;
     mv_init(&av); mv_init(&ov); mv_init(&code);
-    char cell[256];
+    char *cell = NULL;
+    size_t ccap = 0;
     int ok = 1;
     for (int i = 0; i < m->nf && ok; i++) {
         int nv = m->assocs[i][0] ? map_vcount(rec, m->anos[i], &av) : 0;
         for (int seq = 0; seq <= nv; seq++) {
             if (m->assocs[i][0] && seq == 0) continue;   /* MV: 1..nv only */
-            if (map_cell(ctx, rec, m->anos[i], seq, m->convs[i], m->types[i],
-                         &av, &ov, &code, cell, sizeof cell) < 0) {
-                ok = 0;
+            /* The WHOLE value, not the first 255 bytes of it: this is the
+               check MAP-MODE native runs to refuse a record that does not
+               fit, and it was testing a truncated copy. */
+            int64_t cl = map_cell_grow(ctx, rec, m->anos[i], seq, m->convs[i],
+                                       m->types[i], &av, &ov, &code,
+                                       &cell, &ccap);
+            if (cl < 0 || (tcap > 0 && cl > tcap)) {
+                ok = 0;                   /* wrong type, or too long to store */
                 break;
             }
         }
     }
+    free(cell);
     mv_clear(&av); mv_clear(&ov); mv_clear(&code);
     return ok;
 }
@@ -1529,8 +1921,12 @@ static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
     mv_init(&av); mv_init(&ov); mv_init(&code); mv_init(&ta); mv_init(&tb);
     int ok = 1;
 
-    /* parent columns — only the changed ones (all, when there is no old) */
-    static char ps[MAP_MAXF][256];
+    /* parent columns — only the changed ones (all, when there is no old).
+       A GROWING cell per column: a fixed 256 quietly cut every mapped value
+       over 255 bytes, and in native mode, where the column IS the read, the
+       record came back short (mvx#174). */
+    static char *ps[MAP_MAXF];
+    static size_t pscap[MAP_MAXF];
     mvx_mapfield pcol[MAP_MAXF];
     const char *vals[MAP_MAXF];
     int64_t vlens[MAP_MAXF];
@@ -1538,9 +1934,9 @@ static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
     for (int i = 0; i < m->nf; i++) {
         if (m->assocs[i][0] != '\0') continue;
         if (old && map_attr_equal(old, rec, m->anos[i], &ta, &tb)) continue;
-        int64_t vl = map_cell(ctx, rec, m->anos[i], 0, m->convs[i],
-                              m->types[i], &av, &ov, &code, ps[nchg],
-                              sizeof ps[0]);
+        int64_t vl = map_cell_grow(ctx, rec, m->anos[i], 0, m->convs[i],
+                                   m->types[i], &av, &ov, &code,
+                                   &ps[nchg], &pscap[nchg]);
         if (vl < 0) { vl = 0; ps[nchg][0] = '\0'; }
         pcol[nchg].name = m->names[i];
         pcol[nchg].type = m->types[i];
@@ -1842,6 +2238,55 @@ int64_t mvx_mapbuild(mvx_ctx *ctx, const mv_value *fvar,
     return rc < 0 ? rc : count;
 }
 
+/* Put the mapped attributes back INTO the documents.
+ *
+ * Native mode stores a mapped attribute once, in its column, and leaves it out
+ * of the document (#157).  Mirror reads the document and never consults the
+ * columns — that is the difference between the modes — so going back without
+ * this every record would read with its mapped attributes EMPTY while the
+ * values sat untouched in columns nobody looks at any more.
+ *
+ * Deliberately independent of the mode flag: it reads the stored document,
+ * fills the mapped attributes from the columns itself, and writes the whole
+ * record back through the driver.  So it is correct run before or after the
+ * flip, which BASIC could not manage — the mode is global, and one record
+ * cannot be read in one mode and written in the other.
+ *
+ * Returns the number of records rewritten, or -2 if the backend cannot
+ * enumerate. */
+int64_t mvx_maprestore(mvx_ctx *ctx, const mv_value *fvar,
+                       const mv_value *spec) {
+    mvx_file *f = file_of(fvar, "MAPRESTORE");
+    mvx_file_base *b = (mvx_file_base *)f;
+    if (!b->driver->select_begin || !b->driver->read || !b->driver->write)
+        return -2;
+    char nb[40];
+    const char *sp;
+    int64_t slen = mv_val_chars(spec, nb, sizeof nb, &sp);
+    mapmeta m;
+    memset(&m, 0, sizeof m);
+    map_parse(sp, slen, &m);
+    if (m.nf == 0) { free(m.buf); return 0; }
+
+    mvx_cursor *c = b->driver->select_begin(f);
+    if (!c) { free(m.buf); return -2; }
+    int64_t n = 0;
+    mv_value id, rec;
+    mv_init(&id); mv_init(&rec);
+    while (b->driver->select_next(c, &id)) {
+        char ib[40];
+        const char *ip;
+        int64_t il = mv_val_chars(&id, ib, sizeof ib, &ip);
+        if (!b->driver->read(f, ip, il, &rec)) continue;
+        map_recompose(ctx, f, &m, ip, il, &rec);
+        if (b->driver->write(f, ip, il, &rec)) n++;
+    }
+    mv_clear(&id); mv_clear(&rec);
+    if (b->driver->select_end) b->driver->select_end(c);
+    free(m.buf);
+    return n;
+}
+
 /* Count records that would fail native (strict) validation against spec,
    without writing anything — the switch-to-native safety check.  Returns
    the violation count (0 = every record fits), or -2 if unsupported. */
@@ -1868,7 +2313,7 @@ int64_t mvx_mapcheck(mvx_ctx *ctx, const mv_value *fvar,
         const char *rp;
         int64_t rl = mv_val_chars(&rid, rb, sizeof rb, &rp);
         if (!b->driver->read(f, rp, rl, &rec)) continue;
-        if (!map_validate_one(ctx, &m, &rec)) bad++;
+        if (!map_validate_one(ctx, f, &m, &rec)) bad++;
     }
     b->driver->select_end(c);
     mv_clear(&rid); mv_clear(&rec);
@@ -2450,9 +2895,17 @@ int64_t mvx_orderselect(mvx_ctx *ctx, const mv_value *fvar,
     if (!o) return 0;
 
     int otext = 0;
-    const char *ocol = map_order_col(o, mv_get_int(oattr_v),
-                                     (int)mv_get_int(onum_v), &otext);
-    if (!ocol) return 0;                  /* order field not a matching column */
+    int64_t oattr = mv_get_int(oattr_v);
+    int onum = (int)mv_get_int(onum_v);
+    /* A mapped column of the right type sorts natively; otherwise the driver
+       sorts the raw attribute out of the document (#157).  This used to give
+       up here, which is why every BY on an un-mapped field was sorted in the
+       verb after streaming every id. */
+    const char *ocol = map_order_col(o, oattr, onum, &otext);
+    if (!ocol) {
+        if (oattr < 1) return 0;          /* @ID / I-type: nothing to push */
+        otext = !onum;
+    }
 
     /* optional filter, pushable like the others */
     const char *fcol = NULL, *fop = "", *fval = NULL;
@@ -2479,7 +2932,8 @@ int64_t mvx_orderselect(mvx_ctx *ctx, const mv_value *fvar,
     }
 
     mvx_cursor *c = b->driver->select_order(f, fcol, fattr, fop, fval, fvl,
-                                            ocol, otext, mv_get_int(limit_v));
+                                            ocol, oattr, onum, otext,
+                                            mv_get_int(limit_v));
     if (!c) return 0;
     store_state *st = state(ctx);
     clear_select(st);
@@ -2595,17 +3049,26 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
     char plan[4096], sql[4000];
     int done = 0;
 
-    /* Priority 1: BY + FIRST with at most one filter -> ORDER BY / LIMIT push. */
-    if (!done && b->driver->explain && limit > 0 && np <= 1 && battr > 0) {
+    /* Priority 1: BY (with or without FIRST) and at most one filter -> the
+       ORDER BY / LIMIT push.
+       NOT `limit > 0`: that required a FIRST, so a plain `BY x` reported
+       "sorted in the verb" while an ORDER BY was in fact pushed.  And `ocol`
+       may be NULL — an order on a RAW attribute pushes when the sort is
+       numeric (#157), which this could not describe at all.  Both conditions
+       must match what mvx_orderselect actually does, or DESCRIBE goes back to
+       describing something else (#172). */
+    if (!done && b->driver->explain && np <= 1 && battr > 0) {
         int otext = 0;
         const char *ocol = o ? map_order_col(o, battr, (int)bnum, &otext) : NULL;
+        if (!ocol) otext = !bnum;
+        int orderok = ocol != NULL || bnum;     /* raw: numeric only */
         int filterok = np == 0 ||
                        (ops[0][1] == '\0' && (ops[0][0] == '=' || ops[0][0] == '#'));
-        if (ocol && filterok) {
+        if (orderok && filterok) {
             mvx_pred fp;
             if (np == 1) { fp = preds[0]; fp.numeric = 0; }
-            if (b->driver->explain(f, np == 1 ? &fp : NULL, np, ocol, otext,
-                                   limit, sql, sizeof sql)) {
+            if (b->driver->explain(f, np == 1 ? &fp : NULL, np, ocol, battr,
+                                   (int)bnum, otext, limit, sql, sizeof sql)) {
                 snprintf(plan, sizeof plan, "%s: %s", drv, sql);
                 done = 1;
             }
@@ -2614,7 +3077,8 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
 
     /* Priority 2: every condition pushes -> one server-side WHERE (no order). */
     if (!done && b->driver->explain && np >= 1 && allpush) {
-        if (b->driver->explain(f, preds, np, NULL, 0, 0, sql, sizeof sql)) {
+        if (b->driver->explain(f, preds, np, NULL, 0, 0, 0, 0,
+                               sql, sizeof sql)) {
             size_t pp = (size_t)snprintf(plan, sizeof plan, "%s: %s", drv, sql);
             if (battr > 0 || limit > 0)
                 snprintf(plan + pp, sizeof plan - pp, "; then %s in the verb",
@@ -2626,7 +3090,8 @@ void mvx_describe(mvx_ctx *ctx, mv_value *dst, const mv_value *fvar,
     /* Priority 3: no server-side query for this shape. */
     if (!done) {
         if (b->driver->explain &&
-            b->driver->explain(f, NULL, 0, NULL, 0, 0, sql, sizeof sql)) {
+            b->driver->explain(f, NULL, 0, NULL, 0, 0, 0, 0,
+                               sql, sizeof sql)) {
             size_t pp = (size_t)snprintf(plan, sizeof plan, "%s: %s", drv, sql);
             if (np > 0)
                 pp += (size_t)snprintf(plan + pp, sizeof plan - pp,

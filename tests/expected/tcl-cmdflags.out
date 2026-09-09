@@ -1,6 +1,6 @@
 BUILD-PKG: @TESTROOT@/cftest — 2 item(s) built, 0 error(s)
-linked @ROOT@/packages/getopt
-linked @ROOT@/packages/cmd
+linked @PKG@/getopt
+linked @PKG@/cmd
 linked @TESTROOT@/cftest
 m=[hello world]
 all=1
@@ -18,5 +18,5 @@ options:
   -m, --message <value> commit message
   -a, --all             stage all
 unlinked @TESTROOT@/cftest
-unlinked @ROOT@/packages/cmd
-unlinked @ROOT@/packages/getopt
+unlinked @PKG@/cmd
+unlinked @PKG@/getopt
