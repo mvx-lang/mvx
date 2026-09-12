@@ -3334,7 +3334,11 @@ if [ "$QUICK" = 0 ]; then
   echo "== install"
   IPFX="$TESTROOT/prefix"
   rm -rf "$IPFX"
-  if cmake --install "$ROOT/build" --prefix "$IPFX" >/dev/null 2>&1; then
+  # KEPT, NOT DISCARDED.  This install now fetches published packages, and the
+  # fetch reports through CMake warnings -- sending them to /dev/null is how a
+  # CI log ends up unable to say whether the packages arrived (mvx#198).
+  ILOG="$TESTROOT/install.log"
+  if cmake --install "$ROOT/build" --prefix "$IPFX" >"$ILOG" 2>&1; then
     IACCT="$TESTROOT/iacct"
     rm -rf "$IACCT"; mkdir -p "$IACCT"
     prog="$IACCT/hi.b"
@@ -3353,8 +3357,31 @@ if [ "$QUICK" = 0 ]; then
     else
       FAIL=$((FAIL + 1)); echo "FAIL install: $out"
     fi
+    # AND THE BUNDLED PACKAGE HAS TO BE IN IT (mvx#198).
+    #
+    # `cmake --install' fetches the published git package now, and when there is
+    # no asset for the platform it WARNS AND CARRIES ON -- deliberately, so that
+    # mvx stays installable on macOS.  The consequence is that the assertion
+    # above passes identically whether the package arrived or never did, which
+    # is a check that measures nothing.  So ask for the thing itself.
+    #
+    # WHICH PLATFORMS MUST HAVE IT is read from the generated install script
+    # rather than guessed here: it is the same triple the install used, so the
+    # two cannot disagree.
+    itrip="$(sed -n 's/^set(MVX_PKG_TRIPLE "\(.*\)")$/\1/p' \
+             "$ROOT/build/install-system.cmake" 2>/dev/null)"
+    if [ -e "$IPFX/share/mvx/system/CATALOG/GIT" ]; then
+      PASS=$((PASS + 1)); echo "  install carries the git package (${itrip:-?})"
+    elif [ "$itrip" = linux-x86_64-le ]; then
+      FAIL=$((FAIL + 1))
+      echo "FAIL install: no CATALOG/GIT -- the git package did not install ($itrip)"
+      sed -n 's/^/    | /p' "$ILOG" | tail -12
+    else
+      echo "  note: no git package for ${itrip:-unknown platform}; none is published"
+    fi
   else
     FAIL=$((FAIL + 1)); echo "FAIL install: cmake --install failed"
+    sed -n 's/^/    | /p' "$ILOG" | tail -12
   fi
 fi
 
