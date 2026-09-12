@@ -80,6 +80,39 @@ option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
 # built into libmvxrt now (#169), so it needs no package and no configuration.
 set(MVX_PACKAGES "http" CACHE STRING "Packages built into the system account")
 
+# Packages BUNDLED WITH AN INSTALL, downloaded prebuilt rather than built here
+# (mvx#198).  Since #169 the package submodules are gone, which is right -- they
+# were pinned and drifting -- but it left an installed mvx with no GIT: the
+# toolchain shipped, the package did not, and `scripts/test.sh' fetching them
+# for tests helped nobody who had installed mvx.
+#
+# PREBUILT, NOT BUILT FROM SOURCE.  Each of these publishes an mvx asset already
+# compiled against a published toolchain; building them here instead would put
+# libgit2 and a compiler on the critical path of every install.
+#
+# MVPKG IS NOT IN THE LIST AND IS NOT OPTIONAL: it is the package manager, the
+# thing that installs everything else afterwards, so it comes with the toolchain
+# the way the toolchain comes with its own verbs.  The list is what it would
+# otherwise have to fetch first.
+set(MVX_BUNDLED_PACKAGES "git" CACHE STRING
+    "Published packages downloaded into the system account at install time")
+# PINNED, so an install is reproducible and an upgrade is a commit.  Bump these
+# deliberately; scripts/test.sh pins the same versions for the same reason.
+set(MVX_MVPKG_VERSION "1.23.0" CACHE STRING "Pinned mvpkg release to install")
+set(MVX_PKG_VERSION_git "2.0.4" CACHE STRING "Pinned mvx-lang/git release to install")
+
+# The asset triple is decided HERE, at configure time, not in the install script:
+# a script run by `cmake --install' has no CMAKE_SYSTEM_* of its own, and the
+# answer belongs to the machine being configured either way.  Assets are named
+# <pkg>-<ver>-mvx-<os>-<arch>-<endian>.tar.gz.
+string(TOLOWER "${CMAKE_SYSTEM_NAME}" MVX_PKG_OS)
+set(MVX_PKG_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
+  set(MVX_PKG_ENDIAN "be")
+else()
+  set(MVX_PKG_ENDIAN "le")
+endif()
+
 # --- runtime -----------------------------------------------------------
 # A SHARED library so its code is mapped once and shared across every mvx
 # process (each cataloged verb is its own executable), and so dlopen'd

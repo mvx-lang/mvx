@@ -52,4 +52,91 @@ foreach(v ${verbs})
   endif()
   message(STATUS "  cataloged ${vn}")
 endforeach()
+# --- published packages, downloaded prebuilt (mvx#198) ----------------------
+#
+# An installed mvx used to have no GIT.  The package submodules went away in
+# #169 and nothing replaced them for a USER: the tests fetch packages, the
+# install did not.  So the install now does what a person would otherwise do by
+# hand -- fetch the published package for this platform and put it in the system
+# account, where every account sees it with no LINK-PKG.
+#
+# MVPKG COMES FIRST AND ALWAYS.  It is how anything else gets installed later;
+# shipping a toolchain that cannot install a package, and telling people to
+# install a package to get it, is a circle.
+set(MVX_PKG_TRIPLE "@MVX_PKG_OS@-@MVX_PKG_ARCH@-@MVX_PKG_ENDIAN@")
+set(MVX_PKG_BASEURL "https://github.com/mvx-lang")
+
+# mvx_fetch_package(<display> <repo> <asset-stem> <version>)
+#
+# The asset is account-shaped with its contents at the tar root -- CATALOG, VOC,
+# LIB, and for git a bin/ -- so it unpacks straight into the system account.
+function(mvx_fetch_package name repo stem version)
+  set(tgz "${stem}-${version}-mvx-${MVX_PKG_TRIPLE}.tar.gz")
+  set(url "${MVX_PKG_BASEURL}/${repo}/releases/download/${version}/${tgz}")
+  set(tmp "${BIN}/pkgdl/${name}")
+  file(REMOVE_RECURSE "${tmp}")
+  file(MAKE_DIRECTORY "${tmp}")
+
+  # THE CHECKSUM IS PUBLISHED, SO IT IS CHECKED.  Every asset has a .sha256
+  # beside it; downloading one and not the other is choosing to trust the
+  # network for no reason.
+  file(DOWNLOAD "${url}.sha256" "${tmp}/sum" STATUS sumst TIMEOUT 60)
+  list(GET sumst 0 sumrc)
+  file(DOWNLOAD "${url}" "${tmp}/${tgz}" STATUS dlst TIMEOUT 300)
+  list(GET dlst 0 dlrc)
+  if(NOT dlrc EQUAL 0 OR NOT sumrc EQUAL 0)
+    list(GET dlst 1 dlmsg)
+    # NOT AN ERROR, AND IT SAYS WHY.  These packages publish
+    # mvx-linux-x86_64-le only; on macOS -- which is where mvx is developed --
+    # there is nothing to fetch, and failing here would make mvx uninstallable
+    # on the platform it is written on.  A silent skip would be worse than
+    # either: `GIT' would simply not be there, months later, with nothing to
+    # read.  So say it, and carry on.
+    message(WARNING
+      "mvx: no ${name} package for ${MVX_PKG_TRIPLE} -- ${dlmsg}\n"
+      "     tried ${url}\n"
+      "     The toolchain is installed; ${name} is not.  Install it later with\n"
+      "     mvpkg, or set -DMVX_BUNDLED_PACKAGES=\"\" to stop looking.")
+    return()
+  endif()
+  file(READ "${tmp}/sum" sumline)
+  string(REGEX MATCH "[0-9a-fA-F]+" want "${sumline}")
+  file(SHA256 "${tmp}/${tgz}" got)
+  string(TOLOWER "${want}" want)
+  if(NOT want STREQUAL "" AND NOT want STREQUAL got)
+    message(FATAL_ERROR
+      "mvx: ${name} ${version} failed its checksum\n"
+      "     published ${want}\n"
+      "     downloaded ${got}\n"
+      "     Refusing to install it.")
+  endif()
+
+  file(ARCHIVE_EXTRACT INPUT "${tmp}/${tgz}" DESTINATION "${tmp}/x")
+  # The account parts go to the system account; a CLI goes where binaries go.
+  foreach(part CATALOG VOC VOC.DICT LIB CMD.BP CMD.BP.DICT BP)
+    if(EXISTS "${tmp}/x/${part}")
+      file(COPY "${tmp}/x/${part}" DESTINATION "${SYS}")
+    endif()
+  endforeach()
+  if(EXISTS "${tmp}/x/bin")
+    file(GLOB clis "${tmp}/x/bin/*")
+    foreach(c ${clis})
+      file(COPY "${c}" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin"
+           FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                            GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+    endforeach()
+  endif()
+  file(REMOVE_RECURSE "${tmp}")
+  message(STATUS "  installed package ${name} ${version} (${MVX_PKG_TRIPLE})")
+endfunction()
+
+mvx_fetch_package(mvpkg mv_package mvpkg "@MVX_MVPKG_VERSION@")
+foreach(pkg @MVX_BUNDLED_PACKAGES@)
+  if("${pkg}" STREQUAL "git")
+    mvx_fetch_package(git mv_git mv_git "@MVX_PKG_VERSION_git@")
+  else()
+    message(WARNING "mvx: no published asset is known for package '${pkg}'")
+  endif()
+endforeach()
+
 message(STATUS "MVX system account installed to ${SYS}")
