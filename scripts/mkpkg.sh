@@ -123,10 +123,11 @@ fi
 # A prebuilt LIB/libmvxext_<name> shipped without a NATIVE manifest is
 # binary-only (mkpkg leaves it alone).
 if [ -f "$PKG/NATIVE" ]; then
-  NSRCS=""; NPKGCONF=""
+  NSRCS=""; NPKGCONF=""; NLIBS=""
   while IFS= read -r nline || [ -n "$nline" ]; do
     case "$nline" in
       pkgconfig:*) NPKGCONF="$NPKGCONF ${nline#pkgconfig:}" ;;
+      libs:*)      NLIBS="$NLIBS ${nline#libs:}" ;;
       ""|\#*) ;;
       *) NSRCS="$NSRCS $PKG/$nline" ;;
     esac
@@ -139,6 +140,12 @@ if [ -f "$PKG/NATIVE" ]; then
       # shellcheck disable=SC2086
       NLDFLAGS="$(pkg-config --libs $NPKGCONF 2>/dev/null || true)"
     fi
+    # A `libs:` line is the fallback for a library that is present but has no
+    # .pc file -- libcurl on macOS is in the SDK and pkg-config knows nothing
+    # about it, so `pkgconfig: libcurl` yields an empty LDFLAGS and the link
+    # fails for want of -lcurl.  Used only when pkg-config produced nothing, so
+    # a platform that does have the .pc keeps its own flags.
+    if [ -z "$NLDFLAGS" ] && [ -n "$NLIBS" ]; then NLDFLAGS="$NLIBS"; fi
     mkdir -p "$PKG/LIB"
     # shellcheck disable=SC2086
     cc -O2 -fPIC -shared $UNDEF -I"$ROOT/runtime/include" $NCFLAGS $NSRCS $NLDFLAGS \
