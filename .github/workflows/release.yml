@@ -95,7 +95,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          # PINNED, NOT `ubuntu-latest' (mvx#203).  The binaries link against
+          # the runner's own libc, so that label decides the glibc floor of
+          # every published tarball -- and it MOVES.  It is 24.04 today; when
+          # GitHub points it at 26.04 the floor rises again, the release still
+          # succeeds, and the set of machines able to run mvx quietly shrinks.
+          # CI cannot catch it either: CI runs on the image that built it.
+          #
+          # This does not LOWER the floor -- 24.04 is what `ubuntu-latest'
+          # already resolves to -- it stops it moving without anyone deciding.
+          - runner: ubuntu-24.04
             arch: amd64
           - runner: ubuntu-24.04-arm
             arch: arm64
