@@ -8,6 +8,11 @@
 # '/'->'_') as a GitHub release asset the package registry indexes.  This
 # collapses that copy-pasted `source` job to one step.
 #
+# Off a tag, the release's version is stamped into mvpkg.json (and PKG, where a
+# package still has one) before the tar, so a source tarball and the binaries
+# of the same release never disagree about what they are (mvx#205).  A
+# package's committed manifest version is only a default for a dev tree.
+#
 #   - uses: actions/checkout@v5
 #   - uses: mvx-lang/mvx/.github/actions/publish-source@main
 #     with:
@@ -61,9 +66,18 @@ runs:
         PACKAGE: ${{ inputs.package }}
         ARTIFACT: ${{ inputs.artifact }}
         EXTRA_EXCLUDE: ${{ inputs.extra-exclude }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
         VER="${GITHUB_REF_NAME}"
+        # The committed manifest version is right only if someone remembered to
+        # edit it before tagging; mvpkg 1.24.0 shipped saying 1.16.0 (mvx#205).
+        # Only off a tag -- a branch name is not a version.
+        if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+          python3 "$ACTION_PATH/stamp-manifests.py" . "$VER"
+        else
+          echo "not a tag (${GITHUB_REF_TYPE:-unset} $VER): manifests left as committed"
+        fi
         # base = $ARTIFACT when the package declares one, else the package name
         # '/'->'_'.  The registry keys EVERY asset of a release off one base, so
         # this must agree with what the binary jobs use and with "artifact" in
