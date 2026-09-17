@@ -98,7 +98,7 @@ set(MVX_BUNDLED_PACKAGES "git" CACHE STRING
     "Published packages downloaded into the system account at install time")
 # PINNED, so an install is reproducible and an upgrade is a commit.  Bump these
 # deliberately; scripts/test.sh pins the same versions for the same reason.
-set(MVX_MVPKG_VERSION "1.23.0" CACHE STRING "Pinned mvpkg release to install")
+set(MVX_MVPKG_VERSION "1.24.0" CACHE STRING "Pinned mvpkg release to install")
 set(MVX_PKG_VERSION_git "2.0.4" CACHE STRING "Pinned mvx-lang/git release to install")
 
 # The asset triple is decided HERE, at configure time, not in the install script:
