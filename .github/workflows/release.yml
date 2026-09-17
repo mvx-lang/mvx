@@ -154,6 +154,13 @@ jobs:
           fi
 
       - name: Build and install
+        env:
+          # The install asks GitHub which package versions exist (mvx#212);
+          # with nobody at the terminal it takes each one's latest stable, so
+          # a release bundles whatever is latest when it is built.  The token
+          # keeps that listing clear of the per-IP rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+          MVX_INSTALL_PROMPT: never
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="/usr/lib/llvm-${LLVM_VERSION}"

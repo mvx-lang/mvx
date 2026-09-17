@@ -1,0 +1,132 @@
+[
+ {
+  "tag_name": "dev",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-dev-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.2.0-alpha1",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.2.0-alpha1-udt-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "3.0.0",
+  "prerelease": false,
+  "draft": true,
+  "assets": [
+   {
+    "name": "mv_git-3.0.0-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.3.0-nightly4",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.3.0-nightly4-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.1.0-rc3",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.1.0-rc3-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.1.0-rc10",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.1.0-rc10-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.1.0-beta6",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.1.0-beta6-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.0.4",
+  "prerelease": false,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.0.4-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.0.10",
+  "prerelease": false,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.0.10-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.0.0-alpha9",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.0.0-alpha9-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.0.0-rc6",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.0.0-rc6-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "v2.0.99",
+  "prerelease": false,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-v2.0.99-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ },
+ {
+  "tag_name": "2.0.11",
+  "prerelease": false,
+  "draft": false,
+  "assets": [
+   {
+    "name": "mv_git-2.0.11-mvx-linux-aarch64-le.tar.gz"
+   }
+  ]
+ }
+]
