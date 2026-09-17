@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <time.h>
@@ -49,6 +50,36 @@ const char *mvx_runtime_dir(void) {
         dir[0] = '\0';
     }
     return dir;
+}
+
+#ifndef MVX_SYSTEM_DIR
+#define MVX_SYSTEM_DIR "."
+#endif
+
+/* The system account, found the way the rest of an install is: relative to
+   libmvxrt.  $MVXSYSTEM wins; then <lib>/../share/mvx/system (the install
+   layout) and <lib>/../system (the dev build tree); then the compile-time
+   default.
+   Everything that reaches into the system account -- verb lookup, CALL and
+   extension loading, the permission layer -- must ask HERE.  They used to ask
+   separately, and only verb lookup self-located: the rest fell back to the
+   build tree baked in at configure time, which exists only on the machine that
+   built the release.  An installed toolchain found its verbs and then could
+   not call anything they called (mvx#210). */
+const char *mvx_system_dir(void) {
+    const char *p = getenv("MVXSYSTEM");
+    if (p && p[0]) return p;
+    const char *rtd = mvx_runtime_dir();
+    if (rtd[0]) {
+        static char buf[4096];
+        const char *cand[] = { "/../share/mvx/system", "/../system" };
+        for (size_t i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+            snprintf(buf, sizeof buf, "%s%s", rtd, cand[i]);
+            struct stat sb;
+            if (stat(buf, &sb) == 0 && S_ISDIR(sb.st_mode)) return buf;
+        }
+    }
+    return MVX_SYSTEM_DIR;
 }
 
 /* Point the dynamic loader at libmvxrt's own directory for child

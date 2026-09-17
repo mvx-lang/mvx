@@ -39,7 +39,7 @@
  *                                             admin's per-user/group override,
  *                                             outside every account so it cannot
  *                                             be self-granted (8.3).  <system>
- *                                             is $MVXSYSTEM (else MVX_SYSTEM_DIR).
+ *                                             is mvx_system_dir().
  * A `deny` anywhere wins over any `permit`, so the system layer can lock a
  * command (or a switch) down for a user/group regardless of what an account
  * grants itself; the account files can only NARROW, not escalate past a system
@@ -257,10 +257,11 @@ static void load(void) {
     parse_file(path);
     /* the system-account layer — the admin's authoritative per-user/group
        override, outside every account (8.3). */
-    const char *sys = getenv("MVXSYSTEM");
-#ifdef MVX_SYSTEM_DIR
-    if (!sys || !sys[0]) sys = MVX_SYSTEM_DIR;
-#endif
+    /* Where every other part of the runtime looks (mvx#210).  This used to
+       fall back to the build tree baked in at configure time, so on an
+       installed toolchain the system layer -- the admin's overrides and the
+       program blessings -- was silently never read. */
+    const char *sys = mvx_system_dir();
     if (sys && sys[0]) {
         snprintf(path, sizeof path, "%s/.mvx-private/permissions", sys);
         parse_file(path);

@@ -325,8 +325,6 @@ if(EDITLINE_LIBRARY)
   target_compile_definitions(mvx PRIVATE HAVE_EDITLINE)
   target_link_libraries(mvx PRIVATE ${EDITLINE_LIBRARY})
 endif()
-target_compile_definitions(mvx PRIVATE
-  MVX_SYSTEM_DIR="${CMAKE_BINARY_DIR}/system")
 set_target_properties(mvx PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 

@@ -64,6 +64,10 @@ void     mvx_ctx_destroy(mvx_ctx *ctx);
 /* Directory of the loaded libmvxrt; the anchor for relocatable installs
    (drivers beside it, ../bin, ../share/mvx/system).  "" if unknown. */
 const char *mvx_runtime_dir(void);
+/* The system account: $MVXSYSTEM, else relative to libmvxrt (the install
+   layout, then the dev build tree), else the compile-time default.  The ONE
+   answer every part of the runtime uses (mvx#210). */
+const char *mvx_system_dir(void);
 
 /* Is this storage driver usable on this host?  An account may name a backend
    this machine was not built with — migration is per FILE, so a repository's

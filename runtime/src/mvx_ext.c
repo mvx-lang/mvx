@@ -31,9 +31,6 @@
 #define LIB_SUFFIX ".so"
 #endif
 
-#ifndef MVX_SYSTEM_DIR
-#define MVX_SYSTEM_DIR "."
-#endif
 
 typedef struct reg_ent {
     const char *name;                   /* points into the loaded lib (never freed) */
@@ -147,8 +144,7 @@ void mvx_ext_load_libs(void) {
         fclose(fp);
     }
 
-    const char *sys = getenv("MVXSYSTEM");
-    if (!sys || !sys[0]) sys = MVX_SYSTEM_DIR;
+    const char *sys = mvx_system_dir();   /* not the build tree (mvx#210) */
     char syslib[4096];
     snprintf(syslib, sizeof syslib, "%s/LIB", sys);
     load_dir(syslib);
