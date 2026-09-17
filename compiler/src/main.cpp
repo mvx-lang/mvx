@@ -101,6 +101,24 @@ void readExports(const fs::path &exportsFile, std::set<std::string> &out) {
     }
 }
 
+// The system account, found the way the runtime finds it (mvx_system_dir in
+// runtime/src/mvx_ctx.c): $MVXSYSTEM, then relative to this executable -- the
+// install layout <root>/share/mvx/system first, then the dev build tree's
+// <root>/system.  This used to try only <root>/system, so an INSTALLED
+// compiler never saw its system account's EXPORTS and rejected every
+// extension function the toolchain itself ships (mvx#210).  It cannot call the
+// runtime's version: mvx-basic does not link libmvxrt.
+fs::path systemDir() {
+    if (const char *s = getenv("MVXSYSTEM"); s && *s) return s;
+    fs::path root = exeDir().parent_path();
+    for (const char *rel : {"share/mvx/system", "system"}) {
+        std::error_code ec;
+        fs::path cand = root / rel;
+        if (fs::is_directory(cand, ec)) return cand;
+    }
+    return root / "system";
+}
+
 // The expression functions available at compile time: from the always-on
 // system-installed packages (aggregated <system>/EXPORTS) plus, when compiling
 // in an account, that account's linked packages (PACKAGES -> each <pkg>/EXPORTS).
@@ -115,10 +133,7 @@ static const char *const kBuiltinExtFuncs[] = {"JSONENCODE", "JSONDECODE"};
 std::set<std::string> loadExtFuncs() {
     std::set<std::string> out;
     for (const char *n : kBuiltinExtFuncs) out.insert(n);
-    fs::path sys;
-    if (const char *s = getenv("MVXSYSTEM"); s && *s) sys = s;
-    else sys = exeDir().parent_path() / "system";
-    readExports(sys / "EXPORTS", out);
+    readExports(systemDir() / "EXPORTS", out);
 
     if (const char *acct = getenv("MVXACCOUNT"); acct && *acct) {
         std::ifstream pf(fs::path(acct) / "PACKAGES");
