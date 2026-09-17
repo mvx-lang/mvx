@@ -230,6 +230,10 @@ jobs:
           context: .
           file: docker/Dockerfile.base
           build-args: LLVM_VERSION=${{ env.LLVM_VERSION }}
+          # the install's release listing uses the rate-limited GitHub API
+          # (mvx#212); a secret, so it never lands in an image layer
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
