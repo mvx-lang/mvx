@@ -203,13 +203,22 @@ function(mvx_choose_version name repo stem triple override workdir outvar)
     set(hdr HTTPHEADER "Accept: application/vnd.github+json")
     # Unauthenticated API calls are rate-limited per IP, and CI runners share
     # IPs.  A token, when there is one, keeps the listing from failing there.
+    set(auth "")
     if(DEFINED ENV{GITHUB_TOKEN} AND NOT "$ENV{GITHUB_TOKEN}" STREQUAL "")
-      list(APPEND hdr HTTPHEADER "Authorization: Bearer $ENV{GITHUB_TOKEN}")
+      set(auth HTTPHEADER "Authorization: Bearer $ENV{GITHUB_TOKEN}")
     elseif(DEFINED ENV{GH_TOKEN} AND NOT "$ENV{GH_TOKEN}" STREQUAL "")
-      list(APPEND hdr HTTPHEADER "Authorization: Bearer $ENV{GH_TOKEN}")
+      set(auth HTTPHEADER "Authorization: Bearer $ENV{GH_TOKEN}")
     endif()
-    file(DOWNLOAD "${api}" "${json}" STATUS st TIMEOUT 60 ${hdr})
+    file(DOWNLOAD "${api}" "${json}" STATUS st TIMEOUT 60 ${hdr} ${auth})
     list(GET st 0 rc)
+    # A token GitHub REJECTS -- stale, revoked, wrong scope -- fails the whole
+    # request instead of falling back, so a developer with an old GITHUB_TOKEN
+    # in their shell would silently get no packages.  Try once without it.
+    if(NOT rc EQUAL 0 AND auth)
+      message(STATUS "  ${name}: the release listing refused the token; trying without it")
+      file(DOWNLOAD "${api}" "${json}" STATUS st TIMEOUT 60 ${hdr})
+      list(GET st 0 rc)
+    endif()
     if(NOT rc EQUAL 0)
       list(GET st 1 why)
       message(WARNING

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # MVX base image — the compiler, shell, runtime, drivers, and the
 # standard verbs, installed to /usr/local so `mvx` runs from PATH.
 #
@@ -53,11 +54,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY . /src
 WORKDIR /src
-RUN cmake -S . -B build -G Ninja \
+# The install lists each package's releases through the GitHub API (mvx#212),
+# which is rate-limited per IP -- and a limited listing does not fail the
+# build, it quietly leaves the packages out of the image.  So a token is used
+# when the build is given one, as a BuildKit SECRET: a build-arg would stay in
+# the image history.  Without one (a local `docker build') it runs as before.
+# Nobody answers a prompt in a build, so the install takes each package's
+# latest stable release.
+RUN --mount=type=secret,id=github_token \
+    if [ -s /run/secrets/github_token ]; then \
+      GITHUB_TOKEN="$(cat /run/secrets/github_token)"; export GITHUB_TOKEN; \
+    fi; \
+    cmake -S . -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_PREFIX_PATH=/usr/lib/llvm-${LLVM_VERSION} \
  && cmake --build build \
- && cmake --install build --prefix /usr/local
+ && MVX_INSTALL_PROMPT=never cmake --install build --prefix /usr/local
 
 # ---- runtime: the install plus a C toolchain to compile BASIC ---------
 FROM debian:bookworm-slim AS mvx
