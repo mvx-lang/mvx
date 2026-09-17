@@ -96,10 +96,30 @@ set(MVX_PACKAGES "http" CACHE STRING "Packages built into the system account")
 # otherwise have to fetch first.
 set(MVX_BUNDLED_PACKAGES "git" CACHE STRING
     "Published packages downloaded into the system account at install time")
-# PINNED, so an install is reproducible and an upgrade is a commit.  Bump these
-# deliberately; scripts/test.sh pins the same versions for the same reason.
-set(MVX_MVPKG_VERSION "1.24.0" CACHE STRING "Pinned mvpkg release to install")
-set(MVX_PKG_VERSION_git "2.0.4" CACHE STRING "Pinned mvx-lang/git release to install")
+# NOT PINNED (mvx#212).  Empty means the install asks: it lists each package's
+# releases and offers the latest stable one plus the newest at each less-stable
+# level -- or, with nobody at the terminal, takes the latest stable.  Set one to
+# install exactly that version, for a build that has to be reproducible.
+# (scripts/test.sh still pins the packages it TESTS against, which is a
+# different thing: a test run must not depend on what was released today.)
+set(MVX_PACKAGE_VERSION_mvpkg "" CACHE STRING
+    "mvpkg release to install; empty = ask at install (latest stable if unattended)")
+set(MVX_PACKAGE_VERSION_git "" CACHE STRING
+    "mvx-lang/git release to install; empty = ask at install (latest stable if unattended)")
+# THE OLD PINS ARE RENAMED, NOT REUSED.  A build directory configured before
+# this still holds them in its cache, and there they are indistinguishable from
+# a pin someone chose on purpose -- so under the old names every existing build
+# would go on installing its stale version and never ask.  Drop them, and say
+# what replaced them.
+foreach(old MVX_MVPKG_VERSION MVX_PKG_VERSION_git)
+  if(DEFINED CACHE{${old}})
+    message(WARNING
+      "${old} is no longer used (mvx#212): the install now asks which version to "
+      "install.  To pin one, set MVX_PACKAGE_VERSION_mvpkg or "
+      "MVX_PACKAGE_VERSION_git instead.  Dropped ${old}=${${old}}.")
+    unset(${old} CACHE)
+  endif()
+endforeach()
 
 # The asset triple is decided HERE, at configure time, not in the install script:
 # a script run by `cmake --install' has no CMAKE_SYSTEM_* of its own, and the
@@ -463,4 +483,7 @@ set(MVX_SOURCE_DIR ${CMAKE_SOURCE_DIR})
 set(MVX_BINARY_DIR ${CMAKE_BINARY_DIR})
 configure_file(${CMAKE_SOURCE_DIR}/scripts/install-system.cmake.in
                ${CMAKE_BINARY_DIR}/install-system.cmake @ONLY)
+# included by install-system.cmake from its own directory
+configure_file(${CMAKE_SOURCE_DIR}/scripts/pkgver.cmake
+               ${CMAKE_BINARY_DIR}/pkgver.cmake COPYONLY)
 install(SCRIPT ${CMAKE_BINARY_DIR}/install-system.cmake)

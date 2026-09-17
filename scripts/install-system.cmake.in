@@ -130,10 +130,24 @@ function(mvx_fetch_package name repo stem version)
   message(STATUS "  installed package ${name} ${version} (${MVX_PKG_TRIPLE})")
 endfunction()
 
-mvx_fetch_package(mvpkg mv_package mvpkg "@MVX_MVPKG_VERSION@")
+# WHICH VERSION is asked, not pinned (mvx#212): pkgver.cmake lists each
+# package's releases and takes the answer -- or, with nobody at the terminal,
+# the latest stable.  A version set at configure time is used as given.
+include("${CMAKE_CURRENT_LIST_DIR}/pkgver.cmake")
+
+# mvx_install_package(<display> <repo> <asset-stem> <override>)
+function(mvx_install_package name repo stem override)
+  mvx_choose_version("${name}" "${repo}" "${stem}" "${MVX_PKG_TRIPLE}"
+                     "${override}" "${BIN}/pkgdl" version)
+  if(NOT version STREQUAL "")
+    mvx_fetch_package("${name}" "${repo}" "${stem}" "${version}")
+  endif()
+endfunction()
+
+mvx_install_package(mvpkg mv_package mvpkg "@MVX_PACKAGE_VERSION_mvpkg@")
 foreach(pkg @MVX_BUNDLED_PACKAGES@)
   if("${pkg}" STREQUAL "git")
-    mvx_fetch_package(git mv_git mv_git "@MVX_PKG_VERSION_git@")
+    mvx_install_package(git mv_git mv_git "@MVX_PACKAGE_VERSION_git@")
   else()
     message(WARNING "mvx: no published asset is known for package '${pkg}'")
   endif()
