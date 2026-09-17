@@ -22,6 +22,17 @@
 #   MVX_INSTALL_RELEASES=<dir>        read <dir>/<repo>.json instead of asking
 #                                     GitHub.
 
+# POLICIES ARE SET HERE, not inherited.  This file runs inside `cmake --install'
+# and `cmake -P', where no project has set any, so an older CMake applies the
+# OLD behaviour of every policy -- and under that, if(IN_LIST) is an unknown
+# argument and a quoted "stable" is dereferenced as the variable `stable'.  A
+# recent CMake has no OLD behaviour for those, which is how this passed on a
+# Mac and failed on Ubuntu's 3.28.  Functions keep the policies in force when
+# they are DEFINED, so setting them around the definitions is enough, and
+# PUSH/POP leaves the including script as it was.
+cmake_policy(PUSH)
+cmake_policy(VERSION 3.24)
+
 # The order less-stable levels are offered in, most stable first.  A level not
 # named here is offered after these, alphabetically; `dev' is always last.
 set(MVX_PKGVER_LEVELS rc beta alpha)
@@ -302,3 +313,5 @@ function(mvx_choose_version name repo stem triple override workdir outvar)
   endforeach()
   message(WARNING "mvx: no valid choice for ${name}; not installing it.")
 endfunction()
+
+cmake_policy(POP)
