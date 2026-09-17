@@ -3609,5 +3609,67 @@ else
   PASS=$((PASS + 1)); echo "  no raw ->data outside mv_str.c"
 fi
 
+echo "== publish-source stamps the release version"
+# mvx#205: a source tarball carried whatever version was last committed.  The
+# stamp must change the TOP-LEVEL version and nothing else, keep the file's
+# layout, and never mistake a nested "version" key for the package's own.
+STAMP="$ROOT/.github/actions/publish-source/stamp-manifests.py"
+SD=$(mktemp -d)
+st_check() {   # st_check <name> <file> <expected-file>
+  if cmp -s "$2" "$3"; then
+    PASS=$((PASS + 1)); echo "  $1"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL $1"; diff "$3" "$2" | sed 's|^|    |'
+  fi
+}
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  (skipped -- no python3)"
+else
+  # 1. an ordinary manifest: only the value moves, inline arrays stay inline
+  mkdir -p "$SD/plain"
+  printf '{\n  "name": "mvx-lang/mvpkg",\n  "version": "1.16.0",\n  "systems": ["mvx", "udt"]\n}\n' > "$SD/plain/mvpkg.json"
+  printf '{\n  "name": "mvx-lang/mvpkg",\n  "version": "1.24.0",\n  "systems": ["mvx", "udt"]\n}\n' > "$SD/plain.want"
+  python3 "$STAMP" "$SD/plain" 1.24.0 >/dev/null
+  st_check "the top-level version is stamped, layout untouched" "$SD/plain/mvpkg.json" "$SD/plain.want"
+
+  # 2. a nested "version" key that comes FIRST must be left alone
+  mkdir -p "$SD/nested"
+  printf '{\n  "require": {\n    "json": {\n      "version": "^1.5"\n    }\n  },\n  "version": "1.0"\n}\n' > "$SD/nested/mvpkg.json"
+  printf '{\n  "require": {\n    "json": {\n      "version": "^1.5"\n    }\n  },\n  "version": "1.1.0"\n}\n' > "$SD/nested.want"
+  python3 "$STAMP" "$SD/nested" 1.1.0 >/dev/null
+  st_check "a nested version key is not the package's version" "$SD/nested/mvpkg.json" "$SD/nested.want"
+
+  # 3. no version key at all: one is added (layout may change; content may not)
+  mkdir -p "$SD/absent"
+  printf '{"name": "mvx-lang/x"}\n' > "$SD/absent/mvpkg.json"
+  python3 "$STAMP" "$SD/absent" 2.0.0 >/dev/null
+  if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d=={"name":"mvx-lang/x","version":"2.0.0"} else 1)' "$SD/absent/mvpkg.json"; then
+    PASS=$((PASS + 1)); echo "  a manifest with no version gains one, and nothing else"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL absent version not added cleanly: $(cat "$SD/absent/mvpkg.json")"
+  fi
+
+  # 4. PKG: line 2 is the version; every other line, and the final newline, stay
+  mkdir -p "$SD/pkg"
+  printf 'getopt\n1.0\nArgument parsing\nmvx udt uv jbase\n' > "$SD/pkg/PKG"
+  printf 'getopt\n1.1.0\nArgument parsing\nmvx udt uv jbase\n' > "$SD/pkg.want"
+  python3 "$STAMP" "$SD/pkg" 1.1.0 >/dev/null
+  st_check "PKG line 2 is stamped and nothing else moves" "$SD/pkg/PKG" "$SD/pkg.want"
+
+  # 5. a broken manifest must stop the release, not ship unstamped
+  mkdir -p "$SD/bad"
+  printf '{"version": "1.0",\n' > "$SD/bad/mvpkg.json"
+  if python3 "$STAMP" "$SD/bad" 1.1.0 >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1)); echo "FAIL invalid JSON was accepted"
+  else
+    PASS=$((PASS + 1)); echo "  invalid JSON fails the step"
+  fi
+
+  # 6. running it twice is harmless (mv_git stamps before calling the action)
+  python3 "$STAMP" "$SD/plain" 1.24.0 >/dev/null
+  st_check "stamping twice is idempotent" "$SD/plain/mvpkg.json" "$SD/plain.want"
+fi
+rm -rf "$SD"
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
