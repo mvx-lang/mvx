@@ -3334,7 +3334,11 @@ if [ "$QUICK" = 0 ]; then
   echo "== install"
   IPFX="$TESTROOT/prefix"
   rm -rf "$IPFX"
-  if cmake --install "$ROOT/build" --prefix "$IPFX" >/dev/null 2>&1; then
+  # KEPT, NOT DISCARDED.  This install now fetches published packages, and the
+  # fetch reports through CMake warnings -- sending them to /dev/null is how a
+  # CI log ends up unable to say whether the packages arrived (mvx#198).
+  ILOG="$TESTROOT/install.log"
+  if MVX_INSTALL_PROMPT=never cmake --install "$ROOT/build" --prefix "$IPFX" </dev/null >"$ILOG" 2>&1; then
     IACCT="$TESTROOT/iacct"
     rm -rf "$IACCT"; mkdir -p "$IACCT"
     prog="$IACCT/hi.b"
@@ -3353,8 +3357,126 @@ if [ "$QUICK" = 0 ]; then
     else
       FAIL=$((FAIL + 1)); echo "FAIL install: $out"
     fi
+    # AND THE BUNDLED PACKAGE HAS TO BE IN IT (mvx#198).
+    #
+    # `cmake --install' fetches the published git package now, and when there is
+    # no asset for the platform it WARNS AND CARRIES ON -- deliberately, so that
+    # mvx stays installable on macOS.  The consequence is that the assertion
+    # above passes identically whether the package arrived or never did, which
+    # is a check that measures nothing.  So ask for the thing itself.
+    #
+    # WHICH PLATFORMS MUST HAVE IT is read from the generated install script
+    # rather than guessed here: it is the same triple the install used, so the
+    # two cannot disagree.
+    itrip="$(sed -n 's/^set(MVX_PKG_TRIPLE "\(.*\)")$/\1/p' \
+             "$ROOT/build/install-system.cmake" 2>/dev/null)"
+    if [ -e "$IPFX/share/mvx/system/CATALOG/GIT" ]; then
+      PASS=$((PASS + 1)); echo "  install carries the git package (${itrip:-?})"
+    elif [ "$itrip" = linux-x86_64-le ]; then
+      FAIL=$((FAIL + 1))
+      echo "FAIL install: no CATALOG/GIT -- the git package did not install ($itrip)"
+      sed -n 's/^/    | /p' "$ILOG" | tail -12
+    else
+      echo "  note: no git package for ${itrip:-unknown platform}; none is published"
+    fi
+    # AND IT HAS TO USE ITS OWN SYSTEM ACCOUNT (mvx#210).
+    #
+    # The first check runs a program that never reaches into the system
+    # account, so it passed while an installed toolchain could not see its own
+    # system EXPORTS or LIB/: the compiler looked for <prefix>/system, and the
+    # runtime for the build tree baked in at configure time.  On a machine that
+    # HAS that build tree -- this one -- the runtime quietly used the wrong
+    # system account and everything looked fine.  So both probes exist ONLY in
+    # the installed system account, where a stray fallback cannot find them:
+    # an export the compiler must know, and a subroutine a CALL must reach.
+    ISYS="$IPFX/share/mvx/system"
+    case "$(uname -s)" in Darwin) ilibsfx=.dylib ;; *) ilibsfx=.so ;; esac
+    mkdir -p "$ISYS/LIB"
+    printf 'MVXINSTPROBE 0 0\n' >> "$ISYS/EXPORTS"
+    printf 'SUBROUTINE MVXINSTSUB(R)\nR = "own-system"\nRETURN\nEND\n' > "$IACCT/probesub.b"
+    printf 'X = MVXINSTPROBE()\n' > "$IACCT/probe1.b"
+    printf 'CALL MVXINSTSUB(R)\nPRINT "sub:":R\n' > "$IACCT/probe2.b"
+    pout="$(
+      env -u MVXSYSTEM -u MVXDRIVERS -u MVXBIN -u MVXSESSION -u MVXACCOUNT \
+          -u DYLD_LIBRARY_PATH -u LD_LIBRARY_PATH sh -c '
+        P="$1"; A="$2"; S="$3"; X="$4"
+        "$P/bin/mvx-basic" -shared "$A/probesub.b" -o "$S/LIB/MVXINSTSUB$X" \
+          >"$A/probesub.log" 2>&1 || { echo "SUB-COMPILE-FAIL $(head -1 "$A/probesub.log")"; exit 0; }
+        if "$P/bin/mvx-basic" "$A/probe1.b" -o "$A/probe1" >"$A/probe1.log" 2>&1
+        then echo "exports:ok"
+        else echo "exports:FAIL $(head -1 "$A/probe1.log")"; fi
+        "$P/bin/mvx-basic" "$A/probe2.b" -o "$A/probe2" >"$A/probe2.log" 2>&1 \
+          || { echo "P2-COMPILE-FAIL $(head -1 "$A/probe2.log")"; exit 0; }
+        (cd "$A" && MVXACCOUNT=. ./probe2 2>&1)
+      ' _ "$IPFX" "$IACCT" "$ISYS" "$ilibsfx" 2>&1)"
+    case "$pout" in
+      *"exports:ok"*"sub:own-system"*)
+        PASS=$((PASS + 1)); echo "  installed toolchain finds its own system account" ;;
+      *)
+        FAIL=$((FAIL + 1))
+        echo "FAIL install: not using its own system account (mvx#210):"
+        printf '%s\n' "$pout" | sed 's/^/    | /' ;;
+    esac
+    # AND ITS SYSTEM-LAYER POLICY APPLIES (mvx#210).  An admin's deny in the
+    # system account must beat an account's own permit -- that is the layer's
+    # whole purpose (#80).  The installed runtime read the build tree's system
+    # layer instead, so on a real install an account could grant itself a
+    # command the admin had denied.  osexec_sys above proves the rule with
+    # MVXSYSTEM set; this proves an installed toolchain applies it unaided.
+    IPACCT="$TESTROOT/ipacct"
+    rm -rf "$IPACCT"; mkdir -p "$IPACCT/.mvx-private" "$ISYS/.mvx-private"
+    echo "permit * = echo" > "$IPACCT/.mvx-private/permissions"
+    echo "deny * = echo" >> "$ISYS/.mvx-private/permissions"
+    dout="$(
+      env -u MVXSYSTEM -u MVXDRIVERS -u MVXBIN -u MVXSESSION -u MVXACCOUNT -u MVXPRIV \
+          -u DYLD_LIBRARY_PATH -u LD_LIBRARY_PATH sh -c '
+        P="$1"; A="$2"; SRC="$3"
+        "$P/bin/mvx-basic" "$SRC" -o "$A/osx" >"$A/osx.log" 2>&1 \
+          || { echo "COMPILE-FAIL $(head -1 "$A/osx.log")"; exit 0; }
+        (cd "$A" && MVXACCOUNT=. ./osx 2>/dev/null)
+      ' _ "$IPFX" "$IPACCT" "$ROOT/tests/osexec_sys.b" 2>&1)"
+    if [ "$dout" = "echo: status=-1" ]; then
+      PASS=$((PASS + 1)); echo "  installed toolchain enforces its system-layer deny"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL install: system-layer deny not enforced (mvx#210): $dout"
+    fi
+    # AND THE BUNDLED CLIENT HAS TO RUN (mvx#212).
+    #
+    # Nothing ever ran the installed MVPKG, and that is how mv_package#150 and
+    # #210 survived side by side for months: the client shipped with no verb
+    # record and an unresolvable first CALL, the toolchain could not find its
+    # own system account to resolve it from, and every check here still passed
+    # because each one asked whether a FILE existed.  So ask the question a
+    # user asks -- does MVPKG run -- on an installed toolchain, with every MVX
+    # variable unset.  Required on the triples mvpkg publishes.
+    if [ -e "$ISYS/CATALOG/MVPKG" ]; then
+      mout="$(
+        env -u MVXSYSTEM -u MVXDRIVERS -u MVXBIN -u MVXSESSION -u MVXACCOUNT -u MVXPRIV \
+            -u DYLD_LIBRARY_PATH -u LD_LIBRARY_PATH sh -c '
+          cd "$2" && "$1/bin/mvx" -a "$2" -c MVPKG 2>&1
+        ' _ "$IPFX" "$IACCT" 2>&1)"
+      case "$mout" in
+        *"usage: MVPKG"*)
+          PASS=$((PASS + 1)); echo "  installed toolchain runs the bundled MVPKG (${itrip:-?})" ;;
+        *)
+          FAIL=$((FAIL + 1))
+          echo "FAIL install: the bundled MVPKG does not run (${itrip:-?}):"
+          printf '%s\n' "$mout" | head -5 | sed 's/^/    | /' ;;
+      esac
+    else
+      case "$itrip" in
+        linux-x86_64-le|linux-aarch64-le)
+          FAIL=$((FAIL + 1))
+          echo "FAIL install: no CATALOG/MVPKG -- mvpkg did not install ($itrip)"
+          sed -n 's/^/    | /p' "$ILOG" | tail -12 ;;
+        *)
+          echo "  note: no mvpkg package for ${itrip:-unknown platform}; none is published" ;;
+      esac
+    fi
   else
     FAIL=$((FAIL + 1)); echo "FAIL install: cmake --install failed"
+    sed -n 's/^/    | /p' "$ILOG" | tail -12
   fi
 fi
 
@@ -3670,6 +3792,60 @@ else
   st_check "stamping twice is idempotent" "$SD/plain/mvpkg.json" "$SD/plain.want"
 fi
 rm -rf "$SD"
+
+echo "== install asks which package version"
+# mvx#212: the install no longer pins package versions.  It lists releases and
+# offers the latest stable plus the newest newer release at each less-stable
+# level, prompts only when someone is there, and otherwise takes the latest
+# stable.  All offline: releases come from tests/pkgver/, answers from stdin.
+PV="$ROOT/tests/pkgver"
+PVW="$(mktemp -d)"
+pv_choices() {   # pv_choices <repo> <stem>
+  printf 'include("%s/scripts/pkgver.cmake")\nmvx_release_choices("%s/%s.json" "%s" "linux-x86_64-le" c)\nmessage("CHOICES=[${c}]")\n' \
+    "$ROOT" "$PV" "$1" "$2" > "$PVW/list.cmake"
+  cmake -P "$PVW/list.cmake" 2>&1 | sed -n 's/^CHOICES=\[\(.*\)\]$/\1/p'
+}
+pv_choose() {    # pv_choose <prompt-mode> <answer-or-NONE> <repo> <stem> [override]
+  if [ "$2" = NONE ]; then
+    MVX_INSTALL_PROMPT="$1" MVX_INSTALL_RELEASES="${PV_REL:-$PV}" cmake -DROOT="$ROOT" -DREPO="$3" \
+      -DSTEM="$4" -DOVERRIDE="${5:-}" -DWORK="$PVW/w" -P "$PV/choose.cmake" </dev/null 2>&1
+  else
+    printf '%b' "$2" | MVX_INSTALL_PROMPT="$1" MVX_INSTALL_RELEASES="${PV_REL:-$PV}" cmake -DROOT="$ROOT" \
+      -DREPO="$3" -DSTEM="$4" -DOVERRIDE="${5:-}" -DWORK="$PVW/w" -P "$PV/choose.cmake" 2>&1
+  fi | sed -n 's/^RESULT=\[\(.*\)\]$/\1/p'
+}
+pv_is() {        # pv_is <label> <got> <want>
+  if [ "$2" = "$3" ]; then PASS=$((PASS + 1)); echo "  $1"
+  else FAIL=$((FAIL + 1)); echo "FAIL $1: got [$2], want [$3]"; fi
+}
+if ! command -v cmake >/dev/null 2>&1; then
+  echo "  (skipped -- no cmake)"
+else
+  pv_is "offers latest stable, then the newest newer release per level, then dev" \
+    "$(pv_choices mv_git mv_git)" \
+    "2.0.10|stable;2.1.0-rc10|rc;2.1.0-beta6|beta;2.3.0-nightly4|nightly;dev|dev"
+  pv_is "unattended takes the latest stable" \
+    "$(pv_choose never NONE mv_git mv_git)" "2.0.10"
+  pv_is "no terminal and no override means unattended" \
+    "$(MVX_INSTALL_PROMPT= pv_choose '' NONE mv_git mv_git)" "2.0.10"
+  pv_is "Enter takes the default" \
+    "$(pv_choose always '\n' mv_git mv_git)" "2.0.10"
+  pv_is "a number picks that choice" \
+    "$(pv_choose always '3\n' mv_git mv_git)" "2.1.0-beta6"
+  pv_is "dev is offered last" \
+    "$(pv_choose always '5\n' mv_git mv_git)" "dev"
+  pv_is "s skips the package" \
+    "$(pv_choose always 's\n' mv_git mv_git)" ""
+  pv_is "an invalid answer is asked again" \
+    "$(pv_choose always '9\nx\n2\n' mv_git mv_git)" "2.1.0-rc10"
+  pv_is "a configure-time version is used as given, with no lookup" \
+    "$(PV_REL=/nonexistent pv_choose always NONE mv_git mv_git 1.2.3)" "1.2.3"
+  pv_is "unattended never installs a pre-release when there is no stable one" \
+    "$(pv_choose never NONE nostable nostable)" ""
+  pv_is "but a person may choose it" \
+    "$(pv_choose always '1\n' nostable nostable)" "1.0.0-beta1"
+fi
+rm -rf "$PVW"
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

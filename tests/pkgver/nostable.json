@@ -1,0 +1,12 @@
+[
+ {
+  "tag_name": "1.0.0-beta1",
+  "prerelease": true,
+  "draft": false,
+  "assets": [
+   {
+    "name": "nostable-1.0.0-beta1-mvx-linux-x86_64-le.tar.gz"
+   }
+  ]
+ }
+]

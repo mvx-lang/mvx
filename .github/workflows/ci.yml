@@ -87,4 +87,7 @@ jobs:
           MVX_PG: "address=localhost:5432 dbname=mvx user=mvx password=mvx"
           MVX_MONGO: "address=localhost:27017 namespace=mvxtest"
           MVX_SIEVE_OPTIONAL: "1"   # perf benchmark: report, don't gate CI
+          # The install lists package releases through the GitHub API (mvx#212),
+          # which is rate-limited per IP; runners share IPs.
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/test.sh

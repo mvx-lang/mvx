@@ -47,31 +47,14 @@
 #include <histedit.h>
 #endif
 
-#ifndef MVX_SYSTEM_DIR
-#define MVX_SYSTEM_DIR "."
-#endif
 
 static mvx_ctx *g_ctx;
 static mv_value g_voc, g_sysvoc;
 static int g_voc_state, g_sysvoc_state; /* 0 untried, 1 open, -1 absent */
 
-static const char *system_dir(void) {
-    const char *p = getenv("MVXSYSTEM");
-    if (p && p[0]) return p;
-    /* Relative to libmvxrt (../lib): the install layout first, then the
-       dev build tree, then the compile-time default. */
-    const char *rtd = mvx_runtime_dir();
-    if (rtd[0]) {
-        static char buf[4096];
-        const char *cand[] = { "/../share/mvx/system", "/../system" };
-        for (size_t i = 0; i < sizeof cand / sizeof cand[0]; i++) {
-            snprintf(buf, sizeof buf, "%s%s", rtd, cand[i]);
-            struct stat sb;
-            if (stat(buf, &sb) == 0 && S_ISDIR(sb.st_mode)) return buf;
-        }
-    }
-    return MVX_SYSTEM_DIR;
-}
+/* The runtime's answer, so a verb is found in the same system account its
+   CALLs will be resolved from (mvx#210). */
+static const char *system_dir(void) { return mvx_system_dir(); }
 
 /* Read one line from fd 0 unbuffered.  Verbs share this stdin; stdio
    readahead here would swallow input meant for them (and theirs would

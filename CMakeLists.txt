@@ -80,6 +80,59 @@ option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
 # built into libmvxrt now (#169), so it needs no package and no configuration.
 set(MVX_PACKAGES "http" CACHE STRING "Packages built into the system account")
 
+# Packages BUNDLED WITH AN INSTALL, downloaded prebuilt rather than built here
+# (mvx#198).  Since #169 the package submodules are gone, which is right -- they
+# were pinned and drifting -- but it left an installed mvx with no GIT: the
+# toolchain shipped, the package did not, and `scripts/test.sh' fetching them
+# for tests helped nobody who had installed mvx.
+#
+# PREBUILT, NOT BUILT FROM SOURCE.  Each of these publishes an mvx asset already
+# compiled against a published toolchain; building them here instead would put
+# libgit2 and a compiler on the critical path of every install.
+#
+# MVPKG IS NOT IN THE LIST AND IS NOT OPTIONAL: it is the package manager, the
+# thing that installs everything else afterwards, so it comes with the toolchain
+# the way the toolchain comes with its own verbs.  The list is what it would
+# otherwise have to fetch first.
+set(MVX_BUNDLED_PACKAGES "git" CACHE STRING
+    "Published packages downloaded into the system account at install time")
+# NOT PINNED (mvx#212).  Empty means the install asks: it lists each package's
+# releases and offers the latest stable one plus the newest at each less-stable
+# level -- or, with nobody at the terminal, takes the latest stable.  Set one to
+# install exactly that version, for a build that has to be reproducible.
+# (scripts/test.sh still pins the packages it TESTS against, which is a
+# different thing: a test run must not depend on what was released today.)
+set(MVX_PACKAGE_VERSION_mvpkg "" CACHE STRING
+    "mvpkg release to install; empty = ask at install (latest stable if unattended)")
+set(MVX_PACKAGE_VERSION_git "" CACHE STRING
+    "mvx-lang/git release to install; empty = ask at install (latest stable if unattended)")
+# THE OLD PINS ARE RENAMED, NOT REUSED.  A build directory configured before
+# this still holds them in its cache, and there they are indistinguishable from
+# a pin someone chose on purpose -- so under the old names every existing build
+# would go on installing its stale version and never ask.  Drop them, and say
+# what replaced them.
+foreach(old MVX_MVPKG_VERSION MVX_PKG_VERSION_git)
+  if(DEFINED CACHE{${old}})
+    message(WARNING
+      "${old} is no longer used (mvx#212): the install now asks which version to "
+      "install.  To pin one, set MVX_PACKAGE_VERSION_mvpkg or "
+      "MVX_PACKAGE_VERSION_git instead.  Dropped ${old}=${${old}}.")
+    unset(${old} CACHE)
+  endif()
+endforeach()
+
+# The asset triple is decided HERE, at configure time, not in the install script:
+# a script run by `cmake --install' has no CMAKE_SYSTEM_* of its own, and the
+# answer belongs to the machine being configured either way.  Assets are named
+# <pkg>-<ver>-mvx-<os>-<arch>-<endian>.tar.gz.
+string(TOLOWER "${CMAKE_SYSTEM_NAME}" MVX_PKG_OS)
+set(MVX_PKG_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
+  set(MVX_PKG_ENDIAN "be")
+else()
+  set(MVX_PKG_ENDIAN "le")
+endif()
+
 # --- runtime -----------------------------------------------------------
 # A SHARED library so its code is mapped once and shared across every mvx
 # process (each cataloged verb is its own executable), and so dlopen'd
@@ -292,8 +345,6 @@ if(EDITLINE_LIBRARY)
   target_compile_definitions(mvx PRIVATE HAVE_EDITLINE)
   target_link_libraries(mvx PRIVATE ${EDITLINE_LIBRARY})
 endif()
-target_compile_definitions(mvx PRIVATE
-  MVX_SYSTEM_DIR="${CMAKE_BINARY_DIR}/system")
 set_target_properties(mvx PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -432,4 +483,7 @@ set(MVX_SOURCE_DIR ${CMAKE_SOURCE_DIR})
 set(MVX_BINARY_DIR ${CMAKE_BINARY_DIR})
 configure_file(${CMAKE_SOURCE_DIR}/scripts/install-system.cmake.in
                ${CMAKE_BINARY_DIR}/install-system.cmake @ONLY)
+# included by install-system.cmake from its own directory
+configure_file(${CMAKE_SOURCE_DIR}/scripts/pkgver.cmake
+               ${CMAKE_BINARY_DIR}/pkgver.cmake COPYONLY)
 install(SCRIPT ${CMAKE_BINARY_DIR}/install-system.cmake)
