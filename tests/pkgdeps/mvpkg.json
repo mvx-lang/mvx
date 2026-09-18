@@ -1,0 +1,12 @@
+{
+  "name": "mvx-lang/mvpkg",
+  "artifact": "mvpkg",
+  "version": "1.24.2",
+  "systems": ["mvx", "udt", "uv", "jbase"],
+  "dependencies": [
+    "curl",
+    "mvx-lang/json@!mvx:^1.5",
+    "?mvx-lang/cmd",
+    "?mvx-lang/git"
+  ]
+}
