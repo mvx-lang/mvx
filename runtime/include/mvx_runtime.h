@@ -346,7 +346,15 @@ void mvx_call_var(mvx_ctx *ctx, const mv_value *name, int32_t argc,
 /* --- spawning, behind the privilege gate (see mvx_exec.c) -------------- */
 int64_t mvx_unix_cmd(mvx_ctx *ctx, const char *cmd);    /* unrestricted */
 int64_t mvx_compile(mvx_ctx *ctx, const mv_value *mode,
-                    const mv_value *src, const mv_value *out); /* developer */
+                    const mv_value *src, const mv_value *out);
+
+/* COMPILE with build options: a space-separated list of words, NODEBUG (no
+   debug information) and STRIP (no symbols in the linked output).  The words
+   are MV-shaped rather than compiler flags, so the CLI spelling stays the
+   compiler's business (mvx#223). */
+int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
+                         const mv_value *src, const mv_value *out,
+                         const mv_value *opts); /* developer */
 int64_t mvx_execute(mvx_ctx *ctx, const mv_value *sentence,
                     mv_value *capture, mv_value *rc);   /* any tier */
 int64_t mvx_editfile(mvx_ctx *ctx, const mv_value *path); /* unrestricted */

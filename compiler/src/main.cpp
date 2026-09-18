@@ -84,6 +84,8 @@ int usage() {
         "  -shared      produce a shared subroutine library\n"
         "  -D NAME[=v]  define a preprocessor symbol ($IFDEF NAME)\n"
         "  -O0|-O1|-O2  optimisation level (default -O2)\n"
+        "  -g | -g0     emit debug information (default), or none\n"
+        "  -s           strip symbols when linking\n"
         "  --emit-llvm  also write textual IR beside each object\n";
     return 2;
 }
@@ -182,6 +184,7 @@ int main(int argc, char **argv) {
     // only wants to know "can I just call the engine?" should ask that rather
     // than name a platform -- naming platforms is how jBASE ended up excluded
     // from things it can do (mv_git#114).
+    bool strip = false;                 // -s: no symbols in the linked output
     std::map<std::string, std::string> defines;
     defines["MVX"] = "";
     defines["ENGINE"] = "";
@@ -202,6 +205,9 @@ int main(int argc, char **argv) {
         else if (a == "-O0") cg.optLevel = 0;
         else if (a == "-O1") cg.optLevel = 1;
         else if (a == "-O2") cg.optLevel = 2;
+        else if (a == "-g") cg.debugInfo = true;
+        else if (a == "-g0") cg.debugInfo = false;
+        else if (a == "-s") strip = true;
         else if (a == "--emit-llvm") cg.emitLLVM = true;
         else if (a.rfind("-D", 0) == 0) {               // -DNAME[=value] or -D NAME
             std::string def = a.size() > 2 ? a.substr(2) : "";
@@ -325,6 +331,18 @@ int main(int argc, char **argv) {
     if (!shared)
         cmd += " -rdynamic";            // expose mvx_sub_* to runtime CALL
 #endif
+    // -s: THE DYNAMIC SYMBOLS STAY.  An executable exposes mvx_sub_* for the
+    // runtime's CALL (-rdynamic above) and a subroutine library exports the
+    // same names, so a strip that took the dynamic table would leave a program
+    // that links and then cannot call anything.  These take the symbol table
+    // and the debug sections and leave .dynsym alone.
+    if (strip) {
+#ifdef __APPLE__
+        cmd += " -Wl,-x -Wl,-S";        // local symbols, then debug
+#else
+        cmd += " -Wl,-s";               // .symtab and .debug*, never .dynsym
+#endif
+    }
     cmd += " -o " + shellQuote(outPath);
 
     int rc = std::system(cmd.c_str());
@@ -333,7 +351,9 @@ int main(int argc, char **argv) {
     // Mach-O keeps debug info in the object files; bundle it into a .dSYM
     // before the temp objects are removed, or BASIC-level debugging is
     // silently lost.
-    if (rc == 0)
+    // Nothing to bundle when there is no debug info, and nothing wanted when
+    // the output is being stripped.
+    if (rc == 0 && cg.debugInfo && !strip)
         std::system(("dsymutil " + shellQuote(outPath) +
                      " >/dev/null 2>&1").c_str());
 #endif

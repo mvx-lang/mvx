@@ -23,6 +23,11 @@ namespace mvx {
 struct CodegenOptions {
     int  optLevel = 2;
     bool emitLLVM = false;      // write textual IR next to the object
+    // DWARF is emitted always and STRIPPED here when it is not wanted (-g0),
+    // rather than skipped as it is generated: debug info is a headline feature
+    // and the emission path has to stay the one that is exercised.  One code
+    // path to be correct, and -g0 removes the result (mvx#223).
+    bool debugInfo = true;
     // Output-line -> source line for DWARF (1-based; empty = identity).
     // Lets $INCLUDE'd programs still map to the right source lines.
     std::vector<int> dwarfLines;
