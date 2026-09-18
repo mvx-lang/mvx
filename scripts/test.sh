@@ -3898,15 +3898,16 @@ PRINT X
 EOF
 "$MVX" -c "$SD/hello.b" -o "$SD/d.o" 2>/dev/null
 "$MVX" -c -g0 "$SD/hello.b" -o "$SD/n.o" 2>/dev/null
-# DWARF names the source file it describes, so its name in the object is the
-# simplest true test that debug info is there -- and gone.
-if [ "$(strings "$SD/d.o" 2>/dev/null | grep -c 'hello\.b' | tr -d ' ')" -gt 0 ]; then
-  PASS=$((PASS + 1)); echo "  the default build carries debug info"
-else
-  FAIL=$((FAIL + 1)); echo "FAIL default build: no DWARF in the object"
-fi
-sd_is "-g0 leaves none" \
-  "$(strings "$SD/n.o" 2>/dev/null | grep -c 'hello\.b' | tr -d ' ')" "0"
+# THE DEBUG SECTIONS THEMSELVES, by the name every object format spells them
+# with -- .debug_info on ELF, __debug_info on Mach-O.  Looking for the SOURCE
+# NAME instead is what the first version of this did, and it passed on macOS
+# and failed on Linux: an ELF object records the source file in an ordinary
+# FILE symbol, which is not debug information.
+sd_debug() {     # sd_debug <file> -> 1 when it carries DWARF
+  if LC_ALL=C grep -a -q debug_info "$1" 2>/dev/null; then echo 1; else echo 0; fi
+}
+sd_is "the default build carries debug info" "$(sd_debug "$SD/d.o")" "1"
+sd_is "-g0 leaves none" "$(sd_debug "$SD/n.o")" "0"
 
 "$MVX" "$SD/hello.b" -o "$SD/h1" 2>/dev/null
 "$MVX" -g0 -s "$SD/hello.b" -o "$SD/h2" 2>/dev/null
