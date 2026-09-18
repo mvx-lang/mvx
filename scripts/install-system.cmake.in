@@ -12,6 +12,15 @@
 # with the just-installed compiler, so each verb executable's runtime
 # rpath points at the install's own lib directory rather than the build
 # tree.  The master VOC and its dictionary are copied alongside.
+# POLICIES ARE SET HERE, not inherited -- the same trap pkgver.cmake documents.
+# This runs inside `cmake --install', where no project has set any, so an older
+# CMake applies the OLD behaviour of every policy: under that, if(IN_LIST) is
+# an unknown argument.  It passed on a Mac and failed on Ubuntu's 3.28 once
+# already (mvx#212), and this script grew its first IN_LIST with mvx#218.
+# PUSH/POP leaves the calling cmake_install.cmake as it was.
+cmake_policy(PUSH)
+cmake_policy(VERSION 3.24)
+
 set(SRC "@MVX_SOURCE_DIR@")
 set(BIN "@MVX_BINARY_DIR@")
 set(SYS "${CMAKE_INSTALL_PREFIX}/share/mvx/system")
@@ -397,3 +406,5 @@ foreach(pkg @MVX_BUNDLED_PACKAGES@)
 endforeach()
 
 message(STATUS "MVX system account installed to ${SYS}")
+
+cmake_policy(POP)
