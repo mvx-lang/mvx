@@ -486,4 +486,6 @@ configure_file(${CMAKE_SOURCE_DIR}/scripts/install-system.cmake.in
 # included by install-system.cmake from its own directory
 configure_file(${CMAKE_SOURCE_DIR}/scripts/pkgver.cmake
                ${CMAKE_BINARY_DIR}/pkgver.cmake COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/scripts/pkgdeps.cmake
+               ${CMAKE_BINARY_DIR}/pkgdeps.cmake COPYONLY)
 install(SCRIPT ${CMAKE_BINARY_DIR}/install-system.cmake)

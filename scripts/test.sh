@@ -3458,7 +3458,29 @@ if [ "$QUICK" = 0 ]; then
         ' _ "$IPFX" "$IACCT" 2>&1)"
       case "$mout" in
         *"usage: MVPKG"*)
-          PASS=$((PASS + 1)); echo "  installed toolchain runs the bundled MVPKG (${itrip:-?})" ;;
+          PASS=$((PASS + 1)); echo "  installed toolchain runs the bundled MVPKG (${itrip:-?})"
+          # AND IT CAN REACH THE REGISTRY (mvx#218).  Running is not enough:
+          # the registry is HTTPS-only and the toolchain's own http package is
+          # plain HTTP, so MVPKG could start and still be unable to install
+          # anything.  This asks the first question a user asks, and it passes
+          # only because curl came in as mvpkg's declared dependency.
+          case "$itrip" in
+            linux-*)
+              sout="$(
+                env -u MVXSYSTEM -u MVXDRIVERS -u MVXBIN -u MVXSESSION -u MVXACCOUNT -u MVXPRIV \
+                    -u DYLD_LIBRARY_PATH -u LD_LIBRARY_PATH sh -c '
+                  cd "$2" && "$1/bin/mvx" -a "$2" -c "MVPKG search mvpkg" 2>&1
+                ' _ "$IPFX" "$IACCT" 2>&1)"
+              case "$sout" in
+                *"mvx-lang/mvpkg"*)
+                  PASS=$((PASS + 1))
+                  echo "  installed toolchain reaches the registry over HTTPS" ;;
+                *)
+                  FAIL=$((FAIL + 1))
+                  echo "FAIL install: MVPKG cannot reach the registry (mvx#218):"
+                  printf '%s\n' "$sout" | head -6 | sed 's/^/    | /' ;;
+              esac ;;
+          esac ;;
         *)
           FAIL=$((FAIL + 1))
           echo "FAIL install: the bundled MVPKG does not run (${itrip:-?}):"
@@ -3846,6 +3868,170 @@ else
     "$(pv_choose always '1\n' nostable nostable)" "1.0.0-beta1"
 fi
 rm -rf "$PVW"
+
+echo "== a package brings its dependencies, and only if they can load"
+# mvx#218: installing mvpkg installs what mvpkg DECLARES -- curl, which is the
+# only way an installed toolchain has HTTPS and so the only way MVPKG reaches
+# the registry.  mvx#219: a package whose native libraries cannot load here is
+# skipped, because the runtime opens every library in the system account and
+# one unresolvable .so makes EVERY later command print a loader error.
+#
+# Offline throughout: the packages are built here and served over file://.
+PD="$ROOT/tests/pkgdeps"
+PDW="$(mktemp -d)"
+pd_run() {       # pd_run <what> <arg> [arg2] [sys]
+  cmake -DROOT="$ROOT" -DWHAT="$1" -DARG="$2" -DARG2="${3:-}" -DSYS="${4:-mvx}" \
+        -P "$PD/deps.cmake" 2>&1 | sed -n 's/^RESULT=\[\(.*\)\]$/\1/p'
+}
+pd_is() {        # pd_is <label> <got> <want>
+  if [ "$2" = "$3" ]; then PASS=$((PASS + 1)); echo "  $1"
+  else FAIL=$((FAIL + 1)); echo "FAIL $1: got [$2], want [$3]"; fi
+}
+if ! command -v cmake >/dev/null 2>&1; then
+  echo "  (skipped -- no cmake)"
+else
+  # The grammar, which MVPKG parses too (MVPKG.INSTALL/DEPAPPLY).  The two
+  # readings of a manifest have to agree, so these cases are its cases.
+  pd_is "a plain dependency applies everywhere" \
+    "$(pd_run parse curl)" "curl||0|1"
+  pd_is "@!sys excludes this system" \
+    "$(pd_run parse 'mvx-lang/json@!mvx:^1.5')" "mvx-lang/json|^1.5|0|0"
+  pd_is "@sys includes only those named" \
+    "$(pd_run parse 'thing@udt,uv')" "thing||0|0"
+  pd_is "and includes this one when named" \
+    "$(pd_run parse 'thing@mvx,udt')" "thing||0|1"
+  pd_is "? marks it optional" \
+    "$(pd_run parse '?mvx-lang/cmd')" "mvx-lang/cmd||1|1"
+
+  # What that means for a real manifest: on mvx, mvpkg needs curl and nothing
+  # else -- json is in the runtime, cmd and git are optional.
+  pd_is "mvpkg on mvx requires curl alone" \
+    "$(pd_run deps "$PD/mvpkg.json")" "curl|"
+  pd_is "the same manifest on udt also requires json" \
+    "$(pd_run deps "$PD/mvpkg.json" '' udt)" "curl|;mvx-lang/json|^1.5"
+
+  pd_is "^ takes a later minor, not a later major" \
+    "$(pd_run sat 1.4.0 '^1.2')$(pd_run sat 2.0.0 '^1.2')" "10"
+  pd_is "~ pins the minor" \
+    "$(pd_run sat 1.5.3 '~1.5')$(pd_run sat 1.6.0 '~1.5')" "10"
+  pd_is "a range needs both ends" \
+    "$(pd_run sat 2.0.0 '>=1.2,<3.0')$(pd_run sat 3.1.0 '>=1.2,<3.0')" "10"
+  pd_is "a pre-release does not satisfy a constraint" \
+    "$(pd_run sat 1.2.0-beta1 '^1.0')" "0"
+  pd_is "the newest satisfying stable is chosen" \
+    "$(pd_run pick '1.4.0 1.3.0 1.2.0 1.2.0-beta3 dev' '^1.2')" "1.4.0"
+  pd_is "and nothing is chosen when nothing satisfies" \
+    "$(pd_run pick '1.4.0 1.3.0' '^2')" ""
+
+  # END TO END, against a served package tree.  This is the part that would
+  # have caught #218: every check before it asked whether a FILE was there.
+  PDR="$PDW/repo"
+  PDT="$(sed -n 's/^set(MVX_PKG_TRIPLE "\(.*\)")$/\1/p' "$ROOT/build/install-system.cmake")"
+  pd_pack() {    # pd_pack <dir> <repo> <stem> <version>
+    out="$PDR/$2/releases/download/$4"
+    mkdir -p "$out"
+    tar czf "$out/$3-$4-mvx-$PDT.tar.gz" -C "$1" .
+    ( cd "$out" && { shasum -a 256 "$3-$4-mvx-$PDT.tar.gz" 2>/dev/null \
+                     || sha256sum "$3-$4-mvx-$PDT.tar.gz"; } \
+                   > "$3-$4-mvx-$PDT.tar.gz.sha256" )
+  }
+  mkdir -p "$PDW/p/mvpkg/CATALOG" "$PDW/p/mvpkg/VOC" "$PDW/p/curl/LIB" "$PDW/info"
+  echo x > "$PDW/p/mvpkg/CATALOG/MVPKG"
+  echo V > "$PDW/p/mvpkg/VOC/MVPKG"
+  cp "$PD/mvpkg.json" "$PDW/p/mvpkg/mvpkg.json"
+  printf 'HTTPGET 1 1\nHTTPGETFILE 2 2\nHTTPPOST 4 4\n' > "$PDW/p/curl/EXPORTS"
+  echo lib > "$PDW/p/curl/LIB/libmvxext_curl.so"
+  printf '{"name":"mvx-lang/curl","artifact":"curl","version":"1.4.0","dependencies":[]}\n' \
+    > "$PDW/p/curl/mvpkg.json"
+  pd_pack "$PDW/p/mvpkg" mv_package mvpkg 9.9.9
+  pd_pack "$PDW/p/curl" curl curl 1.4.0
+  printf '{"name":"mvx-lang/curl","version":"1.4.0","versions":"1.4.0 1.3.0 dev","tarball":"file://%s/curl/releases/download/1.4.0/curl-1.4.0-mvx-%s.tar.gz"}\n' \
+    "$PDR" "$PDT" > "$PDW/info/curl.json"
+  # Which version of mvpkg: offline too, or the chooser asks GitHub and picks a
+  # real release this fixture does not serve.
+  mkdir -p "$PDW/rel"
+  printf '[{"tag_name":"9.9.9","prerelease":false,"draft":false,"assets":[{"name":"mvpkg-9.9.9-mvx-%s.tar.gz"}]}]\n' \
+    "$PDT" > "$PDW/rel/mv_package.json"
+
+  PDPFX="$PDW/prefix"
+  PDLOG="$PDW/install.log"
+  if MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$PDR" \
+     MVX_INSTALL_PKGINFO="$PDW/info" MVX_INSTALL_RELEASES="$PDW/rel" \
+     cmake --install "$ROOT/build" --prefix "$PDPFX" </dev/null >"$PDLOG" 2>&1; then
+    PDSYS="$PDPFX/share/mvx/system"
+    if grep -q "^HTTPPOST" "$PDSYS/EXPORTS" 2>/dev/null; then
+      PASS=$((PASS + 1)); echo "  a declared dependency is fetched and its EXPORTS merged"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL install deps: HTTPPOST is not in the system EXPORTS"
+      sed -n 's/^/    | /p' "$PDLOG" | tail -8
+    fi
+    # The point of the provenance file: curl covers every name http exports, so
+    # http goes -- library and all -- rather than two libraries answering to
+    # HTTPGET in whatever order the directory is read.
+    if [ -f "$PDSYS/EXPORTS.d/curl" ] && [ ! -e "$PDSYS/EXPORTS.d/http" ] &&
+       ! ls "$PDSYS/LIB"/libmvxext_http.* >/dev/null 2>&1; then
+      PASS=$((PASS + 1)); echo "  an added curl supersedes the built-in http"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL install deps: http was not superseded (EXPORTS.d: $(ls "$PDSYS/EXPORTS.d" 2>&1 | tr '\n' ' '))"
+    fi
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL install deps: the fixture install failed"
+    sed -n 's/^/    | /p' "$PDLOG" | tail -10
+  fi
+
+  # A LIBRARY THAT CANNOT LOAD (#219).  Built here rather than described: a
+  # stub .so against a library that is then deleted is exactly the shape of the
+  # git package on a machine without libgit2.
+  if [ "$(uname -s)" = Linux ] && command -v cc >/dev/null 2>&1; then
+    ND="$PDW/native"
+    mkdir -p "$ND/LIB"
+    echo 'int fake(void){return 1;}' > "$PDW/fake.c"
+    echo 'int fake(void); int stub(void){return fake();}' > "$PDW/stub.c"
+    if cc -shared -fPIC -Wl,-soname,libfake.so.1 -o "$ND/LIB/libfake.so.1" "$PDW/fake.c" 2>/dev/null &&
+       cc -shared -fPIC -o "$ND/LIB/libstub.so" "$PDW/stub.c" -L"$ND/LIB" -l:libfake.so.1 2>/dev/null; then
+      pd_is "a package whose libraries resolve is not flagged" \
+        "$(pd_run native "$ND")" ""
+      rm -f "$ND/LIB/libfake.so.1"
+      case "$(pd_run native "$ND")" in
+        *"libfake.so.1"*)
+          PASS=$((PASS + 1)); echo "  a missing native library is named" ;;
+        *)
+          FAIL=$((FAIL + 1))
+          echo "FAIL native check: a deleted libfake.so.1 was not reported" ;;
+      esac
+
+      # And the install acts on it: nothing of the package is copied.
+      mkdir -p "$PDW/p/broken/LIB"
+      cp "$ND/LIB/libstub.so" "$PDW/p/broken/LIB/libmvxext_broken.so"
+      printf 'BROKENFN 1 1\n' > "$PDW/p/broken/EXPORTS"
+      pd_pack "$PDW/p/broken" mv_broken broken 1.0.0
+      printf '{"name":"mvx-lang/broken","version":"1.0.0","versions":"1.0.0","tarball":"file://%s/mv_broken/releases/download/1.0.0/broken-1.0.0-mvx-%s.tar.gz"}\n' \
+        "$PDR" "$PDT" > "$PDW/info/broken.json"
+      printf '{"name":"mvx-lang/mvpkg","artifact":"mvpkg","version":"9.9.9","dependencies":["broken"]}\n' \
+        > "$PDW/p/mvpkg/mvpkg.json"
+      pd_pack "$PDW/p/mvpkg" mv_package mvpkg 9.9.9
+      PDPFX2="$PDW/prefix2"
+      MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$PDR" \
+        MVX_INSTALL_PKGINFO="$PDW/info" MVX_INSTALL_RELEASES="$PDW/rel" \
+        cmake --install "$ROOT/build" --prefix "$PDPFX2" </dev/null >"$PDW/install2.log" 2>&1 || true
+      if grep -q "libfake.so.1" "$PDW/install2.log" &&
+         ! ls "$PDPFX2/share/mvx/system/LIB"/libmvxext_broken.so >/dev/null 2>&1 &&
+         ! grep -q "^BROKENFN" "$PDPFX2/share/mvx/system/EXPORTS" 2>/dev/null; then
+        PASS=$((PASS + 1)); echo "  a package whose library cannot load is skipped whole"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL install deps: the unloadable package was not skipped"
+        sed -n 's/^/    | /p' "$PDW/install2.log" | tail -8
+      fi
+    else
+      echo "  (skipped the native-library check -- no working cc -shared)"
+    fi
+  fi
+fi
+rm -rf "$PDW"
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

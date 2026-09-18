@@ -35,7 +35,7 @@ file(COPY "${SRC}/system/.mvx" DESTINATION "${SYS}")
 # the BUILD tree, not the source -- EXPORTS names their functions and LIB holds
 # them.  Without these an installed toolchain resolves none of the system
 # package functions a program may call.
-foreach(part EXPORTS LIB)
+foreach(part EXPORTS EXPORTS.d LIB)
   if(EXISTS "${BIN}/system/${part}")
     file(COPY "${BIN}/system/${part}" DESTINATION "${SYS}")
   endif()
@@ -64,18 +64,233 @@ endforeach()
 # shipping a toolchain that cannot install a package, and telling people to
 # install a package to get it, is a circle.
 set(MVX_PKG_TRIPLE "@MVX_PKG_OS@-@MVX_PKG_ARCH@-@MVX_PKG_ENDIAN@")
-set(MVX_PKG_BASEURL "https://github.com/mvx-lang")
 
-# mvx_fetch_package(<display> <repo> <asset-stem> <version>)
+# Where a bundled package's asset comes from.  Overridable so the suite can
+# serve a file:// tree instead of GitHub: the download, the checksum, the
+# native-library check, the EXPORTS merge and the dependency walk are then all
+# exercised without a network (mvx#218).  The same reason pkgver.cmake takes
+# MVX_INSTALL_RELEASES.
+set(MVX_PKG_BASEURL "$ENV{MVX_INSTALL_PKGBASE}")
+if(MVX_PKG_BASEURL STREQUAL "")
+  set(MVX_PKG_BASEURL "https://github.com/mvx-lang")
+endif()
+
+# What has been installed already, so a dependency shared by two packages is
+# fetched once.  A GLOBAL property rather than a variable: this is written
+# inside nested function calls, and PARENT_SCOPE only reaches one level.
+set_property(GLOBAL PROPERTY MVX_INSTALLED_PACKAGES "")
+
+function(_mvx_mark_installed name)
+  get_property(done GLOBAL PROPERTY MVX_INSTALLED_PACKAGES)
+  list(APPEND done "${name}")
+  set_property(GLOBAL PROPERTY MVX_INSTALLED_PACKAGES "${done}")
+endfunction()
+
+function(_mvx_is_installed name out)
+  get_property(done GLOBAL PROPERTY MVX_INSTALLED_PACKAGES)
+  if(name IN_LIST done)
+    set(${out} TRUE PARENT_SCOPE)
+  else()
+    set(${out} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+
+# A package's own dependencies, and whether its native libraries load here.
+include("${CMAKE_CURRENT_LIST_DIR}/pkgdeps.cmake")
+
+# mvx_merge_exports(<key> <exports-file>)
 #
-# The asset is account-shaped with its contents at the tar root -- CATALOG, VOC,
-# LIB, and for git a bin/ -- so it unpacks straight into the system account.
-function(mvx_fetch_package name repo stem version)
-  set(tgz "${stem}-${version}-mvx-${MVX_PKG_TRIPLE}.tar.gz")
-  set(url "${MVX_PKG_BASEURL}/${repo}/releases/download/${version}/${tgz}")
+# EXPORTS is what the compiler reads to know an extension function exists, and
+# it is an aggregate of every installed package's -- so nothing in it says WHICH
+# package a name came from.  That mattered as soon as two packages exported the
+# same name: `http' and `curl' both provide HTTPGET, and which one answered was
+# directory-read order, which is not an order (#218).
+#
+# So the parts are kept beside the aggregate, one file per package under
+# EXPORTS.d/, and the aggregate is rebuilt from them.  A package being installed
+# WINS every name it exports, and any package whose names it wholly covers is
+# superseded -- its entry and its extension library go, because leaving a second
+# library exporting the same names is the ambiguity this exists to remove.
+# `http' is exactly that case: its names are a subset of curl's.
+function(mvx_merge_exports key file)
+  if(NOT EXISTS "${file}")
+    return()
+  endif()
+  set(dir "${SYS}/EXPORTS.d")
+  file(MAKE_DIRECTORY "${dir}")
+  _mvx_exports_names("${file}" mine)
+  if(mine STREQUAL "")
+    return()
+  endif()
+  file(GLOB others "${dir}/*")
+  foreach(o ${others})
+    get_filename_component(okey "${o}" NAME)
+    if(okey STREQUAL key)
+      continue()
+    endif()
+    _mvx_exports_names("${o}" theirs)
+    if(theirs STREQUAL "")
+      continue()
+    endif()
+    set(covered TRUE)
+    foreach(n ${theirs})
+      if(NOT n IN_LIST mine)
+        set(covered FALSE)
+      endif()
+    endforeach()
+    if(covered)
+      file(REMOVE "${o}")
+      foreach(lib "${SYS}/LIB/libmvxext_${okey}.so" "${SYS}/LIB/libmvxext_${okey}.dylib")
+        if(EXISTS "${lib}")
+          file(REMOVE "${lib}")
+        endif()
+      endforeach()
+      message(STATUS "  ${key} supersedes ${okey} (${theirs})")
+    endif()
+  endforeach()
+
+  file(COPY "${file}" DESTINATION "${dir}")
+  get_filename_component(fn "${file}" NAME)
+  if(NOT fn STREQUAL key)
+    file(RENAME "${dir}/${fn}" "${dir}/${key}")
+  endif()
+
+  # Rebuild the aggregate: this package first, so a name it shares with one
+  # that was NOT superseded still resolves to it.
+  set(lines "")
+  set(seen "")
+  foreach(f "${dir}/${key}" ${others})
+    if(NOT EXISTS "${f}")
+      continue()
+    endif()
+    file(STRINGS "${f}" fl)
+    foreach(l ${fl})
+      string(REGEX MATCH "^[ \t]*([^ \t#*][^ \t]*)" m "${l}")
+      set(n "${CMAKE_MATCH_1}")
+      if(NOT n STREQUAL "" AND NOT n IN_LIST seen)
+        list(APPEND seen "${n}")
+        list(APPEND lines "${l}")
+      endif()
+    endforeach()
+  endforeach()
+  string(REPLACE ";" "\n" body "${lines}")
+  file(WRITE "${SYS}/EXPORTS" "${body}\n")
+endfunction()
+
+# _mvx_exports_names(<file> <out>) — the names an EXPORTS file declares
+function(_mvx_exports_names file out)
+  set(names "")
+  if(EXISTS "${file}")
+    file(STRINGS "${file}" fl)
+    foreach(l ${fl})
+      string(REGEX MATCH "^[ \t]*([^ \t#*][^ \t]*)" m "${l}")
+      if(NOT CMAKE_MATCH_1 STREQUAL "")
+        list(APPEND names "${CMAKE_MATCH_1}")
+      endif()
+    endforeach()
+  endif()
+  set(${out} "${names}" PARENT_SCOPE)
+endfunction()
+
+# mvx_install_tree(<display> <dir>) — put an unpacked package into the system
+# account: the account parts, any CLI, and its EXPORTS.
+function(mvx_install_tree name dir)
+  foreach(part CATALOG VOC VOC.DICT LIB CMD.BP CMD.BP.DICT BP)
+    if(EXISTS "${dir}/${part}")
+      file(COPY "${dir}/${part}" DESTINATION "${SYS}")
+    endif()
+  endforeach()
+  if(EXISTS "${dir}/EXPORTS")
+    mvx_merge_exports("${name}" "${dir}/EXPORTS")
+  endif()
+  if(EXISTS "${dir}/bin")
+    file(GLOB clis "${dir}/bin/*")
+    foreach(c ${clis})
+      file(COPY "${c}" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin"
+           FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                            GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+    endforeach()
+  endif()
+endfunction()
+
+# mvx_install_deps(<manifest> <depth>)
+#
+# What the package just installed says it needs (#218).  Required dependencies
+# only, and only those that apply to mvx: an optional one is optional, and
+# `json@!mvx' is built into the runtime here.  Each is resolved through the
+# REGISTRY -- which is what knows that `curl' on mvx/linux/x86_64 is
+# mvx-lang/curl 1.4.0 and where its tarball is -- and installed the same way as
+# a bundled package, recursively.
+#
+# NOTHING IS ASKED.  #212 asks which version of a package a person wants; a
+# dependency is not a choice they made, it is what the package they chose needs.
+function(mvx_install_deps manifest depth)
+  if(depth GREATER 4)
+    message(WARNING "mvx: dependency chain deeper than 4, stopping")
+    return()
+  endif()
+  mvx_dep_list("${manifest}" mvx deps)
+  foreach(d ${deps})
+    string(REPLACE "|" ";" parts "${d}")
+    list(GET parts 0 dname)
+    set(dcons "")
+    list(LENGTH parts np)
+    if(np GREATER 1)
+      list(GET parts 1 dcons)
+    endif()
+    string(REGEX REPLACE "^.*/" "" dkey "${dname}")
+    _mvx_is_installed("${dkey}" already)
+    if(already)
+      continue()
+    endif()
+    mvx_registry_resolve("${dname}" "${MVX_PKG_TRIPLE}" mvx "${BIN}/pkgdl" js)
+    if(js STREQUAL "")
+      message(WARNING
+        "mvx: ${dname} is required by this package and the registry could not\n"
+        "     resolve it for ${MVX_PKG_TRIPLE}.  Install it later with mvpkg.")
+      continue()
+    endif()
+    mvx_json_field("${js}" version dver)
+    mvx_json_field("${js}" tarball dtar)
+    mvx_json_field("${js}" name dfull)
+    if(NOT dcons STREQUAL "")
+      mvx_ver_satisfies("${dver}" "${dcons}" ok)
+      if(NOT ok)
+        mvx_json_field("${js}" versions dvers)
+        mvx_pick_version("${dvers}" "${dcons}" want)
+        if(want STREQUAL "")
+          message(WARNING
+            "mvx: no release of ${dname} satisfies ${dcons} -- skipping it.")
+          continue()
+        endif()
+        mvx_registry_resolve("${dname}" "${MVX_PKG_TRIPLE}" mvx "${BIN}/pkgdl" js "${want}")
+        if(js STREQUAL "")
+          message(WARNING "mvx: ${dname} ${want} could not be resolved -- skipping it.")
+          continue()
+        endif()
+        mvx_json_field("${js}" version dver)
+        mvx_json_field("${js}" tarball dtar)
+      endif()
+    endif()
+    if(dtar STREQUAL "")
+      message(WARNING "mvx: ${dname} has no published build for ${MVX_PKG_TRIPLE} -- skipping it.")
+      continue()
+    endif()
+    string(REGEX REPLACE "^.*/" "" dshort "${dfull}")
+    message(STATUS "  ${dshort} ${dver} is required here")
+    mvx_install_url("${dshort}" "${dver}" "${dtar}" ${depth})
+  endforeach()
+endfunction()
+
+# mvx_install_url(<display> <version> <tarball-url> <depth>)
+#
+# Download, verify, check that its native libraries load, install, and then
+# install what IT requires.
+function(mvx_install_url name version url depth)
   set(tmp "${BIN}/pkgdl/${name}")
   file(REMOVE_RECURSE "${tmp}")
   file(MAKE_DIRECTORY "${tmp}")
+  get_filename_component(tgz "${url}" NAME)
 
   # THE CHECKSUM IS PUBLISHED, SO IT IS CHECKED.  Every asset has a .sha256
   # beside it; downloading one and not the other is choosing to trust the
@@ -112,22 +327,50 @@ function(mvx_fetch_package name repo stem version)
   endif()
 
   file(ARCHIVE_EXTRACT INPUT "${tmp}/${tgz}" DESTINATION "${tmp}/x")
-  # The account parts go to the system account; a CLI goes where binaries go.
-  foreach(part CATALOG VOC VOC.DICT LIB CMD.BP CMD.BP.DICT BP)
-    if(EXISTS "${tmp}/x/${part}")
-      file(COPY "${tmp}/x/${part}" DESTINATION "${SYS}")
-    endif()
-  endforeach()
-  if(EXISTS "${tmp}/x/bin")
-    file(GLOB clis "${tmp}/x/bin/*")
-    foreach(c ${clis})
-      file(COPY "${c}" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin"
-           FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-                            GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-    endforeach()
+
+  # CAN ITS NATIVE LIBRARIES LOAD HERE? (#219)  The git package needs libgit2
+  # 1.7, whose soname pins the minor, and installing it on a machine without
+  # that library does not merely leave GIT broken: the runtime opens every
+  # library in the system account, so EVERY command afterwards prints a loader
+  # error.  A package that cannot work here is better not installed -- nothing
+  # of it is copied, and mvpkg can add it once the library is there.
+  mvx_native_missing("${tmp}/x" "${CMAKE_INSTALL_PREFIX}" missing)
+  if(NOT missing STREQUAL "")
+    string(REPLACE ";" "\n            " mtext "${missing}")
+    message(WARNING
+      "mvx: ${name} ${version} needs a library this machine does not have:\n"
+      "            ${mtext}\n"
+      "     Skipping it -- the toolchain is installed and every other command\n"
+      "     stays clean.  Install the library (on Debian/Ubuntu, apt-get\n"
+      "     install the package that provides it), then add ${name} with:\n"
+      "         mvx -c \"MVPKG install ${name}\"")
+    file(REMOVE_RECURSE "${tmp}")
+    return()
+  endif()
+
+  mvx_install_tree("${name}" "${tmp}/x")
+  message(STATUS "  installed package ${name} ${version} (${MVX_PKG_TRIPLE})")
+  _mvx_mark_installed("${name}")
+
+  # WHAT IT NEEDS COMES WITH IT.  mvpkg declares `curl', and without it an
+  # installed mvpkg cannot reach the HTTPS registry at all (#218).
+  if(EXISTS "${tmp}/x/mvpkg.json")
+    math(EXPR next "${depth} + 1")
+    mvx_install_deps("${tmp}/x/mvpkg.json" ${next})
   endif()
   file(REMOVE_RECURSE "${tmp}")
-  message(STATUS "  installed package ${name} ${version} (${MVX_PKG_TRIPLE})")
+endfunction()
+
+# mvx_fetch_package(<display> <repo> <asset-stem> <version>)
+#
+# A bundled package, whose asset name and location are known without asking the
+# registry.  The asset is account-shaped with its contents at the tar root --
+# CATALOG, VOC, LIB, and for git a bin/ -- so it unpacks straight into the
+# system account.
+function(mvx_fetch_package name repo stem version)
+  set(tgz "${stem}-${version}-mvx-${MVX_PKG_TRIPLE}.tar.gz")
+  set(url "${MVX_PKG_BASEURL}/${repo}/releases/download/${version}/${tgz}")
+  mvx_install_url("${name}" "${version}" "${url}" 0)
 endfunction()
 
 # WHICH VERSION is asked, not pinned (mvx#212): pkgver.cmake lists each
