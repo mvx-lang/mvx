@@ -24,6 +24,7 @@
 #include "llvm/Config/llvm-config.h"   // LLVM_VERSION_MAJOR
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Intrinsics.h"
@@ -813,6 +814,12 @@ private:
                               {ptrTy_, ptrTy_, ptrTy_},
                               {ctxArg_, evalPtr(*e.args[0]),
                                evalPtr(*e.args[1])});
+            if (f == "COMPILE" && e.args.size() == 4)
+                return callRt("mvx_compile_opts", i64Ty_,
+                              {ptrTy_, ptrTy_, ptrTy_, ptrTy_, ptrTy_},
+                              {ctxArg_, evalPtr(*e.args[0]),
+                               evalPtr(*e.args[1]), evalPtr(*e.args[2]),
+                               evalPtr(*e.args[3])});
             if (f == "COMPILE" && e.args.size() == 3)
                 return callRt("mvx_compile", i64Ty_,
                               {ptrTy_, ptrTy_, ptrTy_, ptrTy_},
@@ -2566,6 +2573,9 @@ private:
         finishGosubRet();
 
         dib_.finalize();
+        // -g0: the module was built with debug info, as every build is; drop it
+        // here so nothing downstream (the .o, the link, a .dSYM) carries it.
+        if (!opts_.debugInfo) llvm::StripDebugInfo(mod_);
     }
 };
 

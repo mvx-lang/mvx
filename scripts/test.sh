@@ -3869,6 +3869,100 @@ else
 fi
 rm -rf "$PVW"
 
+echo "== a program can be built without debug info or symbols"
+# mvx#223: -g0 compiles without DWARF, -s links without symbols, and the BASIC
+# and CATALOG verbs pass the same through COMPILE as NODEBUG and STRIP.  The
+# default is unchanged -- debug info is the headline feature, and these are for
+# shipping a program rather than working on one.
+SD="$TESTROOT/strip"
+mkdir -p "$SD"
+sd_is() {        # sd_is <label> <got> <want>
+  if [ "$2" = "$3" ]; then PASS=$((PASS + 1)); echo "  $1"
+  else FAIL=$((FAIL + 1)); echo "FAIL $1: got [$2], want [$3]"; fi
+}
+sd_syms() {      # sd_syms <file> -> symbol count, 0 when stripped bare
+  nm -a "$1" 2>/dev/null | wc -l | tr -d ' '
+}
+cat > "$SD/hello.b" <<'EOF'
+PRINT "hello ":2 + 2
+EOF
+cat > "$SD/sub.b" <<'EOF'
+SUBROUTINE GREETSUB(N)
+N = "greeted ":N
+RETURN
+EOF
+cat > "$SD/caller.b" <<'EOF'
+X = "world"
+CALL GREETSUB(X)
+PRINT X
+EOF
+"$MVX" -c "$SD/hello.b" -o "$SD/d.o" 2>/dev/null
+"$MVX" -c -g0 "$SD/hello.b" -o "$SD/n.o" 2>/dev/null
+# DWARF names the source file it describes, so its name in the object is the
+# simplest true test that debug info is there -- and gone.
+if [ "$(strings "$SD/d.o" 2>/dev/null | grep -c 'hello\.b' | tr -d ' ')" -gt 0 ]; then
+  PASS=$((PASS + 1)); echo "  the default build carries debug info"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL default build: no DWARF in the object"
+fi
+sd_is "-g0 leaves none" \
+  "$(strings "$SD/n.o" 2>/dev/null | grep -c 'hello\.b' | tr -d ' ')" "0"
+
+"$MVX" "$SD/hello.b" -o "$SD/h1" 2>/dev/null
+"$MVX" -g0 -s "$SD/hello.b" -o "$SD/h2" 2>/dev/null
+sd_is "a stripped program prints what it always did" \
+  "$("$SD/h2" 2>&1)" "$("$SD/h1" 2>&1)"
+if [ "$(sd_syms "$SD/h2")" -lt "$(sd_syms "$SD/h1")" ]; then
+  PASS=$((PASS + 1)); echo "  -s leaves fewer symbols behind"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL -s: $(sd_syms "$SD/h2") symbols against $(sd_syms "$SD/h1") unstripped"
+fi
+# macOS keeps debug info in the objects and mvx-basic bundles it with dsymutil;
+# there is nothing to bundle when there is none.
+if [ -e "$SD/h2.dSYM" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL -g0 -s: a .dSYM was produced anyway"
+else
+  PASS=$((PASS + 1)); echo "  no debug bundle is left beside a stripped program"
+fi
+
+# THE ONE THAT MATTERS: stripping must take the symbol table and leave the
+# DYNAMIC one, or a program links and then cannot CALL anything.
+mkdir -p "$SD/acct/LIB"
+case "$(uname -s)" in
+  Darwin) SDSUF=".dylib" ;;
+  *)      SDSUF=".so" ;;
+esac
+"$MVX" -shared -g0 -s "$SD/sub.b" -o "$SD/acct/LIB/GREETSUB$SDSUF" 2>/dev/null
+"$MVX" -g0 -s "$SD/caller.b" -o "$SD/acct/caller" 2>/dev/null
+sd_is "CALL still resolves with both sides stripped" \
+  "$(cd "$SD/acct" && MVXACCOUNT=. ./caller 2>&1)" "greeted world"
+
+# And through the verbs, which is how a program is actually built here.
+SDA="$TESTROOT/stripacct"
+"$ROOT/scripts/mkaccount.sh" "$SDA" >/dev/null 2>&1
+mkdir -p "$SDA/BP" "$SDA/BP.DICT"
+printf 'FILE\375dir\n' > "$SDA/BP.DICT/%FILE%"
+cp "$SD/hello.b" "$SDA/BP/HELLO"
+MVXPRIV=developer "$TCL" -a "$SDA" -c 'CATALOG BP HELLO' >/dev/null 2>&1
+SDPLAIN="$(sd_syms "$SDA/CATALOG/HELLO")"
+MVXPRIV=developer "$TCL" -a "$SDA" -c 'CATALOG BP HELLO NODEBUG STRIP' >/dev/null 2>&1
+SDTHIN="$(sd_syms "$SDA/CATALOG/HELLO")"
+sd_is "a verb cataloged with NODEBUG STRIP still runs" \
+  "$(MVXPRIV=developer "$TCL" -a "$SDA" -c 'HELLO' 2>&1)" "hello 4"
+if [ "$SDTHIN" -lt "$SDPLAIN" ]; then
+  PASS=$((PASS + 1)); echo "  CATALOG passes the options through to the compiler"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL CATALOG STRIP: $SDTHIN symbols against $SDPLAIN plain"
+fi
+sd_is "an unknown option is refused, not ignored" \
+  "$(MVXPRIV=developer "$TCL" -a "$SDA" -c 'CATALOG BP HELLO FAST' 2>&1)" \
+  "CATALOG: unknown option FAST (NODEBUG, STRIP)"
+sd_is "BASIC takes them too" \
+  "$(MVXPRIV=developer "$TCL" -a "$SDA" -c 'BASIC BP HELLO NODEBUG' 2>&1)" \
+  "[241] HELLO compiled"
+
 echo "== a package brings its dependencies, and only if they can load"
 # mvx#218: installing mvpkg installs what mvpkg DECLARES -- curl, which is the
 # only way an installed toolchain has HTTPS and so the only way MVPKG reaches
