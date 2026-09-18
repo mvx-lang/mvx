@@ -12,8 +12,26 @@
 S = SENTENCE()
 FN = FIELD(S, " ", 2)
 IT = FIELD(S, " ", 3)
+* Build options, after the item name: NODEBUG leaves out the debug information,
+* STRIP leaves out the symbols.  Neither changes what the program does; both are
+* for shipping one (mvx#223).  Passed to COMPILE as words -- a verb has no
+* business knowing how the compiler spells its flags.
+OPTS = ""
+W = 4
+LOOP
+   KW = FIELD(S, " ", W)
+WHILE KW # "" DO
+   BEGIN CASE
+      CASE OCONV(KW, "MCU") = "NODEBUG" ; OPTS = TRIM(OPTS:" NODEBUG")
+      CASE OCONV(KW, "MCU") = "STRIP"   ; OPTS = TRIM(OPTS:" STRIP")
+      CASE 1
+         PRINT "BASIC: unknown option ":KW:" (NODEBUG, STRIP)"
+         STOP
+   END CASE
+   W = W + 1
+REPEAT
 IF FN = "" OR IT = "" THEN
-   PRINT "usage: BASIC filename itemname"
+   PRINT "usage: BASIC filename itemname {NODEBUG} {STRIP}"
    STOP
 END
 OPEN FN TO F ELSE
@@ -25,7 +43,7 @@ READ SRC FROM F, IT ELSE
    STOP
 END
 X = CREATEFILE(FN:".O", "DIR")
-RC = COMPILE("c", FN:"/":IT, FN:".O/":IT:".o")
+RC = COMPILE("c", FN:"/":IT, FN:".O/":IT:".o", OPTS)
 IF RC = 0 THEN
    PRINT "[241] ":IT:" compiled"
 END ELSE

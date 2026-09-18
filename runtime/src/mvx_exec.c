@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strncasecmp for COMPILE build options */
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -449,6 +450,12 @@ void mvx_tmpnam(mv_value *dst) {
 
 int64_t mvx_compile(mvx_ctx *ctx, const mv_value *mode,
                     const mv_value *src, const mv_value *out) {
+    return mvx_compile_opts(ctx, mode, src, out, NULL);
+}
+
+int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
+                         const mv_value *src, const mv_value *out,
+                         const mv_value *opts) {
     (void)ctx;
     if (priv_tier() < TIER_DEVELOPER) {
         fprintf(stderr,
@@ -493,11 +500,38 @@ int64_t mvx_compile(mvx_ctx *ctx, const mv_value *mode,
         *slashp = '/';
     }
 
-    char *argv[8];
+    /* BUILD OPTIONS, AS WORDS.  A verb says NODEBUG or STRIP; this turns them
+       into whatever the compiler spells them, so the two are free to differ and
+       a BASIC program never carries a command-line flag (mvx#223).  An
+       unrecognised word is an error rather than a silent no-op: a production
+       build that quietly kept its symbols is the failure this exists to
+       prevent. */
+    char ob2[40];
+    const char *op2 = NULL;
+    int64_t ol2 = opts ? mv_val_chars(opts, ob2, sizeof ob2, &op2) : 0;
+    int want_g0 = 0, want_strip = 0;
+    for (int64_t i = 0; i < ol2;) {
+        while (i < ol2 && (op2[i] == ' ' || op2[i] == ',')) i++;
+        int64_t st = i;
+        while (i < ol2 && op2[i] != ' ' && op2[i] != ',') i++;
+        int64_t len = i - st;
+        if (len == 0) continue;
+        if (len == 7 && strncasecmp(op2 + st, "NODEBUG", 7) == 0) want_g0 = 1;
+        else if (len == 5 && strncasecmp(op2 + st, "STRIP", 5) == 0) want_strip = 1;
+        else {
+            fprintf(stderr, "COMPILE: unknown build option '%.*s' "
+                            "(NODEBUG, STRIP)\n", (int)len, op2 + st);
+            return -1;
+        }
+    }
+
+    char *argv[10];
     int n = 0;
     argv[n++] = mvx;
     if (mp[0] == 'c' || mp[0] == 'C') argv[n++] = "-c";
     else if (mp[0] == 's' || mp[0] == 'S') argv[n++] = "-shared";
+    if (want_g0) argv[n++] = "-g0";
+    if (want_strip) argv[n++] = "-s";
     argv[n++] = srcbuf;
     argv[n++] = "-o";
     argv[n++] = outbuf;
