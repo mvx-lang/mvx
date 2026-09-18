@@ -3,7 +3,10 @@
 A design for mv_git#130 — *"a Pick program that keeps its working set in a
 dynamic array should not fall off a cliff."*
 
-Status: **proposal**. Nothing here is built. The measurements are real.
+Status: **the fast path is built; the representation change is not.** The
+work took a different route from the one proposed here. Section 1 says where
+things stand and how they got there; sections 2 and 3 are the original
+proposal, kept because its stages 2 and 3 are still open.
 
 ---
 
@@ -13,54 +16,132 @@ The banked sieve, five seconds, count validated at 78,498 on every platform:
 
 | platform | flat | banked | cost of banking |
 | --- | --- | --- | --- |
-| MVX, before | 13,660 | 75 | 182x |
-| **MVX, after the snprintf fix** | **13,405** | **144** | **93x** |
-| jBASE 6.2.1 `-O4` | 216 | 7 | 31x |
-| UniData 8.3 | 66 | 35 | 1.9x |
+| **MVX now** | **14,011** | **321** | **44x** |
+| MVX after the snprintf fix (Aug) | 13,405 | 144 | 93x |
+| MVX before (Aug) | 13,660 | 75 | 182x |
+| UniData 8.3 | 68 | 35 | 1.9x |
+| UniVerse 14.2 | cannot run | 35 | — |
+| OpenQM (ScarletDME, `-O2`) | 46 | 19 | 2.4x |
+| jBASE 6.2.1 `-O4` (Aug) | 216 | 7 | 31x |
 
-Halving the cost of banking took removing one thing that was never needed:
-every dynamic-array edit converted its value to characters with
-`snprintf("%lld")`, and the sieve did that **58,486,425 times in five seconds
-to produce the single character `0`**.
+Measured September 2026 unless marked. MVX is a Release build on an Apple M1
+Max, best of interleaved runs; a C version of the flat sieve scores **14,387**
+on the same machine, so MVX is at **97% of C**. ScarletDME ran in a Linux VM on
+the same machine, UniData and UniVerse on x86 VMs; the same C sieve agrees to
+within 1.6% across all of them. UniVerse cannot run the flat sieve because it
+caps a compile-time `DIM` at 64,000 elements, which is why the banked version
+exists.
 
-UniData pays 1.9x because its interpreter overhead already dominates. MVX pays
-93x because the numeric path is genuinely fast and the dynamic-array path is
-genuinely not. **That ratio is the target, not the absolute number** — we are
-already 4x UniData's absolute score on this benchmark.
+`bench/sieve-dynamic.b` keeps all 500,000 flags in **one** dynamic array, the
+shape a Pick programmer writes when the working set is one thing. It scores
+**818** (79 in August), more than twice the banked version.
+
+UniData pays 1.9x for banking because its interpreter overhead already
+dominates. MVX still pays 44x because its numeric path is close to C, so
+anything else shows. **That ratio is still the measure**, and it has halved
+again since the snprintf fix.
+
+### How it got here
+
+Each step was measured on the day it landed. The figures come from the commit
+messages, and a baseline can drift by a few per cent between commits.
+
+| step | banked | one array | where |
+| --- | ---: | ---: | --- |
+| before | 75 | 79 | |
+| integers formatted without `snprintf` | 144 | | #144 |
+| every byte access through `mv_str_bytes()` / `mv_str_wbytes()` | 145 | | #144 |
+| the index engages on 8 bytes, not 128 | 165 | | #144 |
+| a level's index found by arithmetic, not a list walk | 175 | | #144 |
+| an offset per element boundary, not one per 16 | 186 | 412 | #144 |
+| copy-on-write keeps the index | 203 | 506 | #144 |
+| a one-byte replace stored without `memmove` | | 549 | #144 |
+| `X<1,v>` on a value with no attribute mark skips the AM lookup | 291 | 791 | #144 |
+| **now** | **321** | **818** | |
+
+Alongside those: ordered `LOCATE` became a binary search once the order is
+verified (7,874 to 1,867,440 lookups a second on a sorted 20,000-element list,
+#144); `COUNT` and `DCOUNT` of a single mark read the index (#145); `INSERT` and
+`DELETE` at the top level move the tail once and shift the index rather than
+rebuilding it (119,520 to 1,958,040 operations a second, #146); and the `SUM`
+family stopped copying and `strtod`-parsing plain integers (#147).
+
+**This is the "strengthen the existing index" alternative that section 5
+rejected.** It was rejected on the grounds that the index never engaged at bank
+size. That was a true observation and the wrong conclusion: the fix was to make
+it engage. Dropping `IX_MIN_BYTES` from 128 to 8 alone took 145 to 165.
+
+Element reads and writes now cost **5 to 8 nanoseconds at any length and in any
+access order** (a one-character-per-element list from 16 to 65,536 elements).
 
 ### What the profile says now
 
-Exclusive samples, banked sieve, after the fix:
+macOS `sample`, banked sieve, September 2026:
 
 ```
-mv_replace_fn   1792   (72%)     ← inlines locate() and inplace_repl()
-ix_for           106
-memmove           88
-modify            86
-val_span          61
-mv_arr_elem       56
+75%   the replace path: mv_replace_fn with inplace_repl, locate and
+      ix_for inlined, plus val_span
+15%   malloc/free, almost all from cow_keep_index
+ 9%   mv_arr_elem
 ```
 
-### Two things that are *not* the problem
+About 7% of samples sit in PLT stubs, because the runtime is a shared library.
 
-Both were measured, because both are the obvious guess:
+The 15% is the first write to each bank after `MAT BANK = ONES`: 31,250 banks
+a pass, each copying its string and then allocating an index set plus one block
+per level (`cow_keep_index`, `runtime/src/mv_dyn.c`).
 
-- **The fast path already works.** 58.5M in-place same-length hits against
-  2,343,750 rebuilds — and those rebuilds are exactly `31250 banks × 75
-  passes`, the first write to each bank after `MAT BANK = ONES`. That is
-  copy-on-write doing its job.
-- **The element index never engages.** A bank is ~31 bytes; `IX_MIN_BYTES` is
-  128. #130 suspected index-dropping was the cost. On this benchmark there is
-  no index to drop.
+### What is still open
 
-So the remaining 72% is not scanning and not rebuilding. It is **per-call
-overhead on an operation that should not need a call at all**: convert the
-value to bytes, walk to the element, patch a byte, in a shared library, 58
-million times.
+- **The call itself.** With the subscripted write reduced to a call that does
+  nothing, the single-array sieve scored 1,063 against 532 with the work in
+  (#144). Past that needs the call to go, which is compiler specialisation
+  (ARCHITECTURE.md 3.3 option 3), not a runtime change.
+- **Copy-on-write allocations.** One allocation for the whole index set would
+  replace up to four per shared string.
+- **`LOCATE` reaches its field and value with `nth_span`**, not the index
+  (`mv_locate_fn`), so `LOCATE(X, REC<5>; …)` on a long record rescans fields 1
+  to 4 on every call.
+- **The read side.** `IF BANK(B)<1,P> = 0` extracts into a reused temp and then
+  parses the one-byte string to compare it. Native element values (3.5) are
+  aimed at exactly this.
+- **Elements as the truth** (section 2) was never built. Whether it still pays
+  is an open question now that the byte path costs single-digit nanoseconds;
+  the call and the parse above are the larger costs.
+
+### How the others compare
+
+From the same September measurements (`bench/*.b`, ported only where a timer
+needed it):
+
+| | MVX | ScarletDME | UniData | UniVerse |
+| --- | ---: | ---: | ---: | ---: |
+| `INSERT` + `DELETE`, 2,000 items, ops/s | 2.0M | 95k | 650k | 1.25M |
+| ordered `LOCATE`, 20,000 items, lookups/s | 2.0M | 7.8k | 20k | 12k |
+| `X<1,K>` read at 65,536 elements, in order | 8 ns | 58 µs | 62 ns | 30 µs |
+| `X<1,K>` read at 65,536 elements, random order | 5 ns | 74 µs | 17 µs | 36 µs |
+
+- **ScarletDME** (the GPL descendant of OpenQM 2.6) keeps one field-level hint,
+  rescans a field from its first byte to reach a value, rebuilds the whole
+  string on every replace except an owned append, and formats every stored
+  integer with `sprintf("%d")` — 15% of its banked profile.
+- **UniData** is constant time for in-order access and linear for random
+  access, which looks like a cached cursor rather than an index. For the usual
+  `FOR I = 1 TO DCOUNT(...)` loop, MVX's lead over it is mostly compiled against
+  interpreted.
+- **UniVerse** has a field-level position cache like ScarletDME's, and its
+  `INSERT`/`DELETE` is within 1.6x of MVX.
+- The ordered `LOCATE` figures are mostly binary search against linear scan. An
+  unordered `LOCATE` in MVX is still a linear scan.
 
 ---
 
-## 2. The proposal
+## 2. The proposal (not built)
+
+This was written before any of section 1 was built, and describes a change that
+has not been made. Its measurements are the August ones: at 144 passes, the
+replace path (`mv_replace_fn`, with `locate` and `inplace_repl` inlined) was
+**72%** of the banked sieve's samples, and that is the 72% referred to below.
 
 > Store a dynamic array as an indexed object, and materialise the flat string
 > only when something actually needs the bytes.
@@ -158,6 +239,11 @@ stopped being scarce.
 
 So: **take the memory.** Build `dyn` on first subscripted write and keep it.
 
+The index that was built instead makes the same trade: an offset per element
+boundary costs eight bytes an element, and it bought 175 to 186 on the banked
+sieve over one offset every sixteen elements. It is still built only when
+something subscripts the value.
+
 Two bounds stay, and neither is about saving bytes for their own sake:
 
 - A value that is never subscript-written never builds one, so reading a large
@@ -185,13 +271,14 @@ invent a second answer.
 Each stage ships independently and is judged on the banked sieve plus the
 suite. **Stop at any stage that does not pay.**
 
-| # | Stage | Expected | Risk |
+| # | Stage | Expected | Outcome |
 | --- | --- | --- | --- |
-| 0 | *done* — remove the `snprintf` round-trip | 75 → 144 | none, shipped |
-| 1 | *done* — `mv_str_bytes()` / `mv_str_wbytes()` + the grep that enforces them | 145 (unchanged, as intended) | none; the guard was proved by breaking it |
-| 2 | `dyn` built on first subscripted write; bytes materialise on demand | the 72% | stale-bytes bugs if a site is missed |
-| 3 | Elements hold native values | the value round-trip | MV type-equality rules |
-| 4 | Revisit `IX_STRIDE` / `IX_MIN_BYTES` with numbers | small | none |
+| 0 | remove the `snprintf` round-trip | 75 → 144 | **done**, 144 |
+| 1 | `mv_str_bytes()` / `mv_str_wbytes()` + the grep that enforces them | unchanged, as intended | **done**, 145; the guard was proved by breaking it |
+| — | *not in the original plan:* engage, reach and keep the index (section 1) | — | **done**, 145 → 291; 321 now |
+| 2 | `dyn` built on first subscripted write; bytes materialise on demand | the 72% | not started; the 72% is now mostly the call |
+| 3 | Elements hold native values | the value round-trip | not started; still aimed at the read-side parse |
+| 4 | Revisit `IX_STRIDE` / `IX_MIN_BYTES` with numbers | small | **done**: stride 1, minimum 8 bytes |
 
 Stage 1 is worth doing **even if we stop there**: it makes the byte
 representation a thing with one door, which is what any future change to it
@@ -242,6 +329,11 @@ touch this benchmark at all** — the banks are below the index threshold — an
 because it leaves the value round-trip in place. Worth doing for long fields
 independently.
 
+**This is what was built, and it paid** (section 1). The threshold was the
+problem, not the approach: lowered to 8 bytes, the index engaged on every bank.
+Offsets are shifted on `INSERT`/`DELETE` rather than dropped. The sequential
+cursor was not needed: an offset per boundary makes every access direct.
+
 **`memchr` for the element walk.** Tried, **measured, and reverted: 144 → 100
 passes.** Elements are one character and a mark, so every scan is two or three
 bytes and the vector setup costs more than the byte loop. Recorded in the
@@ -256,9 +348,13 @@ compose.
 
 ## 6. What would make us stop
 
-- Stage 2 does not beat 144 by a clear margin on the banked sieve.
-- The flat sieve regresses at all — 13,405 is the number that says the numeric
-  fast path is intact.
+These applied to stage 2 of the original plan, and were written against the
+August figures. Restated against today's:
+
+- Stage 2 (or 3) does not beat **321** by a clear margin on the banked sieve,
+  or **818** on the single-array sieve.
+- The flat sieve regresses at all — **14,011** against C's 14,387 is the number
+  that says the numeric fast path is intact.
 - Memory on a realistic record set grows enough to matter on a machine with
   gigabytes of it — which is a far higher bar than the 1975 one, and is about
   blast radius rather than economy (3.4).
