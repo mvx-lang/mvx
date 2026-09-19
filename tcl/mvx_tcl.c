@@ -1017,6 +1017,24 @@ int main(int argc, char **argv) {
     g_ctx = mvx_ctx_create();
     account_refresh();
 
+    /* Register with the session registry, if one is running (mvx#226).  This
+       is what gives the session its port -- @USERNO, WHO, and later the
+       address a message is sent to.  The CONNECTION is the lease: it stays
+       open for the life of the shell and the daemon frees the port when it
+       drops, so a killed session needs no cleanup.
+
+       A nested TCL (EXECUTE) inherits MVXMSGSESSION and attaches to the port
+       its parent already holds rather than taking a second one.  With no
+       daemon running this does nothing at all, quietly, and the shell behaves
+       exactly as it did before. */
+    if (mvx_msg_register() > 0) {
+        char portbuf[16];
+        snprintf(portbuf, sizeof portbuf, "%lld", (long long)mvx_msg_port());
+        setenv("MVXPORT", portbuf, 1);
+        setenv("MVXMSGSESSION", mvx_msg_session_id(), 1);
+        setenv("MVXMSGTOKEN", mvx_msg_session_token(), 1);
+    }
+
     /* upgrade a pre-.mvx account so the descriptor becomes canonical */
     if (!has_descriptor() && has_markers())
         write_descriptor(g_acct_base);
