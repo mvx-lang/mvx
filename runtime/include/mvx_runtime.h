@@ -397,6 +397,18 @@ void    mvx_listconn(mvx_ctx *ctx, mv_value *dst);
 int     mvx_conn_lookup(const char *conn, const char *field, char *out,
                         size_t outlen);
 
+/* --- Sessions and messaging (see mvx_msg.c, mvx#226) -------------------
+   The session registry lives in mvx-msgd; every call here degrades to a
+   harmless value when there is no daemon, and none of them blocks for more
+   than a moment.  Messaging must never be able to stop a program running. */
+int         mvx_msg_register(void);      /* take a port; 0 = no registry */
+int64_t     mvx_msg_port(void);          /* @USERNO; 0 when unregistered */
+const char *mvx_msg_session_id(void);    /* "" until registered */
+const char *mvx_msg_session_token(void); /* a child ATTACHes with this */
+void        mvx_msg_bye(void);           /* graceful deregister */
+void        mvx_msg_who(mv_value *out, int64_t scope);
+void        mvx_msg_status(mv_value *out);
+
 /* --- OS file access (see mvx_os.c) ------------------------------------- */
 void    mv_osread(mvx_ctx *ctx, mv_value *dst, const mv_value *path);
 int64_t mv_oswrite(mvx_ctx *ctx, const mv_value *data, const mv_value *path);
