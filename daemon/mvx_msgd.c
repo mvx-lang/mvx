@@ -50,6 +50,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -58,6 +59,12 @@
    database daemon's number -- a handful of application processes; here a
    forty-user host with a verb running in each would exceed it, and the
    symptom would be a session that silently cannot register. */
+#ifdef __APPLE__
+#define MVX_DLSUFFIX ".dylib"
+#else
+#define MVX_DLSUFFIX ".so"
+#endif
+
 #define MAX_CONNS 512
 #define MAX_FRAME (1u * 1024 * 1024)
 #define MAX_TEXT 256
@@ -70,6 +77,7 @@ static const char *g_prefix = "";       /* port scope; default: the account */
 static int g_portbase = 1;
 static const char *g_transport = "loop";
 static const char *g_loc = "";          /* @profile or an inline address */
+static char g_origin[128];              /* this daemon, in every record it sends */
 
 /* ------------------------------------------------------------- roster */
 
@@ -349,6 +357,18 @@ static void on_message(void *user, const mvx_msgmsg *m) {
     else if (strncmp(p, "port/", 5) == 0) port = atoi(p + 5);
     else return;
 
+    /* OUR OWN PUBLISH COMING BACK.  A service that echoes to its own
+       subscribers (MQTT does) would deliver a local message twice, since the
+       daemon already put it in the inbox before publishing.  The origin field
+       is the record's last attribute. */
+    if (g_origin[0] && m->plen > 0) {
+        size_t olen = strlen(g_origin);
+        if ((size_t)m->plen > olen &&
+            memcmp(m->payload + m->plen - olen, g_origin, olen) == 0 &&
+            (unsigned char)m->payload[m->plen - olen - 1] == 0xfe)
+            return;
+    }
+
     int class = MVXMSG_CLASS_STATUS;
     /* attribute 2 of the record is the class */
     const char *am = memchr(m->payload, '\xfe', (size_t)m->plen);
@@ -621,9 +641,9 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
         time_t now = time(NULL);
         char rec[4096];
         int n = snprintf(rec, sizeof rec,
-                         "1\xfe%u\xfe%d\xfe%s\xfe%s\xfe%s\xfe%lld\xfe%s\xfe%s",
+                         "1\xfe%u\xfe%d\xfe%s\xfe%s\xfe%s\xfe%lld\xfe%s\xfe%s\xfe%s",
                          eff, me->port, me->user, me->account,
-                         me->host, (long long)now, text, payload);
+                         me->host, (long long)now, text, payload, g_origin);
         if (n < 0) return;
         if ((size_t)n >= sizeof rec) n = (int)sizeof rec - 1;
 
@@ -638,21 +658,35 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
            service a sender cannot learn that a receiver had messages switched
            off, so counting acceptances would give an answer that changed with
            the transport -- exactly what this contract exists to prevent. */
+        /* LOCAL FIRST, THEN PUBLISHED.  Two users on one host must be able to
+           message each other with the broker switched off -- "degraded, not
+           dead" is the whole promise -- so a local session is delivered to
+           directly, and the publish is for the other hosts.  Our own echo
+           comes back and is ignored by its origin field (on_message), which
+           is what stops a local message arriving twice. */
         uint32_t delivered = 0;
         char topic[256];
+        for (session *t = g_sessions; t; t = t->next) {
+            if (strcmp(t->prefix, me->prefix) != 0) continue;
+            if (!wall && !target_matches(t, target)) continue;
+            inbox_put(t, (int)(eff & 0x0fu), rec, (size_t)n);
+            delivered++;
+        }
         if (wall) {
             topic_wall(topic, sizeof topic, me->prefix);
-            for (session *t = g_sessions; t; t = t->next)
-                if (strcmp(t->prefix, me->prefix) == 0) delivered++;
-            if (delivered)
+            g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
+        } else if (target[0] == '!') {
+            /* An explicit port may be on another host.  The count stays what
+               was resolved HERE: this daemon cannot know what is logged on
+               elsewhere until presence arrives, and guessing would have MSG
+               report a delivery that never happened. */
+            long lo = strtol(target + 1, NULL, 10);
+            const char *dash = strchr(target + 1, '-');
+            long hi = dash ? strtol(dash + 1, NULL, 10) : lo;
+            if (hi < lo) { long t2 = lo; lo = hi; hi = t2; }
+            for (long p2 = lo; p2 <= hi && p2 - lo < 64; p2++) {
+                topic_port(topic, sizeof topic, me->prefix, (int)p2);
                 g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
-        } else {
-            for (session *t = g_sessions; t; t = t->next) {
-                if (strcmp(t->prefix, me->prefix) != 0) continue;
-                if (!target_matches(t, target)) continue;
-                topic_port(topic, sizeof topic, t->prefix, t->port);
-                g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
-                delivered++;
             }
         }
         o32(out, delivered);
@@ -708,8 +742,16 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
 
     case MVXMSG_OP_STAT: {
         session *s = sess_for_fd(fd);
-        ostr(out, g_transport);
-        o16(out, MVXMSG_STATE_UP);
+        ostr(out, g_drv ? g_drv->name : g_transport);
+        /* ASK THE DRIVER, do not assume.  A broker that has gone away leaves
+           local messaging working, and a program that wants to say so needs
+           to be able to tell the difference. */
+        int dstate = g_drv && g_drv->state ? g_drv->state(g_conn)
+                                           : MVX_MSGDRV_UP;
+        o16(out, (uint16_t)(dstate == MVX_MSGDRV_UP ? MVXMSG_STATE_UP
+                          : dstate == MVX_MSGDRV_CONNECTING
+                              ? MVXMSG_STATE_CONNECTING
+                              : MVXMSG_STATE_DOWN));
         o16(out, (uint16_t)(s ? s->port : 0));
         ostr(out, s ? s->prefix : g_prefix);
         *status = MVXMSG_ST_OK;
@@ -787,15 +829,53 @@ int main(int argc, char **argv) {
     if (!sockpath && port == 0) { usage(); return 2; }
     if (g_portbase < 0) g_portbase = 1;
     if (strcmp(g_transport, "loop") == 0) {
-        g_drv = mvx_msgdrv_loop();
+        g_drv = mvx_msgdrv_loop();      /* built in: always available */
     } else {
-        fprintf(stderr, "mvx-msgd: no transport named '%s' is built in "
-                        "(only 'loop' so far)\n", g_transport);
-        return 2;
+        /* A transport is a shared library beside the storage drivers, found
+           the same way they are, and loaded only when a site asks for it by
+           name.  So a build without libmosquitto is not a build without
+           messaging -- it is a build without MQTT. */
+        char path[1024];
+        const char *dir = getenv("MVXMSGDRIVERS");
+        if (!dir || !*dir) dir = getenv("MVXDRIVERS");
+        if (dir && *dir)
+            snprintf(path, sizeof path, "%s/libmvxmsg_%s%s", dir, g_transport,
+                     MVX_DLSUFFIX);
+        else
+            snprintf(path, sizeof path, "libmvxmsg_%s%s", g_transport,
+                     MVX_DLSUFFIX);
+        void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            fprintf(stderr, "mvx-msgd: no transport '%s': %s\n",
+                    g_transport, dlerror());
+            return 2;
+        }
+        mvx_msgdrv_entry_fn entry =
+            (mvx_msgdrv_entry_fn)dlsym(h, "mvx_msgdrv_entry");
+        g_drv = entry ? entry(MVX_MSGDRV_ABI) : NULL;
+        if (!g_drv) {
+            fprintf(stderr, "mvx-msgd: %s is not a transport for ABI %d\n",
+                    path, MVX_MSGDRV_ABI);
+            return 2;
+        }
     }
 
+    /* A CLIENT ID MUST BE UNIQUE ACROSS THE SERVICE.  MQTT takes a repeated
+       one as the same client reconnecting and closes the older session, so
+       two daemons sharing a name kick each other off in a loop -- and the
+       symptom is not an error but silence: each one looks connected and
+       neither receives anything.  Host and pid make it unique without
+       needing configuration. */
+    char clientid[128], selfhost[64];
+    if (gethostname(selfhost, sizeof selfhost) != 0)
+        snprintf(selfhost, sizeof selfhost, "host");
+    selfhost[sizeof selfhost - 1] = '\0';
+    snprintf(clientid, sizeof clientid, "mvx-msgd-%s-%ld", selfhost,
+             (long)getpid());
+    snprintf(g_origin, sizeof g_origin, "%s", clientid);
+
     char derr[256] = {0};
-    g_conn = g_drv->connect(g_loc, "mvx-msgd", NULL, NULL, 0, derr, sizeof derr);
+    g_conn = g_drv->connect(g_loc, clientid, NULL, NULL, 0, derr, sizeof derr);
     if (!g_conn) {
         fprintf(stderr, "mvx-msgd: transport %s: %s\n", g_drv->name,
                 derr[0] ? derr : "could not connect");

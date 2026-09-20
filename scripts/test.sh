@@ -2152,6 +2152,68 @@ else
   wait $MPID2 2>/dev/null
   rm -f "$MSOCK.send"
 
+  # THE BROKER TESTS ARE OPT-IN.  The suite stays network-free by default, so
+  # an offline build and a laptop without a broker both pass; CI can set
+  # MVX_TEST_MQTT=tcp://host:1883 to run the cross-host case for real.
+  if [ -n "${MVX_TEST_MQTT:-}" ] && [ -f "$ROOT/build/lib/libmvxmsg_mqtt.dylib" -o -f "$ROOT/build/lib/libmvxmsg_mqtt.so" ]; then
+    QPFX="mvxtest$$"
+    QA="$MSOCK.qa"; QB="$MSOCK.qb"
+    MVXDRIVERS="$ROOT/build/lib" "$ROOT/build/bin/mvx-msgd" -s "$QA" -t mqtt \
+      -c "$MVX_TEST_MQTT" -x "$QPFX" -b 1 2>/dev/null &
+    QPIDA=$!
+    MVXDRIVERS="$ROOT/build/lib" "$ROOT/build/bin/mvx-msgd" -s "$QB" -t mqtt \
+      -c "$MVX_TEST_MQTT" -x "$QPFX" -b 201 2>/dev/null &
+    QPIDB=$!
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ -S "$QA" ] && [ -S "$QB" ] && break
+      sleep 0.1
+    done
+    sleep 1                     # let both reach the broker
+    # Wait on the CLOCK, not on KEYIN: KEYIN does not wait when stdin is not a
+    # terminal, and the suite drives everything through pipes -- a poll loop
+    # built on it would spin through its iterations in a millisecond and
+    # report that nothing arrived.
+    cat > "$TESTROOT/qrecv.b" <<'QEOF'
+PRINT "port=":@USERNO
+DEADLINE = SYSTEM(12) + 5000
+LOOP WHILE SYSTEM(12) < DEADLINE DO
+   IF MSGPENDING() > 0 THEN
+      M = MSGREAD()
+      PRINT "received: ":M<8>
+      STOP
+   END
+REPEAT
+PRINT "received: nothing"
+QEOF
+    printf 'X = MSGSEND("*", "across the broker")
+PRINT "sent=":X
+' \
+      > "$TESTROOT/qsend.b"
+    if "$MVX" "$TESTROOT/qrecv.b" -o "$TESTROOT/qrecvbin" 2>/dev/null &&
+       "$MVX" "$TESTROOT/qsend.b" -o "$TESTROOT/qsendbin" 2>/dev/null; then
+      ( cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QB" "$TESTROOT/qrecvbin" \
+          > "$TESTROOT/qrecv.out" 2>&1 ) &
+      QRPID=$!
+      sleep 1
+      ( cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QA" MVXPRIV=unrestricted \
+          "$TESTROOT/qsendbin" >/dev/null 2>&1 )
+      wait $QRPID 2>/dev/null
+      if grep -q "received: across the broker" "$TESTROOT/qrecv.out"; then
+        PASS=$((PASS + 1)); echo "  a wall crosses hosts through the broker"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL mqtt: the other host received [$(cat "$TESTROOT/qrecv.out" | tr '\n' ' ')]"
+      fi
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL mqtt: the test programs did not compile"
+    fi
+    kill $QPIDA $QPIDB 2>/dev/null
+    wait $QPIDA $QPIDB 2>/dev/null
+    rm -f "$QA" "$QB"
+  else
+    echo "  (skipped the broker tests -- set MVX_TEST_MQTT=tcp://host:1883)"
+  fi
+
   # And with the registry gone, the same commands still work.
   kill $MPID 2>/dev/null
   wait $MPID 2>/dev/null

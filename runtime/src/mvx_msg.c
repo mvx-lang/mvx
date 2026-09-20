@@ -392,6 +392,9 @@ void mvx_msg_status(mv_value *out) {
     uint16_t state = i16(&in);
     uint16_t port = i16(&in);
     istr(&in, prefix, sizeof prefix);
+    /* `degraded', not `down': the registry is answering, so local messaging
+       works -- it is the service beyond it that is unreachable.  A program
+       that reads "down" would reasonably stop trying. */
     const char *sname = state == MVXMSG_STATE_UP ? "up"
                       : state == MVXMSG_STATE_CONNECTING ? "connecting"
                       : "degraded";

@@ -70,7 +70,18 @@ BEGIN CASE
       IF N = 1 THEN PLURAL = ""
       PRINT "sent to ":N:" port":PLURAL
    CASE N = 0
-      PRINT "MSG: no logged-on port matches ":TARGET
+*     Nothing here matched.  If a message service is carrying this prefix the
+*     message has gone to it, and a port of that number on another host will
+*     have received it -- this daemon cannot say so until the roster spans
+*     hosts (presence).  Saying "nobody" would be wrong, and saying "sent to
+*     1" would be a guess; say what is actually known.
+      ST = MSGSTATUS()
+      IF ST<1,1> = "up" AND ST<1,2> # "loop" AND TARGET[1, 1] = "!" THEN
+         PRINT "MSG: no port here is logged on as ":TARGET:
+         PRINT "; forwarded to the ":ST<1,2>:" service"
+      END ELSE
+         PRINT "MSG: no logged-on port matches ":TARGET
+      END
    CASE N = -1
       * the runtime has already said which permit is missing
       STOP
