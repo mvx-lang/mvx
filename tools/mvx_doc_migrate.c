@@ -72,8 +72,14 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "usage: mvx-doc-migrate <driver> <location>\n"
                 "\n"
-                "Converts every file in <location> from the pre-#157 record\n"
-                "blob to the document form, in place.  Safe to re-run.\n"
+                "Brings every file in <location> up to the current storage\n"
+                "format, in place.  Safe to re-run.  Two conversions:\n"
+                "\n"
+                "  records  the pre-#157 blob becomes a JSON document\n"
+                "  ids      a binary record id becomes text, escaped only\n"
+                "           where the database's character set cannot carry\n"
+                "           the byte -- and re-spelled when that character\n"
+                "           set has changed under the data (#236)\n"
                 "\n"
                 "The location is written as BINDINGS writes it; for a\n"
                 "connection profile that is @name, so run it from the account.\n"
@@ -81,7 +87,8 @@ int main(int argc, char **argv) {
                 "  mvx-doc-migrate sqlite /srv/acct/acct.sqlite\n"
                 "  mvx-doc-migrate mysql 'host=h port=3306 user=u password=p "
                 "dbname=d'\n"
-                "  (cd /srv/acct && mvx-doc-migrate postgres @pgmain)\n");
+                "  (cd /srv/acct && mvx-doc-migrate postgres @pgmain)\n"
+                "  (cd /srv/acct && mvx-doc-migrate mongo @mongomain)\n");
         return 2;
     }
     const char *name = argv[1], *loc = argv[2];

@@ -293,11 +293,41 @@ static int sq_is_pre157(sqlite3 *db, const char *tbl) {
     return old;
 }
 
+/* sqlite has no table comment to stamp -- it normalises away a comment
+   written into CREATE TABLE -- but it does have a place for exactly this:
+   PRAGMA user_version, four bytes in the file header, read without touching
+   a page of data.  So the FILE carries the format and the tables carry the
+   shape (mvx#171, mvx#236). */
+static int sq_user_version(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    int v = 0;
+    if (sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &st, NULL)
+            == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    return v;
+}
+
+static void sq_set_user_version(sqlite3 *db, int v) {
+    char sql[64];
+    snprintf(sql, sizeof sql, "PRAGMA user_version = %d", v);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
 /* AND WHETHER ITS IDS ARE STILL BINARY (mvx#236).  The shape says so again:
-   a format-2 file has `id BLOB`, a format-3 one `id TEXT`.  Reading one as
-   the other is the worst kind of wrong -- bound text never equals a stored
-   blob in sqlite, so every READ would simply say the record is not there. */
+   a format-2 file declares `id BLOB`, a format-3 one `id TEXT`.  Reading one
+   as the other is the worst kind of wrong -- bound text never equals a stored
+   blob in sqlite, so every READ would simply say the record is not there.
+ *
+ * The version is consulted as well as the shape because the conversion
+ * CANNOT change the declared type: sqlite has no ALTER COLUMN, and a primary
+ * key column cannot be dropped and re-added.  It does not need to -- a column
+ * declared BLOB has no affinity, so it stores text as text and compares it
+ * correctly -- but the declaration stays behind as a fossil, and the file
+ * header is what says the fossil has been dealt with. */
 static int sq_is_blob_id(sqlite3 *db, const char *tbl) {
+    if (sq_user_version(db) >= MVX_FILE_FORMAT) return 0;
     char sql[256];
     snprintf(sql, sizeof sql,
              "SELECT sum(name='id' AND upper(type)='BLOB') "
@@ -447,6 +477,7 @@ static int sq_create(const char *spec, char *err, size_t errlen) {
     quote_ident(tbl, qt, sizeof qt);
     snprintf(sql, sizeof sql,
              "CREATE TABLE %s (id TEXT PRIMARY KEY, doc TEXT)", qt);
+    sq_set_user_version(db, MVX_FILE_FORMAT);   /* say what this file is */
     if (!exec_sql(db, sql)) {
         snprintf(err, errlen, "sqlite: %s", sqlite3_errmsg(db));
         return 0;
@@ -1323,6 +1354,92 @@ static int sq_explain(mvx_file *fh, const mvx_pred *preds, int npred,
  * The whole file is one transaction, so an interrupted run leaves the file in
  * the old format rather than half converted.  Idempotent: a file that already
  * has `doc` is skipped. */
+/* Rewrite one table's blob ids as text (#236).
+ *
+ * BY ROWID, like the doc pass and for the same reason: an id that is a blob
+ * cannot be matched by binding the same bytes as text, and once half the
+ * table has been converted it cannot reliably be matched as a blob either.
+ * rowid is an integer and always matches itself.
+ *
+ * The declared column type is left alone -- sqlite has no ALTER COLUMN and a
+ * primary key column cannot be dropped -- which costs nothing, because a
+ * column declared BLOB has no affinity and stores text as text.  The file's
+ * user_version is what records that this has been done. */
+/* Does this table have that column? */
+static int sq_has_col(sqlite3 *db, const char *tbl, const char *col) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, tbl, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, col, -1, SQLITE_STATIC);
+    int got = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) got = sqlite3_column_int(st, 0) > 0;
+    sqlite3_finalize(st);
+    return got;
+}
+
+static int sq_ids_to_text(sqlite3 *db, const char *qt, const char *name,
+                          int *changed, char *err, size_t errlen) {
+    char sql[800];
+    snprintf(sql, sizeof sql,
+             "SELECT rowid, id FROM %s WHERE typeof(id) = 'blob'", qt);
+    sqlite3_stmt *rd = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &rd, NULL) != SQLITE_OK) {
+        snprintf(err, errlen, "sqlite: %s: %s", name, sqlite3_errmsg(db));
+        return 0;
+    }
+    char usql[800];
+    snprintf(usql, sizeof usql, "UPDATE %s SET id = ?2 WHERE rowid = ?1", qt);
+    int failed = 0;
+    while (!failed && sqlite3_step(rd) == SQLITE_ROW) {
+        sqlite3_int64 rid = sqlite3_column_int64(rd, 0);
+        const void *ip = sqlite3_column_blob(rd, 1);
+        int il = sqlite3_column_bytes(rd, 1);
+        char stack[512], *buf = stack;
+        size_t cap = sizeof stack;
+        if ((size_t)il * 3 + 1 > cap) {
+            cap = (size_t)il * 3 + 1;
+            buf = malloc(cap);
+            if (!buf) { failed = 1; break; }
+        }
+        int64_t n = mvx_id_encode((const char *)ip, (int64_t)il,
+                                  MVX_ID_CS_UTF8, buf, cap);
+        sqlite3_stmt *up = NULL;
+        if (n >= 0 && sqlite3_prepare_v2(db, usql, -1, &up, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(up, 1, rid);
+            sqlite3_bind_text(up, 2, buf, (int)n, SQLITE_TRANSIENT);
+            if (sqlite3_step(up) != SQLITE_DONE || sqlite3_changes(db) != 1)
+                failed = 1;
+            sqlite3_finalize(up);
+        } else failed = 1;
+        if (buf != stack) free(buf);
+        if (!failed && changed) *changed = 1;
+    }
+    sqlite3_finalize(rd);
+    if (failed) {
+        snprintf(err, errlen, "sqlite: %s: %s", name, sqlite3_errmsg(db));
+        return 0;
+    }
+    /* PROVE NONE IS LEFT.  A blob id that survived would read as a missing
+       record and nothing would report it. */
+    snprintf(sql, sizeof sql,
+             "SELECT count(*) FROM %s WHERE typeof(id) = 'blob'", qt);
+    sqlite3_stmt *ck = NULL;
+    int64_t left = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &ck, NULL) == SQLITE_OK) {
+        if (sqlite3_step(ck) == SQLITE_ROW) left = sqlite3_column_int64(ck, 0);
+        sqlite3_finalize(ck);
+    }
+    if (left != 0) {
+        snprintf(err, errlen,
+                 "sqlite: %s: %lld record id(s) did not convert — left in the "
+                 "old form", name, (long long)left);
+        return 0;
+    }
+    return 1;
+}
+
 static int sq_migrate_docs(const char *loc, char *err, size_t errlen) {
     sqlite3 *db = sq_connect(loc, err, errlen);
     if (!db) return -1;
@@ -1332,12 +1449,12 @@ static int sq_migrate_docs(const char *loc, char *err, size_t errlen) {
     char (*names)[256] = NULL;
     int n = 0, cap = 0;
     sqlite3_stmt *st = NULL;
+    /* Every table with an `id' column, not just every file: a mapping's
+       child tables carry ids too and never appear in LISTF. */
     if (sqlite3_prepare_v2(db,
             "SELECT m.name FROM sqlite_master m "
             "JOIN pragma_table_info(m.name) p "
-            "WHERE m.type='table' AND p.name='rec' "
-            "AND NOT EXISTS (SELECT 1 FROM pragma_table_info(m.name) q "
-            "                WHERE q.name='doc') ORDER BY m.name",
+            "WHERE m.type='table' AND p.name='id' ORDER BY m.name",
             -1, &st, NULL) != SQLITE_OK) {
         snprintf(err, errlen, "sqlite: %s", sqlite3_errmsg(db));
         return -1;
@@ -1365,6 +1482,12 @@ static int sq_migrate_docs(const char *loc, char *err, size_t errlen) {
             snprintf(err, errlen, "sqlite: %s", sqlite3_errmsg(db));
             free(names); return -1;
         }
+        /* The doc pass applies only to a file still holding `rec'; the id
+           pass applies to every table that has ids, child tables included. */
+        int needdocs = sq_has_col(db, names[i], "rec") &&
+                      !sq_has_col(db, names[i], "doc");
+        int changed = needdocs;
+        if (!needdocs) goto ids;
         snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc TEXT", qt);
         if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) {
             snprintf(err, errlen, "sqlite: %s: %s", names[i], sqlite3_errmsg(db));
@@ -1443,10 +1566,18 @@ static int sq_migrate_docs(const char *loc, char *err, size_t errlen) {
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             free(names); return -1;
         }
+    ids:
+        if (!sq_ids_to_text(db, qt, names[i], &changed, err, errlen)) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            free(names); return -1;
+        }
         sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-        done++;
+        if (changed) done++;      /* count files CONVERTED, not files seen */
     }
     free(names);
+    /* LAST, and only once every table is through: the file header is what
+       says the conversion happened, so it must not say so early. */
+    sq_set_user_version(db, MVX_FILE_FORMAT);
     return done;
 }
 
