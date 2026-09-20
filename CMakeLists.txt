@@ -154,6 +154,7 @@ add_library(mvxrt SHARED
   runtime/src/mvx_perm.c
   runtime/src/mvx_cred.c
   runtime/src/mvx_conn.c
+  runtime/src/mvx_msg.c
   runtime/src/mvx_call.c
   runtime/src/mvx_term.c
   runtime/src/mvx_os.c
@@ -325,6 +326,16 @@ if(MVX_WITH_DAEMON)
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
+# --- the session registry (mvx#226) ------------------------------------
+# Not gated behind an option and not part of MVX_WITH_DAEMON: it is libc and a
+# poll loop with no third-party dependency, so it builds wherever the runtime
+# does.  A transport that needs a library arrives later as its own dlopen'd
+# driver, and that is what gets an option.
+add_executable(mvx-msgd daemon/mvx_msgd.c)
+target_include_directories(mvx-msgd PRIVATE runtime/include)
+set_target_properties(mvx-msgd PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # --- mvx-git-adopt: adopt a plain-git checkout into a native account ----
 add_executable(mvx-git-adopt tools/mvx_git_adopt.c)
 target_link_libraries(mvx-git-adopt PRIVATE mvxrt)
@@ -442,7 +453,7 @@ endif()
 set_target_properties(mvx mvx-basic mvx-git-adopt PROPERTIES
   INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 
-set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt)
+set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd)
 if(MVX_WITH_DAEMON)
   list(APPEND MVX_INSTALL_BINS mvx-lmdbd mvx-lmdbd-admin)
 endif()

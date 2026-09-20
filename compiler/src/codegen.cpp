@@ -959,7 +959,8 @@ private:
             return t;
         }
         if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0 &&
-            e.sval != "@USER.TYPE" && e.sval != "@SENTENCE")
+            e.sval != "@USER.TYPE" && e.sval != "@SENTENCE" &&
+            e.sval != "@USERNO")
             return getScalar(e.sval, e.line);
         if (e.kind == Expr::K::Paren && arrayNames_.count(e.sval))
             return arrayElemPtr(e);
@@ -1002,6 +1003,17 @@ private:
             if (e.sval == "@USER.TYPE") {          // session type (0 = interactive)
                 callRt("mv_user_type", voidTy_, {ptrTy_, ptrTy_},
                        {ctxArg_, dest});
+                return;
+            }
+            if (e.sval == "@USERNO") {
+                /* The classic port number, from the session registry
+                   (mvx#226).  ARCHITECTURE.md has listed it as session state
+                   since Slice 3 and nothing implemented it, so every program
+                   that read it got an ordinary unassigned variable -- silently
+                   zero-ish, never an error.  0 when no registry is running,
+                   which is the same answer a single-user system should give. */
+                Value *n = callRt("mvx_msg_port", i64Ty_, {}, {});
+                callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_}, {dest, n});
                 return;
             }
             int mc = sysConstChar(e.sval);

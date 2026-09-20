@@ -60,6 +60,7 @@ const mvx_ext *mvx_ext_entry(int abi);
    Each provider returns its table; mvx_ext.c registers them before any library
    is loaded, so a package cannot shadow a built-in name. */
 const mvx_ext *mvx_json_builtin(void);  /* JSONENCODE / JSONDECODE */
+const mvx_ext *mvx_msg_builtin(void);   /* MSGWHO / MSGSTATUS (mvx#226) */
 
 /* Runtime side (mvx_ext.c), linked into libmvxrt. */
 void mvx_ext_load_libs(void);           /* dlopen package LIB/ libs (shared with CALL) */

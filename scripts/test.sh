@@ -173,6 +173,8 @@ lang strfns world
 lang strmath
 lang ifdef
 lang equate
+# mvx#226: messaging must cost nothing when no registry is running.
+lang msg
 lang matparse
 lang include
 lang matches
@@ -2005,6 +2007,93 @@ check tcl-namespace "$( \
 
 kill $DPID 2>/dev/null
 rm -f "$DSOCK"
+
+# the session registry (mvx#226): ports, the roster, and the lease.  Offline
+# and deterministic -- ports are allocated lowest-free, so a fresh daemon
+# always hands out 1, 2, 3 -- and sessions are never run in parallel.
+MSOCK="/tmp/mvx-msgd-test-$$.sock"
+MACCT="$TESTROOT/macct"
+"$ROOT/scripts/mkaccount.sh" "$MACCT" >/dev/null 2>&1
+"$ROOT/build/bin/mvx-msgd" -s "$MSOCK" 2>/dev/null &
+MPID=$!
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [ -S "$MSOCK" ] && break
+  sleep 0.1
+done
+if [ ! -S "$MSOCK" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL msgd: the registry did not start"
+else
+  # A session that stays logged on while we ask about it.  Its stdin is a
+  # fifo, not a pipeline: that way $! is the SHELL's own pid and `kill -9`
+  # reaches it, which is the whole point of the lease test.  Killing a
+  # pipeline's subshell leaves the process inside it running.
+  MFIFO="$TESTROOT/mfifo"
+  mkfifo "$MFIFO" 2>/dev/null
+  sleep 30 > "$MFIFO" &
+  MSLEEP=$!
+  MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" < "$MFIFO" >/dev/null 2>&1 &
+  HOLDER=$!
+  # Wait for it to be ON the roster rather than guessing how long a shell
+  # takes to start; each probe is itself a session, and its own port is the
+  # second one, so "2" is the number that says the holder is up.
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ "$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>/dev/null | \
+         sed -n 's/^\([0-9]*\) session(s).*/\1/p')" = 2 ] && break
+    sleep 0.1
+  done
+
+  # A verb runs as a child of its shell and ATTACHes to the port the shell
+  # already holds -- it must not take a second one, or every command would
+  # log a new session on.
+  msg_who="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c WHO 2>&1 | awk '{print $1}')"
+  case "$msg_who" in
+    [0-9]*) PASS=$((PASS + 1)); echo "  WHO reports this session's port" ;;
+    *) FAIL=$((FAIL + 1)); echo "FAIL msgd: WHO gave no port: $msg_who" ;;
+  esac
+
+  msg_n="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+           sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+  if [ "$msg_n" = 2 ]; then
+    PASS=$((PASS + 1)); echo "  the roster lists both sessions"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgd: roster has [$msg_n] sessions, want 2"
+  fi
+
+  # THE LEASE.  Kill the holder outright: the daemon must drop it when the
+  # connection goes, with no cleanup step anywhere.
+  kill -9 $HOLDER 2>/dev/null
+  wait $HOLDER 2>/dev/null
+  kill $MSLEEP 2>/dev/null
+  wait $MSLEEP 2>/dev/null
+  sleep 0.5
+  msg_n2="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+            sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+  if [ "$msg_n2" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  a killed session leaves the roster by itself"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgd: after SIGKILL the roster has [$msg_n2], want 1"
+  fi
+
+  # Ports are scoped by a prefix that defaults to the ACCOUNT, so the same
+  # user has the same address wherever they logged on.
+  msg_pfx="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+             sed -n 's/.*on prefix //p')"
+  if [ "$msg_pfx" = "macct" ]; then
+    PASS=$((PASS + 1)); echo "  the port prefix defaults to the account name"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgd: prefix is [$msg_pfx], want macct"
+  fi
+
+  # And with the registry gone, the same commands still work.
+  kill $MPID 2>/dev/null
+  wait $MPID 2>/dev/null
+  msg_off="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c WHO 2>&1)"
+  case "$msg_off" in
+    *"$MACCT"*) PASS=$((PASS + 1)); echo "  WHO still answers with no registry running" ;;
+    *) FAIL=$((FAIL + 1)); echo "FAIL msgd: WHO broke without a registry: $msg_off" ;;
+  esac
+fi
+rm -f "$MSOCK" "$TESTROOT/mfifo"
 
 # daemon authentication: mvx-lmdbd-admin provisions a namespace token
 # (offline, into <datadir>/accounts); a client with the token in
