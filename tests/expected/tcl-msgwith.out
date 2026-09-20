@@ -1,0 +1,7 @@
+sent to 1 port, with ORDERS O1234
+[1] <user>: have a look
+     attached: ORDERS O1234 — on the stack as "CT ORDERS O1234"
+MSG: NOSUCH is not on file in ORDERS
+MSG: cannot open NOSUCHFILE
+usage: MSG{n} (* | !port{-port} | account{,account} | @user)
+           {WITH file id} text

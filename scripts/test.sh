@@ -2199,6 +2199,45 @@ CTCL
     MVXPRIV=restricted "$TCL" -a "$MACCT" -c "MSG * everyone" 2>&1; \
     MVXPRIV=unrestricted "$TCL" -a "$MACCT" -c "MSG * everyone" 2>&1; \
     unset MVXMSGD)"
+
+  # PAYLOADS AND THE STATEMENT SPELLINGS (mvx#238).  Same shape as msgsend:
+  # one session, which sends and then drains.
+  if "$MVX" "$ROOT/tests/msgpayload.b" -o "$TESTROOT/msgpaybin" 2>/dev/null; then
+    check msgpayload "$( \
+      cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$MSOCK.send" MVXPRIV=unrestricted \
+        "$TESTROOT/msgpaybin" 2>&1 | normalise)"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgpayload: did not compile"
+  fi
+
+  # THE HAND-OFF, END TO END: a record attached by the verb, and the offer
+  # the receiving shell makes.  One session sending to itself -- the verb is
+  # a child that ATTACHes to the shell's port, so the message lands in the
+  # shell's inbox and the drain before the next prompt prints it.
+  #
+  # What is asserted is that the shell OFFERS: it names the record and puts a
+  # command on the stack.  Nothing opens.  A session that opened an attached
+  # record on arrival would be a way to take over somebody's terminal.
+  #
+  # The sender's name is masked, not the port: a golden file must not depend
+  # on who ran the suite.
+  cat > "$TESTROOT/attseed.b" <<'ATTEOF'
+OPEN "ORDERS" TO F ELSE STOP "no ORDERS"
+WRITE "Acme Ltd":@AM:"1500.00" ON F, "O1234"
+ATTEOF
+  "$TCL" -a "$MACCT" -c 'CREATE-FILE ORDERS' >/dev/null 2>&1
+  "$MVX" "$TESTROOT/attseed.b" -o "$TESTROOT/attseed" 2>/dev/null
+  (cd "$MACCT" && MVXACCOUNT=. "$TESTROOT/attseed" >/dev/null 2>&1)
+  check tcl-msgwith "$( \
+    export MVXMSGD="$MSOCK.send" MVXPRIV=unrestricted; \
+    printf 'MSG !1 WITH ORDERS O1234 have a look\nWHO\nOFF\n' | \
+      "$TCL" -a "$MACCT" 2>&1 | grep -E 'attached|have a look|sent to' | \
+      sed -E 's/^\[([0-9]+)\] [^:]*:/[\1] <user>:/'; \
+    "$TCL" -a "$MACCT" -c 'MSG !1 WITH ORDERS NOSUCH nope' 2>&1; \
+    "$TCL" -a "$MACCT" -c 'MSG !1 WITH NOSUCHFILE X nope' 2>&1; \
+    "$TCL" -a "$MACCT" -c 'MSG !1 WITH ORDERS' 2>&1; \
+    unset MVXMSGD MVXPRIV)"
+
   kill $MPID2 2>/dev/null
   wait $MPID2 2>/dev/null
   rm -f "$MSOCK.send"
