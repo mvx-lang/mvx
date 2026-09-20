@@ -2103,6 +2103,41 @@ else
     FAIL=$((FAIL + 1)); echo "FAIL msgsend: did not compile"
   fi
 
+  # THE TEST THAT PROVES THE ABSTRACTION (mvx#230).  The same scenario, run
+  # against a transport forced to admit fewer and fewer capabilities: what a
+  # program sees must not change.  A future driver for another service is
+  # correct by construction if it passes this, because the daemon has already
+  # been made to work without retained messages, without a will, and without
+  # wildcards.
+  msgcaps_same=1
+  msgcaps_want="$(cat "$EXP/msgsend.out" 2>/dev/null)"
+  for caps in "retain" "will" "loopback" "retain,will,persist,wildcard,loopback"; do
+    CSOCK="$MSOCK.caps"
+    "$ROOT/build/bin/mvx-msgd" -s "$CSOCK" -r 100000 -k 100000 \
+      -X "nocaps=$caps" 2>/dev/null &
+    CPID=$!
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ -S "$CSOCK" ] && break
+      sleep 0.1
+    done
+    got="$(cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$CSOCK" MVXPRIV=unrestricted \
+             "$TESTROOT/msgsendbin" 2>&1 | normalise)"
+    kill $CPID 2>/dev/null
+    wait $CPID 2>/dev/null
+    rm -f "$CSOCK"
+    if [ "$got" != "$msgcaps_want" ]; then
+      msgcaps_same=0
+      echo "FAIL tcl-msgcaps: delivery changed with nocaps=$caps"
+      printf '%s\n' "$got" | diff -u "$EXP/msgsend.out" - | head -10 | sed 's/^/    /'
+    fi
+  done
+  if [ "$msgcaps_same" = 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  delivery is the same whatever the transport admits to"
+  else
+    FAIL=$((FAIL + 1))
+  fi
+
   # The verb, its addressing forms, and the gate on a wall broadcast.  A
   # restricted session may message one port and may not message every port:
   # the check is in the RUNTIME, so calling MSGSEND directly is refused too.

@@ -36,6 +36,7 @@
  */
 
 #include "mvxmsg_proto.h"
+#include "mvx_msgdrv.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -68,6 +69,7 @@ static void on_stop(int sig) { (void)sig; g_stop = 1; }
 static const char *g_prefix = "";       /* port scope; default: the account */
 static int g_portbase = 1;
 static const char *g_transport = "loop";
+static const char *g_loc = "";          /* @profile or an inline address */
 
 /* ------------------------------------------------------------- roster */
 
@@ -217,6 +219,28 @@ static void rand_hex(char *out, size_t n) {
     out[i * 2] = '\0';
 }
 
+/* ------------------------------------------------------- transport */
+
+static const mvx_msgdrv *g_drv;
+static mvx_msgconn *g_conn;
+static unsigned g_caps;                 /* what the driver admits to */
+static unsigned g_nocaps;               /* forced off, for testing */
+
+/* Topics, and only these four shapes.  Every future backend has to reproduce
+   exactly this much, which is the point of keeping it small:
+     mvx/<prefix>/port/<port>/msg     one port
+     mvx/<prefix>/wall                every port
+     mvx/<prefix>/presence/<port>     the roster (retained where possible)
+     mvx/<prefix>/ctl/<daemon>        daemon to daemon
+*/
+static void topic_port(char *out, size_t cap, const char *prefix, int port) {
+    snprintf(out, cap, "mvx/%s/port/%d/msg", prefix, port);
+}
+
+static void topic_wall(char *out, size_t cap, const char *prefix) {
+    snprintf(out, cap, "mvx/%s/wall", prefix);
+}
+
 /* --------------------------------------------------------- delivery */
 
 /* Put one record in a session's inbox.  Returns 1 if it was queued.
@@ -297,6 +321,44 @@ static int target_matches(const session *s, const char *target) {
         p = comma + 1;
     }
     return 0;
+}
+
+/* A message arriving FROM the transport, whichever transport it is.  This is
+   the only path into a local inbox: delivery does not short-circuit for a
+   message that happens to have come from this host, because then the local
+   and remote cases would be different code and only one of them would be
+   exercised by the tests. */
+static void on_message(void *user, const mvx_msgmsg *m) {
+    (void)user;
+    if (!m || !m->topic) return;
+
+    /* mvx/<prefix>/port/<port>/msg  or  mvx/<prefix>/wall */
+    char prefix[128];
+    int port = 0, wall = 0;
+    const char *p = m->topic;
+    if (strncmp(p, "mvx/", 4) != 0) return;
+    p += 4;
+    const char *slash = strchr(p, '/');
+    if (!slash) return;
+    size_t plen = (size_t)(slash - p);
+    if (plen >= sizeof prefix) return;
+    memcpy(prefix, p, plen);
+    prefix[plen] = '\0';
+    p = slash + 1;
+    if (strcmp(p, "wall") == 0) wall = 1;
+    else if (strncmp(p, "port/", 5) == 0) port = atoi(p + 5);
+    else return;
+
+    int class = MVXMSG_CLASS_STATUS;
+    /* attribute 2 of the record is the class */
+    const char *am = memchr(m->payload, '\xfe', (size_t)m->plen);
+    if (am) class = atoi(am + 1) & 0x0f;
+
+    for (session *s = g_sessions; s; s = s->next) {
+        if (strcmp(s->prefix, prefix) != 0) continue;
+        if (!wall && s->port != port) continue;
+        inbox_put(s, class, m->payload, (size_t)m->plen);
+    }
 }
 
 /* ------------------------------------------------------------ plumbing
@@ -449,6 +511,17 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
             rand_hex(s->token, sizeof s->token);
             s->next = g_sessions;
             g_sessions = s;
+
+            /* Subscribe for this port and for the prefix's wall.  A driver
+               with wildcards needs only the patterns; one without needs the
+               exact topics, which is why this asks rather than assumes. */
+            char topic[256];
+            if (g_drv && g_conn) {
+                topic_port(topic, sizeof topic, s->prefix, s->port);
+                g_drv->subscribe(g_conn, topic);
+                topic_wall(topic, sizeof topic, s->prefix);
+                g_drv->subscribe(g_conn, topic);
+            }
             *status = MVXMSG_ST_OK;
         }
         o16(out, (uint16_t)s->port);
@@ -554,11 +627,33 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
         if (n < 0) return;
         if ((size_t)n >= sizeof rec) n = (int)sizeof rec - 1;
 
+        /* RESOLVED HERE, AGAINST THE ROSTER, THEN PUBLISHED PER PORT.  The
+           alternative -- let the service fan out by wildcard -- would make
+           MQTT's subscription model load-bearing, and would leave MSG unable
+           to say how many ports it reached.  Ports that are not logged on are
+           simply absent from the roster, which is how a message to a
+           logged-off line comes to be dropped.
+
+           The count is PORTS ADDRESSED, not inboxes that accepted.  Across a
+           service a sender cannot learn that a receiver had messages switched
+           off, so counting acceptances would give an answer that changed with
+           the transport -- exactly what this contract exists to prevent. */
         uint32_t delivered = 0;
-        for (session *t = g_sessions; t; t = t->next) {
-            if (strcmp(t->prefix, me->prefix) != 0) continue;
-            if (!wall && !target_matches(t, target)) continue;
-            if (inbox_put(t, (int)(eff & 0x0fu), rec, (size_t)n)) delivered++;
+        char topic[256];
+        if (wall) {
+            topic_wall(topic, sizeof topic, me->prefix);
+            for (session *t = g_sessions; t; t = t->next)
+                if (strcmp(t->prefix, me->prefix) == 0) delivered++;
+            if (delivered)
+                g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
+        } else {
+            for (session *t = g_sessions; t; t = t->next) {
+                if (strcmp(t->prefix, me->prefix) != 0) continue;
+                if (!target_matches(t, target)) continue;
+                topic_port(topic, sizeof topic, t->prefix, t->port);
+                g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
+                delivered++;
+            }
         }
         o32(out, delivered);
         *status = MVXMSG_ST_OK;
@@ -651,7 +746,8 @@ static int conn_dispatch(conn *c) {
 static void usage(void) {
     fprintf(stderr,
             "usage: mvx-msgd (-s unix-socket | -p port) [-t transport]\n"
-            "                [-x prefix] [-b portbase] [-r per-sec] [-k burst]\n");
+            "                [-x prefix] [-b portbase] [-r per-sec] [-k burst]\n"
+            "                [-c @profile] [-X nocaps=retain,will,...]\n");
 }
 
 int main(int argc, char **argv) {
@@ -665,15 +761,50 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) g_portbase = atoi(argv[++i]);
         else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) g_rate = atof(argv[++i]);
         else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) g_burst = atof(argv[++i]);
+        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) g_loc = argv[++i];
+        else if (strcmp(argv[i], "-X") == 0 && i + 1 < argc) {
+            /* -X nocaps=retain,will -- pretend the transport cannot do these,
+               so the daemon's compensation for a backend that lacks them is
+               exercised on purpose rather than first meeting daylight when a
+               second backend arrives. */
+            const char *v = argv[++i];
+            if (strncmp(v, "nocaps=", 7) == 0) {
+                v += 7;
+                while (*v) {
+                    if (strncmp(v, "retain", 6) == 0) g_nocaps |= MVX_MSGCAP_RETAIN;
+                    else if (strncmp(v, "will", 4) == 0) g_nocaps |= MVX_MSGCAP_WILL;
+                    else if (strncmp(v, "persist", 7) == 0) g_nocaps |= MVX_MSGCAP_PERSIST;
+                    else if (strncmp(v, "wildcard", 8) == 0) g_nocaps |= MVX_MSGCAP_WILDCARD;
+                    else if (strncmp(v, "loopback", 8) == 0) g_nocaps |= MVX_MSGCAP_LOOPBACK;
+                    const char *comma = strchr(v, ',');
+                    if (!comma) break;
+                    v = comma + 1;
+                }
+            }
+        }
         else { usage(); return 2; }
     }
     if (!sockpath && port == 0) { usage(); return 2; }
     if (g_portbase < 0) g_portbase = 1;
-    if (strcmp(g_transport, "loop") != 0) {
-        fprintf(stderr, "mvx-msgd: transport '%s' is not built in yet "
-                        "(only 'loop')\n", g_transport);
+    if (strcmp(g_transport, "loop") == 0) {
+        g_drv = mvx_msgdrv_loop();
+    } else {
+        fprintf(stderr, "mvx-msgd: no transport named '%s' is built in "
+                        "(only 'loop' so far)\n", g_transport);
         return 2;
     }
+
+    char derr[256] = {0};
+    g_conn = g_drv->connect(g_loc, "mvx-msgd", NULL, NULL, 0, derr, sizeof derr);
+    if (!g_conn) {
+        fprintf(stderr, "mvx-msgd: transport %s: %s\n", g_drv->name,
+                derr[0] ? derr : "could not connect");
+        return 1;
+    }
+    /* WHAT THE DRIVER SAYS IT CAN DO, minus anything forced off for a test.
+       The daemon reads these and compensates; it never asks which backend it
+       is talking to. */
+    g_caps = g_drv->caps & ~g_nocaps;
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_stop);
@@ -705,8 +836,8 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(stderr, "mvx-msgd: %s transport, ports from %d, on %s\n",
-            g_transport, g_portbase, sockpath ? sockpath : "tcp");
+    fprintf(stderr, "mvx-msgd: %s transport (caps %#x), ports from %d, on %s\n",
+            g_drv->name, g_caps, g_portbase, sockpath ? sockpath : "tcp");
 
     set_nonblock(lfd);
     struct pollfd fds[MAX_CONNS + 1];
@@ -722,9 +853,31 @@ int main(int argc, char **argv) {
             fds[i].events =
                 (short)(POLLIN | (cs[i].wpos < cs[i].wlen ? POLLOUT : 0));
 
-        if (poll(fds, (nfds_t)nfds, -1) < 0) {
+        /* The transport joins this loop rather than running a thread of its
+           own: the roster and the inboxes are in one hand that way.  A driver
+           with no descriptor (loop) simply asks for a timer. */
+        int dn = 0;
+        if (g_drv->fds) {
+            int dfds[8];
+            short devs[8];
+            dn = g_drv->fds(g_conn, dfds, devs, 8);
+            for (int i = 0; i < dn && nfds + i <= MAX_CONNS; i++) {
+                fds[nfds + i].fd = dfds[i];
+                fds[nfds + i].events = devs[i];
+                fds[nfds + i].revents = 0;
+            }
+        }
+        int wait_ms = g_drv->timeout_ms ? g_drv->timeout_ms(g_conn) : -1;
+
+        if (poll(fds, (nfds_t)(nfds + dn), wait_ms) < 0) {
             if (errno == EINTR) { if (g_stop) break; continue; }
             break;
+        }
+
+        /* Whatever arrived on the transport goes into the local inboxes. */
+        if (g_drv->pump && !g_drv->pump(g_conn, on_message, NULL)) {
+            fprintf(stderr, "mvx-msgd: transport %s disconnected\n",
+                    g_drv->name);
         }
 
         if (fds[0].revents & POLLIN) {
@@ -786,6 +939,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (g_drv && g_conn) g_drv->disconnect(g_conn);
     if (sockpath) unlink(sockpath);
     return 0;
 }
