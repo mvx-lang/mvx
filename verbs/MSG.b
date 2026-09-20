@@ -31,13 +31,47 @@
 *    MSG   signed             MSG1  unsigned
 *    MSG2  signed, cursor     MSG3  unsigned, cursor
 *    MSG4  signed, bell       MSG5  signed, cursor, bell
+*
+* AND A MESSAGE CAN CARRY A RECORD (mvx#238):
+*
+*    MSG !7 WITH ORDERS O1234 have a look at this
+*
+* which sends the message AND an attachment saying where to find the
+* record.  The receiving terminal OFFERS to open it -- it puts the command
+* on the stack and says so -- so it opens because the person at it chose to,
+* never because the sender said so.
 S = SENTENCE()
 VERB = FIELD(S, " ", 1)
 TARGET = FIELD(S, " ", 2)
-TEXT = FIELD(S, " ", 3, 999)
+FILENAME = ""
+RECID = ""
+IF OCONV(FIELD(S, " ", 3), "MCU") = "WITH" THEN
+   FILENAME = FIELD(S, " ", 4)
+   RECID = FIELD(S, " ", 5)
+   TEXT = FIELD(S, " ", 6, 999)
+END ELSE
+   TEXT = FIELD(S, " ", 3, 999)
+END
 IF TARGET = "" OR TEXT = "" THEN
-   PRINT "usage: MSG{n} (* | !port{-port} | account{,account} | @user) text"
+   PRINT "usage: MSG{n} (* | !port{-port} | account{,account} | @user)"
+   PRINT "           {WITH file id} text"
    STOP
+END
+* DON'T SEND A POINTER TO SOMETHING THAT IS NOT THERE.  The receiver would
+* find out by trying to open it, long after the sender had gone.
+IF FILENAME # "" THEN
+   IF RECID = "" THEN
+      PRINT "MSG: WITH needs a file and a record id"
+      STOP
+   END
+   OPEN FILENAME TO ATTF ELSE
+      PRINT "MSG: cannot open ":FILENAME
+      STOP
+   END
+   READ ATTR FROM ATTF, RECID ELSE
+      PRINT "MSG: ":RECID:" is not on file in ":FILENAME
+      STOP
+   END
 END
 * The class, from the digit on the verb.
 EQU CSTATUS TO 0
@@ -63,12 +97,22 @@ IF LEN(TEXT) > LIMIT THEN
    PRINT "MSG: text truncated to ":LIMIT:" characters"
    TEXT = TEXT[1, LIMIT]
 END
-N = MSGSEND(TARGET, TEXT, CLASS)
+* The payload convention (mvx#238): file, id, program, mode, by value mark.
+* Positions 5 and beyond are free for an application to use.  MODE is what
+* the receiver should OFFER -- a verb sends "view", because someone handing
+* you a record to look at is not asking you to change it.
+PAYLOAD = ""
+IF FILENAME # "" THEN
+   PAYLOAD = FILENAME:@VM:RECID:@VM:"":@VM:"view"
+END
+N = MSGSEND(TARGET, TEXT, CLASS, PAYLOAD)
 BEGIN CASE
    CASE N > 0
       PLURAL = "s"
       IF N = 1 THEN PLURAL = ""
-      PRINT "sent to ":N:" port":PLURAL
+      PRINT "sent to ":N:" port":PLURAL:
+      IF FILENAME # "" THEN PRINT ", with ":FILENAME:" ":RECID:
+      PRINT ""
    CASE N = 0
 *     Nothing here matched.  If a message service is carrying this prefix the
 *     message has gone to it, and a port of that number on another host will

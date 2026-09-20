@@ -286,42 +286,6 @@ static int voc_lookup(const char *verb, char *path, size_t cap) {
  *
  * Costs nothing when no registry is running: mvx_msg_pending() answers -1
  * without talking to anything. */
-static void drain_messages(void) {
-    mv_value m;
-    mv_init(&m);
-    while (mvx_msg_pending() > 0) {
-        mvx_msg_read(&m);
-        char nb[40];
-        const char *p;
-        int64_t n = mv_val_chars(&m, nb, sizeof nb, &p);
-        if (n <= 0) break;
-        /* class \xfe port \xfe user \xfe account \xfe host \xfe sent \xfe text */
-        char buf[1024];
-        if ((size_t)n >= sizeof buf) n = (int64_t)sizeof buf - 1;
-        memcpy(buf, p, (size_t)n);
-        buf[n] = '\0';
-        char *f[9] = {0};
-        int nf = 0;
-        for (char *tok = buf; nf < 9; nf++) {
-            f[nf] = tok;
-            char *mark = strchr(tok, '\xfe');
-            if (!mark) { nf++; break; }
-            *mark = '\0';
-            tok = mark + 1;
-        }
-        long cls = nf > 1 ? strtol(f[1], NULL, 10) : 0;
-        const char *port = nf > 2 ? f[2] : "?";
-        const char *user = nf > 3 ? f[3] : "?";
-        const char *text = nf > 7 ? f[7] : "";
-        if (cls & 32)               /* signed: say who it is from */
-            printf("\n[%s] %s: %s\n", port, user, text);
-        else
-            printf("\n%s\n", text);
-        if (cls & 16) fputc('\a', stdout);   /* bell */
-        fflush(stdout);
-    }
-    mv_clear(&m);
-}
 
 static int run_verb(const char *path, const char *line) {
     pid_t pid = fork();
@@ -499,6 +463,93 @@ static char *el_prompt(EditLine *e) {   /* libedit asks for the prompt */
 }
 static EditLine *g_el;                /* .R needs to type INTO the next prompt */
 #endif
+
+/* AN ATTACHED RECORD IS AN OFFER, NOT AN INSTRUCTION (mvx#238).
+ *
+ * Attribute 9 of a message carries, by value mark: file, id, program, mode.
+ * Positions 5 and beyond are free for an application; the shell reads the
+ * four it knows and ignores the rest, which is what lets the convention grow
+ * without every reader having to be taught first.
+ *
+ * What the shell does with it is PUT THE COMMAND ON THE STACK and say so.
+ * The record opens when the person at the terminal recalls it and presses
+ * return -- never because a message arrived.  That distinction is the whole
+ * design: a sender can hand you a screen, and cannot take yours. */
+static void msg_offer(const char *payload) {
+    if (!payload || !payload[0]) return;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", payload);
+    char *v[8] = {0};
+    int nv = 0;
+    for (char *tok = buf; nv < 8; nv++) {
+        v[nv] = tok;
+        char *mark = strchr(tok, '\xfd');       /* value mark */
+        if (!mark) { nv++; break; }
+        *mark = '\0';
+        tok = mark + 1;
+    }
+    const char *file = nv > 0 ? v[0] : "";
+    const char *id = nv > 1 ? v[1] : "";
+    const char *prog = nv > 2 ? v[2] : "";
+    const char *mode = nv > 3 ? v[3] : "";
+    if (!file[0] || !id[0]) return;             /* nothing openable */
+
+    /* The sender says what it is FOR, and the verb follows from that: CT to
+       look at a record, ED to change one.  A named program wins -- an
+       application knows its own screens better than the shell does. */
+    char cmd[1024];
+    if (prog[0])
+        snprintf(cmd, sizeof cmd, "%s %s %s", prog, file, id);
+    else if (strcmp(mode, "edit") == 0)
+        snprintf(cmd, sizeof cmd, "ED %s %s", file, id);
+    else
+        snprintf(cmd, sizeof cmd, "CT %s %s", file, id);
+
+    stack_push(cmd);
+    printf("     attached: %s %s — on the stack as \"%s\"", file, id, cmd);
+#ifdef HAVE_EDITLINE
+    if (g_el && isatty(0)) printf(" (.1 to recall)");
+#endif
+    printf("\n");
+}
+
+static void drain_messages(void) {
+    mv_value m;
+    mv_init(&m);
+    while (mvx_msg_pending() > 0) {
+        mvx_msg_read(&m);
+        char nb[40];
+        const char *p;
+        int64_t n = mv_val_chars(&m, nb, sizeof nb, &p);
+        if (n <= 0) break;
+        /* class \xfe port \xfe user \xfe account \xfe host \xfe sent \xfe text */
+        char buf[1024];
+        if ((size_t)n >= sizeof buf) n = (int64_t)sizeof buf - 1;
+        memcpy(buf, p, (size_t)n);
+        buf[n] = '\0';
+        char *f[9] = {0};
+        int nf = 0;
+        for (char *tok = buf; nf < 9; nf++) {
+            f[nf] = tok;
+            char *mark = strchr(tok, '\xfe');
+            if (!mark) { nf++; break; }
+            *mark = '\0';
+            tok = mark + 1;
+        }
+        long cls = nf > 1 ? strtol(f[1], NULL, 10) : 0;
+        const char *port = nf > 2 ? f[2] : "?";
+        const char *user = nf > 3 ? f[3] : "?";
+        const char *text = nf > 7 ? f[7] : "";
+        if (cls & 32)               /* signed: say who it is from */
+            printf("\n[%s] %s: %s\n", port, user, text);
+        else
+            printf("\n%s\n", text);
+        if (nf > 8) msg_offer(f[8]);
+        if (cls & 16) fputc('\a', stdout);   /* bell */
+        fflush(stdout);
+    }
+    mv_clear(&m);
+}
 
 /* Offer entry i for editing.  On a terminal that means seeding the next
    prompt with it, which is what "display and allow modification" means when
