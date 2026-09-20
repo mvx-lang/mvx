@@ -397,6 +397,24 @@ void    mvx_listconn(mvx_ctx *ctx, mv_value *dst);
 int     mvx_conn_lookup(const char *conn, const char *field, char *out,
                         size_t outlen);
 
+/* --- Record ids as stored text (see mvx_id.c, mvx#236) -----------------
+   Percent-encoded: an ordinary id is itself, and only bytes that cannot be
+   text are escaped, so a database shows the keys it actually holds.  Storage
+   form only -- above the driver an id is bytes.  Size `out' at 3x+1. */
+/* Record ids are stored as text (mvx#236).  A driver asks its connection what
+   character set it is using, and only the bytes that character set cannot
+   carry are percent-escaped; see runtime/src/mvx_id.c. */
+enum {
+    MVX_ID_CS_ASCII = 0,   /* keep ASCII, escape the rest (unknown charset) */
+    MVX_ID_CS_UTF8 = 1,    /* keep valid UTF-8, escape what is not */
+    MVX_ID_CS_BYTE = 2,    /* every byte is a character; escape almost nothing */
+};
+int mvx_id_charset(const char *name);
+const char *mvx_id_csname(int cs);
+int64_t mvx_id_encode(const char *id, int64_t idlen, int cs, char *out,
+                      size_t cap);
+int64_t mvx_id_decode(const char *txt, int64_t txtlen, char *out, size_t cap);
+
 /* --- Sessions and messaging (see mvx_msg.c, mvx#226) -------------------
    The session registry lives in mvx-msgd; every call here degrades to a
    harmless value when there is no daemon, and none of them blocks for more

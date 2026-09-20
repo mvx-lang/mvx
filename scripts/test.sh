@@ -3362,11 +3362,12 @@ WRITE "widget":@AM:990 ON F, "D1"
 SQDEOF
     "$MVX" "$TESTROOT/sqdup.b" -o "$TESTROOT/sqdup" || dupok=0
     (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdup" >/dev/null 2>&1)
-    # an external writer changes both columns; id is a BLOB, so CAST or the
-    # UPDATE silently matches nothing and the test measures the old value
+    # An external writer changes both columns.  The id is TEXT now (mvx#236),
+    # so this is the query anybody would write -- it needed CAST('D1' AS BLOB)
+    # when ids were raw bytes, and getting that wrong matched nothing silently.
     sqlite3 "$SQA/acct.sqlite" \
       "UPDATE \"$f\" SET \"PRICE\"=55.55, \"PRICE.RAW\"='777' \
-       WHERE id=CAST('D1' AS BLOB);" 2>/dev/null
+       WHERE id='D1';" 2>/dev/null
     ch="$(sqlite3 "$SQA/acct.sqlite" \
       "SELECT COUNT(*) FROM \"$f\" WHERE \"PRICE.RAW\"='777';" 2>/dev/null)"
     cat > "$TESTROOT/sqdupr.b" <<SQREOF
