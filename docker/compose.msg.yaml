@@ -1,0 +1,62 @@
+# Messaging across hosts (mvx#232).
+#
+#   docker compose -f docker/compose.msg.yaml up
+#
+# One broker, and one mvx-msgd per application container.  The daemon is a
+# SIDECAR rather than a shared service because a session reaches it over a unix
+# socket and the connection is its lease: a container that dies takes its
+# sessions off the roster by dropping that socket, with nothing to clean up.
+#
+# Ports are scoped by the prefix, which both daemons share here, and each host
+# is given its own block (-b) so two of them never hand out the same number.
+services:
+  broker:
+    image: eclipse-mosquitto:2
+    command: >
+      sh -c "printf 'listener 1883\nallow_anonymous true\n'
+      > /mosquitto/config/mosquitto.conf &&
+      exec mosquitto -c /mosquitto/config/mosquitto.conf"
+    # allow_anonymous is for trying this out.  A real deployment sets a
+    # password file and gives the daemons MVXMSG_USER / MVXMSG_PASSWORD.
+    ports:
+      - "1883:1883"
+
+  app1:
+    image: ghcr.io/mvx-lang/mvx:latest
+    depends_on: [broker]
+    volumes:
+      - msgsock1:/run/mvx
+    environment:
+      MVXMSGD: /run/mvx/msgd.sock
+    command: tail -f /dev/null
+
+  msgd1:
+    image: ghcr.io/mvx-lang/mvx:latest
+    depends_on: [broker]
+    volumes:
+      - msgsock1:/run/mvx
+    command: >
+      mvx-msgd -s /run/mvx/msgd.sock -t mqtt -c tcp://broker:1883
+               -x DEMO -b 1
+
+  app2:
+    image: ghcr.io/mvx-lang/mvx:latest
+    depends_on: [broker]
+    volumes:
+      - msgsock2:/run/mvx
+    environment:
+      MVXMSGD: /run/mvx/msgd.sock
+    command: tail -f /dev/null
+
+  msgd2:
+    image: ghcr.io/mvx-lang/mvx:latest
+    depends_on: [broker]
+    volumes:
+      - msgsock2:/run/mvx
+    command: >
+      mvx-msgd -s /run/mvx/msgd.sock -t mqtt -c tcp://broker:1883
+               -x DEMO -b 201
+
+volumes:
+  msgsock1:
+  msgsock2:
