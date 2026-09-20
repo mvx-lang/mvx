@@ -25,7 +25,7 @@ END
 W = MSGWHO("SYSTEM")
 N = DCOUNT(W, @AM)
 IF W = "" THEN N = 0
-PRINT "Port User            Account          Logged on  Line"
+PRINT "Port User            Account          Host            Logged on"
 FOR I = 1 TO N
    PORT = W<I,1>
    USR  = W<I,2>
@@ -35,8 +35,9 @@ FOR I = 1 TO N
 *  The daemon reports seconds since the epoch; show the time of day, which is
 *  what an operator reading a roster wants.
    HMS = OCONV(MOD(SINCE, 86400), "MTS")
+   HOST = W<I,4>
    PRINT FMT(PORT, "R#4"):" ":FMT(USR, "L#15"):" ":FMT(ACCT, "L#16"):" ":
-   PRINT FMT(HMS, "L#10"):" ":TTY
+   PRINT FMT(HOST, "L#15"):" ":HMS
 NEXT I
 PRINT
 PRINT N:" session(s) on prefix ":ST<1,4>

@@ -2084,6 +2084,57 @@ else
     FAIL=$((FAIL + 1)); echo "FAIL msgd: prefix is [$msg_pfx], want macct"
   fi
 
+  # ONE PERSON, ONE PORT (mvx#234).  A verb, an EXECUTE and a subroutine are
+  # not three logons: they are one thing somebody typed.  And a program that
+  # never mentions messaging is still logged on -- the roster is who is here,
+  # not who uses the feature.
+  mkdir -p "$MACCT/BP" "$MACCT/BP.DICT"
+  printf 'FILE\375dir\n' > "$MACCT/BP.DICT/%FILE%"
+  cat > "$MACCT/BP/PORTSHOW" <<'PEOF'
+PRINT "port=":@USERNO
+EXECUTE "WHO" CAPTURING OUT
+PRINT "execute=":FIELD(OUT<1>, " ", 1)
+PEOF
+  msg_ports="$(MVXMSGD="$MSOCK" MVXPRIV=developer "$TCL" -a "$MACCT" 2>&1 <<'PTCL' | grep -E '^(port|execute)=|session' | tr '\n' ' '
+CATALOG BP PORTSHOW
+PORTSHOW
+LISTU
+PTCL
+)"
+  case "$msg_ports" in
+    "port=1 execute=1 1 session(s) on prefix macct "*|"port=1 execute=1 1 session(s) on prefix macct")
+      PASS=$((PASS + 1))
+      echo "  a verb and its EXECUTE keep the session's port, and add no sessions" ;;
+    *)
+      FAIL=$((FAIL + 1))
+      echo "FAIL msgd: ports through TCL were [$msg_ports]" ;;
+  esac
+
+  # A PROGRAM THAT DIES DOES NOT LOG ANYONE OFF.  A verb's connection is an
+  # attachment, not the lease -- the shell holds that -- so a crash drops the
+  # attachment, returns to TCL, and leaves the port and the roster untouched.
+  # The person is still at their terminal; only their program is gone.
+  cat > "$MACCT/BP/BOOM" <<'BEOF'
+PRINT "port=":@USERNO
+OPEN "NOSUCHFILE" TO F ELSE PRINT "about to fail"
+READ R FROM F, "X" THEN PRINT R
+PRINT "never reached"
+BEOF
+  msg_crash="$(MVXMSGD="$MSOCK" MVXPRIV=developer "$TCL" -a "$MACCT" 2>&1 <<'CTCL' | grep -E '^(port=|never|[0-9]+ session)' | tr '\n' ' '
+CATALOG BP BOOM
+BOOM
+LISTU
+CTCL
+)"
+  case "$msg_crash" in
+    "port=1 1 session(s) on prefix macct"*)
+      PASS=$((PASS + 1))
+      echo "  a program that dies returns to TCL with its session intact" ;;
+    *)
+      FAIL=$((FAIL + 1))
+      echo "FAIL msgd: after a crash TCL saw [$msg_crash]" ;;
+  esac
+
   # Messaging itself (mvx#228): one session, sending to itself and draining.
   # The inbox lives in the daemon, so a receiver need not be running when a
   # message is sent -- which is what lets this be one process and therefore
@@ -2204,6 +2255,37 @@ PRINT "sent=":X
         FAIL=$((FAIL + 1))
         echo "FAIL mqtt: the other host received [$(cat "$TESTROOT/qrecv.out" | tr '\n' ' ')]"
       fi
+
+      # PRESENCE (mvx#234): the roster spans hosts, and a daemon that is
+      # killed outright takes its sessions off every other roster -- the case
+      # a session's own lease cannot cover, because nothing is left to clear.
+      ( cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QB" "$TESTROOT/qrecvbin" \
+          >/dev/null 2>&1 ) &
+      QHOLD=$!
+      sleep 1.5
+      qroster="$(cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QA" \
+                   "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+                   sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+      if [ "${qroster:-0}" -ge 2 ]; then
+        PASS=$((PASS + 1)); echo "  the roster spans hosts"
+      else
+        FAIL=$((FAIL + 1)); echo "FAIL mqtt: host A sees [$qroster] sessions, want 2+"
+      fi
+      kill -9 $QPIDB 2>/dev/null       # the other daemon dies without tidying
+      wait $QPIDB 2>/dev/null
+      sleep 3
+      qafter="$(cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QA" \
+                  "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+                  sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+      if [ "${qafter:-9}" -lt "${qroster:-0}" ]; then
+        PASS=$((PASS + 1))
+        echo "  a dead daemon's sessions leave every roster (its will)"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL mqtt: after killing the other daemon the roster still has [$qafter]"
+      fi
+      kill -9 $QHOLD 2>/dev/null
+      wait $QHOLD 2>/dev/null
     else
       FAIL=$((FAIL + 1)); echo "FAIL mqtt: the test programs did not compile"
     fi

@@ -126,6 +126,26 @@ typedef struct session {
 
 static session *g_sessions;
 
+/* WHAT OTHER HOSTS HAVE (mvx#234).  Learned from presence, not from a
+   registry we keep: each entry arrived as a retained message and leaves when
+   that message is cleared, or when the daemon it came from dies and its will
+   says so.  Nothing here is authoritative -- the host a session is on is the
+   only place that knows for certain -- so an entry that goes stale is dropped
+   rather than believed. */
+typedef struct remote {
+    char prefix[128];
+    int port;
+    char user[64], account[128], host[64], origin[128];
+    time_t since;
+    time_t heard;                       /* last time it was confirmed */
+    struct remote *next;
+} remote;
+
+static remote *g_remote;
+static time_t g_presence_ttl = 90;      /* seconds; 0 = never expire */
+
+static remote *remote_find(const char *prefix, int port);
+
 /* A child that ATTACHed to its parent's port.  Its connection is NOT a lease:
    dropping it leaves the parent's session alone, which is the whole point --
    a verb finishing must not log its shell off. */
@@ -157,6 +177,10 @@ static int port_alloc(const char *prefix) {
         int taken = 0;
         for (session *s = g_sessions; s; s = s->next)
             if (s->port == p && strcmp(s->prefix, prefix) == 0) taken = 1;
+        /* AND WHAT ANOTHER HOST HAS (mvx#234).  Port blocks (-b) keep two
+           daemons apart by configuration; this keeps them apart when somebody
+           forgets, which is the likelier case. */
+        if (!taken && remote_find(prefix, p)) taken = 1;
         if (!taken) return p;
     }
     return -1;
@@ -185,10 +209,19 @@ static void attach_drop(int fd) {
     }
 }
 
+static void presence_publish(const session *s, int gone);
+
+static int port_is_local(const char *prefix, int port) {
+    for (session *s = g_sessions; s; s = s->next)
+        if (s->port == port && strcmp(s->prefix, prefix) == 0) return 1;
+    return 0;
+}
+
 static void sess_drop(int fd) {
     for (session **pp = &g_sessions; *pp;) {
         if ((*pp)->fd == fd) {
             session *dead = *pp;
+            presence_publish(dead, 1);   /* it is gone; say so */
             *pp = dead->next;
             for (int i = 0; i < dead->count; i++)
                 free(dead->inbox[(dead->head + i) % INBOX_MSGS]);
@@ -331,6 +364,145 @@ static int target_matches(const session *s, const char *target) {
     return 0;
 }
 
+static void topic_presence(char *out, size_t cap, const char *prefix, int port) {
+    snprintf(out, cap, "mvx/%s/presence/%d", prefix, port);
+}
+
+static void topic_daemon(char *out, size_t cap, const char *origin) {
+    snprintf(out, cap, "mvx/_daemons/%s", origin);
+}
+
+/* Announce a session, or clear it.  Retained where the transport has it, so a
+   daemon that starts later still learns the roster; a heartbeat where it does
+   not (see presence_tick).  An EMPTY payload is the clear: that is how a
+   retained topic is deleted, and it reads the same way when it arrives as a
+   last will. */
+static void presence_publish(const session *s, int gone) {
+    if (!g_drv || !g_conn) return;
+    char topic[256], rec[512];
+    topic_presence(topic, sizeof topic, s->prefix, s->port);
+    int n = 0;
+    if (!gone)
+        n = snprintf(rec, sizeof rec, "%d\xfe%s\xfe%s\xfe%s\xfe%lld\xfe%s",
+                     s->port, s->user, s->account, s->host,
+                     (long long)s->since, g_origin);
+    g_drv->publish(g_conn, topic, gone ? "" : rec, gone ? 0 : n, 0,
+                   (g_caps & MVX_MSGCAP_RETAIN) ? 1 : 0, 250);
+}
+
+static remote *remote_find(const char *prefix, int port) {
+    for (remote *r = g_remote; r; r = r->next)
+        if (r->port == port && strcmp(r->prefix, prefix) == 0) return r;
+    return NULL;
+}
+
+static void remote_drop(const char *prefix, int port) {
+    for (remote **pp = &g_remote; *pp;) {
+        if ((*pp)->port == port && strcmp((*pp)->prefix, prefix) == 0) {
+            remote *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            continue;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* Everything that came from one daemon, gone at once: its will fired, or its
+   heartbeat stopped.  A daemon crash is the case a session's own lease cannot
+   cover, because there is nobody left to clear anything. */
+static void remote_drop_origin(const char *origin) {
+    for (remote **pp = &g_remote; *pp;) {
+        if (strcmp((*pp)->origin, origin) == 0) {
+            remote *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            continue;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* A presence record for a port we are told about. */
+static void remote_learn(const char *prefix, const char *payload, size_t plen) {
+    char buf[512];
+    if (plen >= sizeof buf) plen = sizeof buf - 1;
+    memcpy(buf, payload, plen);
+    buf[plen] = '\0';
+
+    char *f[8] = {0};
+    int nf = 0;
+    for (char *tok = buf; nf < 8; nf++) {
+        f[nf] = tok;
+        char *mark = strchr(tok, '\xfe');
+        if (!mark) { nf++; break; }
+        *mark = '\0';
+        tok = mark + 1;
+    }
+    if (nf < 6) return;
+    int port = atoi(f[0]);
+    if (port <= 0) return;
+    /* Our own announcement, echoed back: we already know. */
+    if (strcmp(f[5], g_origin) == 0) return;
+
+    remote *r = remote_find(prefix, port);
+    if (!r) {
+        r = calloc(1, sizeof *r);
+        if (!r) return;
+        snprintf(r->prefix, sizeof r->prefix, "%s", prefix);
+        r->port = port;
+        r->next = g_remote;
+        g_remote = r;
+    }
+    snprintf(r->user, sizeof r->user, "%s", f[1]);
+    snprintf(r->account, sizeof r->account, "%s", f[2]);
+    snprintf(r->host, sizeof r->host, "%s", f[3]);
+    r->since = (time_t)strtoll(f[4], NULL, 10);
+    snprintf(r->origin, sizeof r->origin, "%s", f[5]);
+    r->heard = time(NULL);
+}
+
+/* THE COMPENSATION LADDER (mvx#234).  The contract lets a backend lack
+ * retained messages, or a will, or both, and the daemon makes up the
+ * difference here -- once, for every transport, rather than each driver
+ * inventing its own idea of presence:
+ *
+ *   retain + will   announce once, retained; the will clears it.  No polling.
+ *   retain, no will heartbeat as well, because nothing else notices a daemon
+ *                   that dies; readers expire what goes quiet.
+ *   will, no retain announce on a timer, so a daemon starting later learns
+ *                   the roster rather than waiting for the next session.
+ *   neither         both of the above; the local roster is still correct,
+ *                   which is all a single host needs.
+ *
+ * Called from the poll loop, not from a timer thread: one hand on the roster.
+ */
+static void presence_tick(void) {
+    if (!g_drv || !g_conn || !g_sessions) return;
+    static time_t last;
+    time_t now = time(NULL);
+
+    int need_beat = !(g_caps & MVX_MSGCAP_WILL) || !(g_caps & MVX_MSGCAP_RETAIN);
+    if (need_beat && now - last >= 20) {
+        last = now;
+        for (session *s = g_sessions; s; s = s->next) presence_publish(s, 0);
+    }
+
+    /* Expire what has gone quiet.  With a will this rarely fires; without one
+       it is the only thing that removes a host that was unplugged. */
+    if (g_presence_ttl > 0) {
+        for (remote **pp = &g_remote; *pp;) {
+            if (now - (*pp)->heard > g_presence_ttl) {
+                remote *dead = *pp;
+                *pp = dead->next;
+                free(dead);
+                continue;
+            }
+            pp = &(*pp)->next;
+        }
+    }
+}
+
 /* A message arriving FROM the transport, whichever transport it is.  This is
    the only path into a local inbox: delivery does not short-circuit for a
    message that happens to have come from this host, because then the local
@@ -340,12 +512,22 @@ static void on_message(void *user, const mvx_msgmsg *m) {
     (void)user;
     if (!m || !m->topic) return;
 
-    /* mvx/<prefix>/port/<port>/msg  or  mvx/<prefix>/wall */
+    /* mvx/<prefix>/port/<port>/msg, mvx/<prefix>/wall,
+       mvx/<prefix>/presence/<port>, or mvx/_daemons/<origin> */
     char prefix[128];
     int port = 0, wall = 0;
     const char *p = m->topic;
     if (strncmp(p, "mvx/", 4) != 0) return;
     p += 4;
+
+    /* A daemon's own topic, cleared by its will: everything it told us about
+       goes with it.  This is the case a session lease cannot cover. */
+    if (strncmp(p, "_daemons/", 9) == 0) {
+        const char *origin = p + 9;
+        if (m->plen == 0 && strcmp(origin, g_origin) != 0)
+            remote_drop_origin(origin);
+        return;
+    }
     const char *slash = strchr(p, '/');
     if (!slash) return;
     size_t plen = (size_t)(slash - p);
@@ -355,6 +537,14 @@ static void on_message(void *user, const mvx_msgmsg *m) {
     p = slash + 1;
     if (strcmp(p, "wall") == 0) wall = 1;
     else if (strncmp(p, "port/", 5) == 0) port = atoi(p + 5);
+    else if (strncmp(p, "presence/", 9) == 0) {
+        int pport = atoi(p + 9);
+        /* An empty payload is a session that has gone -- the clear of a
+           retained topic, and what a will leaves behind. */
+        if (m->plen == 0) remote_drop(prefix, pport);
+        else remote_learn(prefix, m->payload, (size_t)m->plen);
+        return;
+    }
     else return;
 
     /* OUR OWN PUBLISH COMING BACK.  A service that echoes to its own
@@ -541,6 +731,19 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
                 g_drv->subscribe(g_conn, topic);
                 topic_wall(topic, sizeof topic, s->prefix);
                 g_drv->subscribe(g_conn, topic);
+                /* Presence for this prefix, and every daemon's own topic.
+                   With wildcards that is two subscriptions; without them a
+                   driver would have to be told each port, which is why the
+                   capability is asked about rather than assumed. */
+                if (!(g_caps & MVX_MSGCAP_WILDCARD)) {
+                    /* No wildcards: ask for this prefix's presence topics as
+                       we learn of ports.  With them the daemon already
+                       subscribed at startup. */
+                    snprintf(topic, sizeof topic, "mvx/%s/presence/%d",
+                             s->prefix, s->port);
+                    g_drv->subscribe(g_conn, topic);
+                }
+                presence_publish(s, 0);
             }
             *status = MVXMSG_ST_OK;
         }
@@ -604,12 +807,27 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
             o32(out, (uint32_t)s->since);
             count++;
           }
+          /* Then whatever another host has told us about, in the same port
+             order, so a roster reads as one list rather than two. */
+          if (scope != MVXMSG_SCOPE_LOCAL) {
+            for (remote *r = g_remote; r; r = r->next) {
+                if (r->port != p) continue;
+                if (want && strcmp(r->prefix, want) != 0) continue;
+                o16(out, (uint16_t)r->port);
+                ostr(out, r->user);
+                ostr(out, r->account);
+                ostr(out, r->host);
+                ostr(out, "-");
+                o32(out, (uint32_t)r->since);
+                count++;
+            }
+          }
         }
         memcpy(out->d + count_pos, &count, 4);
-        /* Every roster this daemon holds is a local one until a transport
-           carries presence; say so rather than implying otherwise. */
-        o16(out, MVXMSG_SCOPE_LOCAL);
-        (void)scope;
+        /* Say which roster this actually is: local-only until a transport
+           carries presence, system-wide once it does. */
+        o16(out, (uint16_t)((g_caps & MVX_MSGCAP_RETAIN) || g_remote
+                                ? MVXMSG_SCOPE_SYSTEM : MVXMSG_SCOPE_LOCAL));
         *status = MVXMSG_ST_OK;
         return;
     }
@@ -675,18 +893,37 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
         if (wall) {
             topic_wall(topic, sizeof topic, me->prefix);
             g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
-        } else if (target[0] == '!') {
-            /* An explicit port may be on another host.  The count stays what
-               was resolved HERE: this daemon cannot know what is logged on
-               elsewhere until presence arrives, and guessing would have MSG
-               report a delivery that never happened. */
-            long lo = strtol(target + 1, NULL, 10);
-            const char *dash = strchr(target + 1, '-');
-            long hi = dash ? strtol(dash + 1, NULL, 10) : lo;
-            if (hi < lo) { long t2 = lo; lo = hi; hi = t2; }
-            for (long p2 = lo; p2 <= hi && p2 - lo < 64; p2++) {
-                topic_port(topic, sizeof topic, me->prefix, (int)p2);
+        } else {
+            /* THE REMOTE HALF OF THE ROSTER, now that presence brings one.
+               A port known to be on another host is published to and COUNTED,
+               so MSG can say it reached three ports of five whichever hosts
+               they are on.  An explicit port nobody has claimed is still
+               published -- presence may not have reached us yet, and a
+               message is cheaper than a wrong refusal. */
+            int matched_remote = 0;
+            for (remote *r = g_remote; r; r = r->next) {
+                if (strcmp(r->prefix, me->prefix) != 0) continue;
+                session probe;
+                memset(&probe, 0, sizeof probe);
+                probe.port = r->port;
+                snprintf(probe.user, sizeof probe.user, "%s", r->user);
+                snprintf(probe.account, sizeof probe.account, "%s", r->account);
+                if (!target_matches(&probe, target)) continue;
+                topic_port(topic, sizeof topic, me->prefix, r->port);
                 g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
+                delivered++;
+                matched_remote = 1;
+            }
+            if (!matched_remote && target[0] == '!') {
+                long lo = strtol(target + 1, NULL, 10);
+                const char *dash = strchr(target + 1, '-');
+                long hi = dash ? strtol(dash + 1, NULL, 10) : lo;
+                if (hi < lo) { long t2 = lo; lo = hi; hi = t2; }
+                for (long p2 = lo; p2 <= hi && p2 - lo < 64; p2++) {
+                    if (port_is_local(me->prefix, (int)p2)) continue;
+                    topic_port(topic, sizeof topic, me->prefix, (int)p2);
+                    g_drv->publish(g_conn, topic, rec, n, 0, 0, 250);
+                }
             }
         }
         o32(out, delivered);
@@ -789,7 +1026,8 @@ static void usage(void) {
     fprintf(stderr,
             "usage: mvx-msgd (-s unix-socket | -p port) [-t transport]\n"
             "                [-x prefix] [-b portbase] [-r per-sec] [-k burst]\n"
-            "                [-c @profile] [-X nocaps=retain,will,...]\n");
+            "                [-c address] [-T presence-ttl] "
+            "[-X nocaps=retain,will,...]\n");
 }
 
 int main(int argc, char **argv) {
@@ -804,6 +1042,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) g_rate = atof(argv[++i]);
         else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) g_burst = atof(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) g_loc = argv[++i];
+        else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc)
+            g_presence_ttl = (time_t)atol(argv[++i]);
         else if (strcmp(argv[i], "-X") == 0 && i + 1 < argc) {
             /* -X nocaps=retain,will -- pretend the transport cannot do these,
                so the daemon's compensation for a backend that lacks them is
@@ -874,8 +1114,18 @@ int main(int argc, char **argv) {
              (long)getpid());
     snprintf(g_origin, sizeof g_origin, "%s", clientid);
 
+    /* OUR OWN DEATH NOTICE.  A session's lease covers a session; nothing
+       covers the daemon itself, because a crashed daemon clears nothing.  The
+       will is an empty retained payload on our own topic, which every other
+       daemon reads as "purge whatever came from there" -- and an empty
+       payload is also how a retained topic is deleted, so the two meanings
+       coincide rather than needing a protocol of their own. */
+    char willtopic[256];
+    topic_daemon(willtopic, sizeof willtopic, clientid);
+
     char derr[256] = {0};
-    g_conn = g_drv->connect(g_loc, clientid, NULL, NULL, 0, derr, sizeof derr);
+    g_conn = g_drv->connect(g_loc, clientid, willtopic, "", 0, derr,
+                            sizeof derr);
     if (!g_conn) {
         fprintf(stderr, "mvx-msgd: transport %s: %s\n", g_drv->name,
                 derr[0] ? derr : "could not connect");
@@ -885,6 +1135,17 @@ int main(int argc, char **argv) {
        The daemon reads these and compensates; it never asks which backend it
        is talking to. */
     g_caps = g_drv->caps & ~g_nocaps;
+
+    /* SUBSCRIBE TO PRESENCE NOW, not when the first session arrives.  A
+       retained roster is delivered on subscribe, so a daemon that waits for a
+       session learns the other hosts a moment AFTER that session could first
+       ask -- and the first MSG to a remote port then reports nothing there.
+       Subscribing at startup removes the race rather than papering over it
+       with a delay. */
+    if (g_caps & MVX_MSGCAP_WILDCARD) {
+        g_drv->subscribe(g_conn, "mvx/+/presence/+");
+        g_drv->subscribe(g_conn, "mvx/_daemons/+");
+    }
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_stop);
@@ -953,6 +1214,8 @@ int main(int argc, char **argv) {
             if (errno == EINTR) { if (g_stop) break; continue; }
             break;
         }
+
+        presence_tick();
 
         /* Whatever arrived on the transport goes into the local inboxes. */
         if (g_drv->pump && !g_drv->pump(g_conn, on_message, NULL)) {
