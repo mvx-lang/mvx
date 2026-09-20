@@ -71,6 +71,27 @@ static const char *g_transport = "loop";
 
 /* ------------------------------------------------------------- roster */
 
+/* THE INBOX IS BOUNDED, AND DROPS THE OLDEST.  An unbounded queue is a
+   memory-exhaustion vector available to any logged-on user, and refusing new
+   messages when full is the wrong end to drop: for a message the newest is
+   the one that matters.  The count of what was lost is kept, so a program can
+   say so honestly rather than quietly showing less than was sent. */
+#define INBOX_MSGS 256
+#define INBOX_BYTES (64 * 1024)
+
+/* Per-port rate limit: a token bucket refilled at RATE per second, capped at
+   BURST.  Without one, "message every port" in a loop is a denial of service
+   any user can run. */
+#define RATE_PER_SEC 10
+#define RATE_BURST 30
+
+/* Adjustable, so the suite can test what the inbox does when it OVERFLOWS --
+   which needs three hundred messages in a moment, and is a different question
+   from whether the limiter works.  A rule that cannot be turned off cannot be
+   tested around. */
+static double g_rate = RATE_PER_SEC;
+static double g_burst = RATE_BURST;
+
 typedef struct session {
     int fd;                             /* the lease: this connection */
     int port;
@@ -79,6 +100,17 @@ typedef struct session {
     char user[64], account[128], host[64], tty[64], prefix[128];
     long pid;
     time_t since;
+
+    int mode;                           /* MVXMSG_MODE_* */
+    char *inbox[INBOX_MSGS];            /* ring of whole message records */
+    size_t inlen[INBOX_MSGS];
+    int head, count;                    /* head = oldest */
+    size_t bytes;
+    uint32_t dropped;                   /* lost to overflow, since logon */
+
+    double tokens;                      /* rate limit */
+    time_t tokens_at;
+
     struct session *next;
 } session;
 
@@ -148,6 +180,8 @@ static void sess_drop(int fd) {
         if ((*pp)->fd == fd) {
             session *dead = *pp;
             *pp = dead->next;
+            for (int i = 0; i < dead->count; i++)
+                free(dead->inbox[(dead->head + i) % INBOX_MSGS]);
             free(dead);
             continue;
         }
@@ -181,6 +215,88 @@ static void rand_hex(char *out, size_t n) {
         out[i * 2 + 1] = hex[buf[i] & 15];
     }
     out[i * 2] = '\0';
+}
+
+/* --------------------------------------------------------- delivery */
+
+/* Put one record in a session's inbox.  Returns 1 if it was queued.
+   MODE OFF discards -- except a wall or a system message, which a user may
+   not switch off: "the system is going down in five minutes" is not theirs
+   to suppress.  That is a deliberate departure from classic behaviour. */
+static int inbox_put(session *s, int class, const char *rec, size_t len) {
+    if (s->mode == MVXMSG_MODE_OFF &&
+        class != MVXMSG_CLASS_WALL && class != MVXMSG_CLASS_SYSTEM)
+        return 0;
+
+    char *copy = malloc(len + 1);
+    if (!copy) return 0;
+    memcpy(copy, rec, len);
+    copy[len] = '\0';
+
+    while (s->count >= INBOX_MSGS ||
+           (s->bytes + len > INBOX_BYTES && s->count > 0)) {
+        char *old = s->inbox[s->head];
+        s->bytes -= s->inlen[s->head];
+        free(old);
+        s->head = (s->head + 1) % INBOX_MSGS;
+        s->count--;
+        s->dropped++;
+    }
+    int slot = (s->head + s->count) % INBOX_MSGS;
+    s->inbox[slot] = copy;
+    s->inlen[slot] = len;
+    s->bytes += len;
+    s->count++;
+    return 1;
+}
+
+/* One send's worth of tokens, or 0 when the port has spent its budget. */
+static int rate_ok(session *s) {
+    time_t now = time(NULL);
+    if (s->tokens_at == 0) { s->tokens = g_burst; s->tokens_at = now; }
+    double elapsed = (double)(now - s->tokens_at);
+    if (elapsed > 0) {
+        s->tokens += elapsed * g_rate;
+        if (s->tokens > g_burst) s->tokens = g_burst;
+        s->tokens_at = now;
+    }
+    if (s->tokens < 1.0) return 0;
+    s->tokens -= 1.0;
+    return 1;
+}
+
+/* Does this session match the classic target form?
+     *            every logged-on port
+     !7, !5-9     a port, or a range
+     @fred        a user, wherever they are logged on
+     SALES,PAY    those accounts
+   Ports absent from the roster are simply skipped, which is what classic Pick
+   did with a logged-off line: there is nowhere to put the message. */
+static int target_matches(const session *s, const char *target) {
+    if (!target || !*target) return 0;
+    if (strcmp(target, "*") == 0) return 1;
+
+    if (target[0] == '!') {
+        long lo = 0, hi = 0;
+        const char *dash = strchr(target + 1, '-');
+        lo = strtol(target + 1, NULL, 10);
+        hi = dash ? strtol(dash + 1, NULL, 10) : lo;
+        if (hi < lo) { long t = lo; lo = hi; hi = t; }
+        return s->port >= lo && s->port <= hi;
+    }
+
+    if (target[0] == '@') return strcmp(s->user, target + 1) == 0;
+
+    /* one or more account names, comma separated */
+    const char *p = target;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t n = comma ? (size_t)(comma - p) : strlen(p);
+        if (n == strlen(s->account) && strncmp(p, s->account, n) == 0) return 1;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------ plumbing
@@ -405,6 +521,96 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out, uint8_t *status) 
         return;
     }
 
+    case MVXMSG_OP_SEND: {
+        char target[256], text[1024], payload[2048];
+        istr(in, target, sizeof target);
+        uint16_t class = i16(in);
+        istr(in, text, sizeof text);
+        istr(in, payload, sizeof payload);
+        if (in->bad) return;
+
+        session *me = sess_for_fd(fd);
+        if (!me) return;                /* not registered: nothing to send as */
+        if (!rate_ok(me)) { *status = MVXMSG_ST_BUSY; return; }
+
+        /* THE RECORD IS BUILT HERE, from the roster, not from what the sender
+           claims to be.  A sender that could write its own from-port and
+           from-user would make every message unattributable. */
+        /* A message sent to every port IS a wall message, whatever class the
+           sender asked for -- otherwise the receiver cannot tell a broadcast
+           from a note, and MODE OFF would be deciding one thing while the
+           record said another.  The flags (bell, signed) are the sender's and
+           are kept. */
+        int wall = (class == MVXMSG_CLASS_WALL) || strcmp(target, "*") == 0;
+        unsigned eff = wall ? ((class & ~0x0fu) | MVXMSG_CLASS_WALL)
+                            : (unsigned)class;
+
+        time_t now = time(NULL);
+        char rec[4096];
+        int n = snprintf(rec, sizeof rec,
+                         "1\xfe%u\xfe%d\xfe%s\xfe%s\xfe%s\xfe%lld\xfe%s\xfe%s",
+                         eff, me->port, me->user, me->account,
+                         me->host, (long long)now, text, payload);
+        if (n < 0) return;
+        if ((size_t)n >= sizeof rec) n = (int)sizeof rec - 1;
+
+        uint32_t delivered = 0;
+        for (session *t = g_sessions; t; t = t->next) {
+            if (strcmp(t->prefix, me->prefix) != 0) continue;
+            if (!wall && !target_matches(t, target)) continue;
+            if (inbox_put(t, (int)(eff & 0x0fu), rec, (size_t)n)) delivered++;
+        }
+        o32(out, delivered);
+        *status = MVXMSG_ST_OK;
+        return;
+    }
+
+    case MVXMSG_OP_PEEK: {
+        session *s = sess_for_fd(fd);
+        if (!s) return;
+        o32(out, (uint32_t)s->count);
+        o32(out, s->dropped);
+        *status = MVXMSG_ST_OK;
+        return;
+    }
+
+    case MVXMSG_OP_RECV: {
+        uint16_t max = i16(in);
+        if (in->bad) return;
+        session *s = sess_for_fd(fd);
+        if (!s) return;
+        if (max == 0) max = 1;
+        uint32_t count = 0;
+        size_t count_pos = out->len;
+        o32(out, 0);
+        while (s->count > 0 && count < max) {
+            char *m = s->inbox[s->head];
+            size_t len = s->inlen[s->head];
+            o16(out, (uint16_t)(len > 0xffff ? 0xffff : len));
+            oput(out, m, len > 0xffff ? 0xffff : len);
+            free(m);
+            s->inbox[s->head] = NULL;
+            s->bytes -= len;
+            s->head = (s->head + 1) % INBOX_MSGS;
+            s->count--;
+            count++;
+        }
+        memcpy(out->d + count_pos, &count, 4);
+        *status = MVXMSG_ST_OK;
+        return;
+    }
+
+    case MVXMSG_OP_MODE: {
+        uint16_t mode = i16(in);
+        if (in->bad) return;
+        session *s = sess_for_fd(fd);
+        if (!s) return;
+        o16(out, (uint16_t)s->mode);
+        if (mode <= MVXMSG_MODE_DEFER) s->mode = mode;
+        *status = MVXMSG_ST_OK;
+        return;
+    }
+
     case MVXMSG_OP_STAT: {
         session *s = sess_for_fd(fd);
         ostr(out, g_transport);
@@ -445,7 +651,7 @@ static int conn_dispatch(conn *c) {
 static void usage(void) {
     fprintf(stderr,
             "usage: mvx-msgd (-s unix-socket | -p port) [-t transport]\n"
-            "                [-x prefix] [-b portbase]\n");
+            "                [-x prefix] [-b portbase] [-r per-sec] [-k burst]\n");
 }
 
 int main(int argc, char **argv) {
@@ -457,6 +663,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) g_transport = argv[++i];
         else if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) g_prefix = argv[++i];
         else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) g_portbase = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) g_rate = atof(argv[++i]);
+        else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) g_burst = atof(argv[++i]);
         else { usage(); return 2; }
     }
     if (!sockpath && port == 0) { usage(); return 2; }

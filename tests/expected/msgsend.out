@@ -1,0 +1,20 @@
+port=1
+to self=1
+to nobody=0
+to my account=1
+to me by name=1
+wall=1
+pending=4
+  direct from port 1: one
+  direct from port 1: by account
+  direct from port 1: by user
+  wall from port 1: to everyone
+drained=0
+mode was ON
+direct while off=0 pending=0
+wall while off=1 pending=1
+the one that got through: not muted
+mode was OFF
+queued=256
+dropped=44
+oldest kept: flood 45

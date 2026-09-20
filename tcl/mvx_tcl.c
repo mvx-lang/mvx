@@ -275,6 +275,54 @@ static int voc_lookup(const char *verb, char *path, size_t cap) {
 /* Run a cataloged verb and return its process exit status, so a verb (e.g.
    CHECK) can signal failure to a script or CI: `mvx -c 'CHECK ...'` exits with
    the verb's code (STOP <code>). */
+/* Show any messages waiting for this session (mvx#228).
+ *
+ * BETWEEN COMMANDS, NEVER DURING ONE.  This is called just before the prompt
+ * and just after a verb returns, which are the two moments when nothing else
+ * owns the screen.  There is no signal, no timer and no second thread: a
+ * message can wait a few seconds for the operator to press Enter, and that is
+ * a far better trade than writing over a running program's display -- or
+ * than an interrupted read(), which mv_input treats as end of input.
+ *
+ * Costs nothing when no registry is running: mvx_msg_pending() answers -1
+ * without talking to anything. */
+static void drain_messages(void) {
+    mv_value m;
+    mv_init(&m);
+    while (mvx_msg_pending() > 0) {
+        mvx_msg_read(&m);
+        char nb[40];
+        const char *p;
+        int64_t n = mv_val_chars(&m, nb, sizeof nb, &p);
+        if (n <= 0) break;
+        /* class \xfe port \xfe user \xfe account \xfe host \xfe sent \xfe text */
+        char buf[1024];
+        if ((size_t)n >= sizeof buf) n = (int64_t)sizeof buf - 1;
+        memcpy(buf, p, (size_t)n);
+        buf[n] = '\0';
+        char *f[9] = {0};
+        int nf = 0;
+        for (char *tok = buf; nf < 9; nf++) {
+            f[nf] = tok;
+            char *mark = strchr(tok, '\xfe');
+            if (!mark) { nf++; break; }
+            *mark = '\0';
+            tok = mark + 1;
+        }
+        long cls = nf > 1 ? strtol(f[1], NULL, 10) : 0;
+        const char *port = nf > 2 ? f[2] : "?";
+        const char *user = nf > 3 ? f[3] : "?";
+        const char *text = nf > 7 ? f[7] : "";
+        if (cls & 32)               /* signed: say who it is from */
+            printf("\n[%s] %s: %s\n", port, user, text);
+        else
+            printf("\n%s\n", text);
+        if (cls & 16) fputc('\a', stdout);   /* bell */
+        fflush(stdout);
+    }
+    mv_clear(&m);
+}
+
 static int run_verb(const char *path, const char *line) {
     pid_t pid = fork();
     if (pid < 0) {
@@ -1129,6 +1177,7 @@ int main(int argc, char **argv) {
             /* An M macro's commands wait here: each is typed into the
                prompt in turn so it can be edited before it goes, which is
                what the M type is for (#177). */
+            drain_messages();
             if (g_mqi < g_mqn) el_push(g_el, g_mqueue[g_mqi++]);
             else if (g_mqn) { for (int i = 0; i < g_mqn; i++) free(g_mqueue[i]);
                               g_mqn = g_mqi = 0; }
@@ -1148,10 +1197,12 @@ int main(int argc, char **argv) {
                 history(elh, &elev, H_ENTER, t);
             }
             command(line);
+            drain_messages();        /* a long verb's messages, the moment it ends */
             continue;
         }
 #else
         if (tty) {
+            drain_messages();
             printf("%s> ", g_acct_base);
             fflush(stdout);
         }
@@ -1165,6 +1216,10 @@ int main(int argc, char **argv) {
             if (t[0] && t[0] != '.') stack_push(t);
         }
         command(line);
+        /* Not only on a terminal: a scripted session is exactly where an
+           unnoticed message would matter, and the suite drives TCL through a
+           pipe. */
+        drain_messages();
     }
     if (tty) fputc('\n', stdout);
 #ifdef HAVE_EDITLINE

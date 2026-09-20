@@ -2084,6 +2084,39 @@ else
     FAIL=$((FAIL + 1)); echo "FAIL msgd: prefix is [$msg_pfx], want macct"
   fi
 
+  # Messaging itself (mvx#228): one session, sending to itself and draining.
+  # The inbox lives in the daemon, so a receiver need not be running when a
+  # message is sent -- which is what lets this be one process and therefore
+  # deterministic.  The limiter is turned right up for the overflow case,
+  # which is a different question from whether the limiter works.
+  "$ROOT/build/bin/mvx-msgd" -s "$MSOCK.send" -r 100000 -k 100000 2>/dev/null &
+  MPID2=$!
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -S "$MSOCK.send" ] && break
+    sleep 0.1
+  done
+  if "$MVX" "$ROOT/tests/msgsend.b" -o "$TESTROOT/msgsendbin" 2>/dev/null; then
+    check msgsend "$( \
+      cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$MSOCK.send" MVXPRIV=unrestricted \
+        "$TESTROOT/msgsendbin" 2>&1 | normalise)"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgsend: did not compile"
+  fi
+
+  # The verb, its addressing forms, and the gate on a wall broadcast.  A
+  # restricted session may message one port and may not message every port:
+  # the check is in the RUNTIME, so calling MSGSEND directly is refused too.
+  check tcl-msg "$( \
+    export MVXMSGD="$MSOCK.send"; \
+    MVXPRIV=unrestricted "$TCL" -a "$MACCT" -c "MSG !1 hello port one" 2>&1; \
+    MVXPRIV=unrestricted "$TCL" -a "$MACCT" -c "MSG !4000 nobody there" 2>&1; \
+    MVXPRIV=restricted "$TCL" -a "$MACCT" -c "MSG * everyone" 2>&1; \
+    MVXPRIV=unrestricted "$TCL" -a "$MACCT" -c "MSG * everyone" 2>&1; \
+    unset MVXMSGD)"
+  kill $MPID2 2>/dev/null
+  wait $MPID2 2>/dev/null
+  rm -f "$MSOCK.send"
+
   # And with the registry gone, the same commands still work.
   kill $MPID 2>/dev/null
   wait $MPID 2>/dev/null

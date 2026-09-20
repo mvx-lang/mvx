@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp, for the privilege tier */
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -400,6 +401,155 @@ void mvx_msg_status(mv_value *out) {
     mv_set_str(out, line, len < 0 ? 0 : len);
 }
 
+/* ------------------------------------------------------- sending */
+
+/* The gate is HERE, in the runtime, not in the MSG verb: anyone who can
+   compile can call MSGSEND directly, so a check in the verb would be
+   decorative (ARCHITECTURE.md 8.1, and the same reasoning as MKDIR/RMTREE in
+   mvx_exec.c).  One-to-one messaging is not a privileged act; reaching every
+   port on the system is.
+     *            -> msgwall
+     an account, a user, or a range wider than FANOUT_FREE -> msgbroadcast
+   Returns 1 when allowed; the caller reports -1, the MKDIR convention, so a
+   BASIC program can branch on it. */
+#define FANOUT_FREE 16
+
+/* The tier check and the permit lookup, as mvx_exec.c's perm_op does it: an
+   unrestricted session bypasses, anyone else needs a permit for the op name.
+   $MVXPRIV is read fresh every time and never cached, because it is the login
+   environment's word and not the account's. */
+static int msg_perm(const char *op) {
+    const char *p = getenv("MVXPRIV");
+    if (p && strcasecmp(p, "unrestricted") == 0) return 1;
+    char *av[2] = {(char *)op, NULL};
+    return mvx_perm_allowed(av);
+}
+
+static int send_allowed(const char *target) {
+    if (!target || !*target) return 1;
+    if (strcmp(target, "*") == 0) {
+        if (msg_perm("msgwall")) return 1;
+        fprintf(stderr, "not allowed: a message to every port requires an "
+                        "'msgwall' permit for your groups\n");
+        return 0;
+    }
+    int wide = 0;
+    if (target[0] == '!') {
+        const char *dash = strchr(target + 1, '-');
+        if (dash) {
+            long lo = strtol(target + 1, NULL, 10);
+            long hi = strtol(dash + 1, NULL, 10);
+            if (hi - lo + 1 > FANOUT_FREE || lo - hi + 1 > FANOUT_FREE) wide = 1;
+        }
+    } else if (target[0] != '@') {
+        wide = 1;                       /* an account, possibly several */
+    }
+    if (!wide) return 1;
+    if (msg_perm("msgbroadcast")) return 1;
+    fprintf(stderr, "not allowed: messaging a whole account or a wide range "
+                    "requires an 'msgbroadcast' permit for your groups\n");
+    return 0;
+}
+
+/* MSGSEND(target, text {, class {, payload}}) -> delivered, or:
+     0  nobody live matched      -1  refused      -2  no registry running
+   The three failures are distinct because a program does different things
+   about each: try another port, ask for a permit, carry on regardless. */
+int64_t mvx_msg_send(const char *target, const char *text, int64_t msgclass,
+                     const char *payload) {
+    if (!send_allowed(target)) return -1;
+    if (!msg_ensure()) return -2;
+
+    obuf req = {0, 0, 0};
+    ostr(&req, target);
+    o16(&req, (uint16_t)msgclass);
+    ostr(&req, text);
+    ostr(&req, payload ? payload : "");
+    char resp[64];
+    size_t rlen = sizeof resp;
+    int st = roundtrip(MVXMSG_OP_SEND, &req, resp, &rlen);
+    free(req.d);
+    if (st == MVXMSG_ST_BUSY) return 0;         /* rate limited: nothing sent */
+    if (st != MVXMSG_ST_OK) return -2;
+    ibuf in = {resp, rlen, 0};
+    return (int64_t)i32(&in);
+}
+
+/* MSGPENDING() -> queued, or -1 when there is no registry.  A program can
+   tell "none waiting" from "cannot ask", which matters when the answer
+   decides whether to draw a message line at all. */
+int64_t mvx_msg_pending(void) {
+    if (!msg_ensure()) return -1;
+    obuf req = {0, 0, 0};
+    char resp[64];
+    size_t rlen = sizeof resp;
+    int st = roundtrip(MVXMSG_OP_PEEK, &req, resp, &rlen);
+    free(req.d);
+    if (st != MVXMSG_ST_OK) return -1;
+    ibuf in = {resp, rlen, 0};
+    return (int64_t)i32(&in);
+}
+
+int64_t mvx_msg_dropped(void) {
+    if (!msg_ensure()) return 0;
+    obuf req = {0, 0, 0};
+    char resp[64];
+    size_t rlen = sizeof resp;
+    int st = roundtrip(MVXMSG_OP_PEEK, &req, resp, &rlen);
+    free(req.d);
+    if (st != MVXMSG_ST_OK) return 0;
+    ibuf in = {resp, rlen, 0};
+    i32(&in);
+    return (int64_t)i32(&in);
+}
+
+/* MSGREAD() -> the next message record, or "" when the inbox is empty. */
+void mvx_msg_read(mv_value *out) {
+    mv_set_str(out, "", 0);
+    if (!msg_ensure()) return;
+    obuf req = {0, 0, 0};
+    o16(&req, 1);
+    size_t cap = 8192;
+    char *resp = malloc(cap);
+    if (!resp) { free(req.d); return; }
+    size_t rlen = cap;
+    int st = roundtrip(MVXMSG_OP_RECV, &req, resp, &rlen);
+    free(req.d);
+    if (st != MVXMSG_ST_OK) { free(resp); return; }
+    ibuf in = {resp, rlen, 0};
+    uint32_t n = i32(&in);
+    if (n >= 1) {
+        uint16_t len = i16(&in);
+        const char *p = itake(&in, len);
+        if (p) mv_set_str(out, p, len);
+    }
+    free(resp);
+}
+
+/* MSGMODE("ON"|"OFF"|"DEFER") -> the previous mode. */
+void mvx_msg_mode(mv_value *out, const char *want) {
+    mv_set_str(out, "unavailable", 11);
+    if (!msg_ensure()) return;
+    int mode = MVXMSG_MODE_ON;
+    if (want && (want[0] == 'O' || want[0] == 'o') &&
+        (want[1] == 'F' || want[1] == 'f')) mode = MVXMSG_MODE_OFF;
+    else if (want && (want[0] == 'D' || want[0] == 'd')) mode = MVXMSG_MODE_DEFER;
+    else if (!want || !*want) mode = 0xffff;    /* ask without setting */
+
+    obuf req = {0, 0, 0};
+    o16(&req, (uint16_t)mode);
+    char resp[64];
+    size_t rlen = sizeof resp;
+    int st = roundtrip(MVXMSG_OP_MODE, &req, resp, &rlen);
+    free(req.d);
+    if (st != MVXMSG_ST_OK) return;
+    ibuf in = {resp, rlen, 0};
+    uint16_t prev = i16(&in);
+    const char *name = prev == MVXMSG_MODE_OFF ? "OFF"
+                     : prev == MVXMSG_MODE_DEFER ? "DEFER" : "ON";
+    mv_set_str(out, name, (int64_t)strlen(name));
+}
+
 /* ------------------------------------------------- extension functions */
 
 static void ext_msgwho(mvx_ctx *ctx, mv_value *ret, int32_t argc,
@@ -421,11 +571,77 @@ static void ext_msgstatus(mvx_ctx *ctx, mv_value *ret, int32_t argc,
     mvx_msg_status(ret);
 }
 
+static void ext_msgsend(mvx_ctx *ctx, mv_value *ret, int32_t argc,
+                        mv_value **argv) {
+    (void)ctx;
+    char tb[40], xb[40], pb[40];
+    const char *tp, *xp, *pp = "";
+    int64_t tl = mv_val_chars(argv[0], tb, sizeof tb, &tp);
+    int64_t xl = mv_val_chars(argv[1], xb, sizeof xb, &xp);
+    int64_t pl = 0;
+    int64_t msgclass = MVXMSG_CLASS_STATUS | MVXMSG_FLAG_SIGNED;
+    if (argc >= 3) msgclass = mv_get_int(argv[2]);
+    if (argc >= 4) pl = mv_val_chars(argv[3], pb, sizeof pb, &pp);
+
+    /* The arguments are MV strings and need not be NUL-terminated. */
+    char *target = malloc((size_t)tl + 1);
+    char *text = malloc((size_t)xl + 1);
+    char *payload = malloc((size_t)pl + 1);
+    if (!target || !text || !payload) {
+        free(target); free(text); free(payload);
+        mv_set_int(ret, -2);
+        return;
+    }
+    memcpy(target, tp, (size_t)tl); target[tl] = '\0';
+    memcpy(text, xp, (size_t)xl); text[xl] = '\0';
+    memcpy(payload, pp, (size_t)pl); payload[pl] = '\0';
+
+    mv_set_int(ret, mvx_msg_send(target, text, msgclass, payload));
+    free(target); free(text); free(payload);
+}
+
+static void ext_msgpending(mvx_ctx *ctx, mv_value *ret, int32_t argc,
+                           mv_value **argv) {
+    (void)ctx; (void)argc; (void)argv;
+    mv_set_int(ret, mvx_msg_pending());
+}
+
+static void ext_msgdropped(mvx_ctx *ctx, mv_value *ret, int32_t argc,
+                           mv_value **argv) {
+    (void)ctx; (void)argc; (void)argv;
+    mv_set_int(ret, mvx_msg_dropped());
+}
+
+static void ext_msgread(mvx_ctx *ctx, mv_value *ret, int32_t argc,
+                        mv_value **argv) {
+    (void)ctx; (void)argc; (void)argv;
+    mvx_msg_read(ret);
+}
+
+static void ext_msgmode(mvx_ctx *ctx, mv_value *ret, int32_t argc,
+                        mv_value **argv) {
+    (void)ctx;
+    char nb[40];
+    const char *p = "";
+    int64_t n = 0;
+    if (argc >= 1) n = mv_val_chars(argv[0], nb, sizeof nb, &p);
+    char want[16];
+    size_t len = (size_t)n < sizeof want - 1 ? (size_t)n : sizeof want - 1;
+    memcpy(want, p, len);
+    want[len] = '\0';
+    mvx_msg_mode(ret, want);
+}
+
 static const mvx_extfn msg_fns[] = {
     {"MSGWHO", 0, 1, ext_msgwho},
     {"MSGSTATUS", 0, 0, ext_msgstatus},
+    {"MSGSEND", 2, 4, ext_msgsend},
+    {"MSGPENDING", 0, 0, ext_msgpending},
+    {"MSGREAD", 0, 0, ext_msgread},
+    {"MSGMODE", 0, 1, ext_msgmode},
+    {"MSGDROPPED", 0, 0, ext_msgdropped},
 };
 
-static const mvx_ext msg_ext = {"msg", 2, msg_fns};
+static const mvx_ext msg_ext = {"msg", 7, msg_fns};
 
 const mvx_ext *mvx_msg_builtin(void) { return &msg_ext; }

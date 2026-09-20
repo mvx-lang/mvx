@@ -53,6 +53,44 @@ enum {
 
     /* (no fields) -> OK: transport, state, port, prefix */
     MVXMSG_OP_STAT,
+
+    /* target, class, text, payload -> OK: count delivered
+       The target is the classic sentence form: "*", "!7", "!5-9", "@user",
+       or one or more account names.  Resolution happens in the daemon,
+       against the roster, because that is where the roster is -- and doing
+       it there keeps the delivery set explicit, so MSG can say it reached
+       three ports of five. */
+    MVXMSG_OP_SEND,
+
+    /* (no fields) -> OK: pending, dropped-since-logon */
+    MVXMSG_OP_PEEK,
+
+    /* max -> OK: count, then that many message records */
+    MVXMSG_OP_RECV,
+
+    /* mode -> OK: previous mode */
+    MVXMSG_OP_MODE,
+};
+
+/* Message classes.  The class travels with the message and the RECEIVER
+   decides what to do with it -- which is the modern answer to the classic
+   variants, where the sender chose between the status line and the cursor
+   and the receiving program had no say. */
+enum {
+    MVXMSG_CLASS_STATUS = 0,    /* ordinary: show it somewhere out of the way */
+    MVXMSG_CLASS_CURSOR = 1,    /* the sender wants it seen where the eye is */
+    MVXMSG_CLASS_WALL = 2,      /* to every port; cannot be switched off */
+    MVXMSG_CLASS_SYSTEM = 3,    /* from the operator; cannot be switched off */
+};
+
+#define MVXMSG_FLAG_BELL  (1u << 4)
+#define MVXMSG_FLAG_SIGNED (1u << 5)   /* show who sent it */
+
+/* What a session does with arriving messages. */
+enum {
+    MVXMSG_MODE_ON = 0,         /* queue everything */
+    MVXMSG_MODE_OFF = 1,        /* discard, except WALL and SYSTEM */
+    MVXMSG_MODE_DEFER = 2,      /* queue, and do not interrupt at the prompt */
 };
 
 /* WHO scopes: this host, or every host sharing the prefix.  Only LOCAL can be
