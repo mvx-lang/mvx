@@ -2026,14 +2026,13 @@ static int pg_migrate_docs(const char *loc, char *err, size_t errlen) {
         return -1;
     }
     int n = PQntuples(r);
-    struct { char name[128]; char enc[64]; int docs, bin, txt, stamp; } *work =
+    struct { char name[128]; char enc[64]; int docs, bin, txt; } *work =
         n ? calloc((size_t)n, sizeof *work) : NULL;
     char wasenc[64] = "";
     for (int i = 0; i < n; i++) {
         snprintf(work[i].name, sizeof work[0].name, "%s", PQgetvalue(r, i, 0));
         work[i].docs = PQgetvalue(r, i, 1)[0] == 't';
         work[i].bin = PQgetvalue(r, i, 2)[0] == 't';
-        work[i].stamp = work[i].docs || PQgetvalue(r, i, 3)[0] == 't';
         pg_stamp_word(PQgetisnull(r, i, 4) ? NULL : PQgetvalue(r, i, 4),
                       "idenc=", work[i].enc, sizeof work[0].enc);
         if (work[i].enc[0] && nowenc && strcmp(work[i].enc, nowenc) != 0) {
@@ -2073,7 +2072,10 @@ static int pg_migrate_docs(const char *loc, char *err, size_t errlen) {
                             err, errlen)) {
             PQclear(PQexec(c, "ROLLBACK")); free(work); return -1;
         }
-        if (work[i].stamp) {              /* say what it is now (mvx#171) */
+        {   /* Say what it is now (mvx#171) -- for whatever was touched,
+               child tables included: they carry ids and so they carry the
+               encoding that spelled them.  A child left with the old stamp
+               would be re-spelled again on the next run. */
             snprintf(sql, sizeof sql,
                      "COMMENT ON TABLE %s IS 'mvx: format=%d idcs=%s idenc=%s'",
                      qt, MVX_FILE_FORMAT, mvx_id_csname(pg_cs(c)),

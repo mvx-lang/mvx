@@ -39,6 +39,13 @@
  *         SQLite truncates, Postgres rejects, MySQL and BSON are lax but
  *         every client in front of them is not.
  *
+ * And one byte is escaped in one position: A TRAILING SPACE, as `%20'.  It is
+ * perfectly representable; it is not reliably COMPARABLE, because a PAD SPACE
+ * collation -- which is most of MySQL's, including utf8mb4_bin -- reads `A'
+ * and `A ' as the same key.  Escaping only the last one is enough to keep
+ * every distinct id distinct (no encoded id can then end in a space at all)
+ * and costs three characters on the handful of ids that have one.
+ *
  * Base64 was considered and rejected -- it would make every id unreadable to
  * solve a problem that affects almost none of them.
  *
@@ -131,6 +138,8 @@ int64_t mvx_id_encode(const char *id, int64_t idlen, int cs, char *out,
         int n = 1;
         if (c == '%' || c == 0)
             keep = 0;                   /* escaped in every character set */
+        else if (c == ' ' && i == idlen - 1)
+            keep = 0;                   /* a trailing space; see above */
         else if (c < 0x80)
             keep = 1;                   /* ASCII is ASCII everywhere */
         else if (cs == MVX_ID_CS_BYTE)
