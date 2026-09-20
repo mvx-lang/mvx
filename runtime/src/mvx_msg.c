@@ -244,31 +244,36 @@ static int msg_ensure(void) {
     if (g_port) return g_port;
     if (msg_connect() < 0) return 0;
 
-    const char *sid = getenv("MVXMSGSESSION");
-    const char *tok = getenv("MVXMSGTOKEN");
-    if (sid && *sid && tok && *tok) {
-        obuf req = {0, 0, 0};
-        ostr(&req, sid);
-        ostr(&req, tok);
-        char resp[256];
-        size_t rlen = sizeof resp;
-        int st = roundtrip(MVXMSG_OP_ATTACH, &req, resp, &rlen);
-        free(req.d);
-        if (st == MVXMSG_ST_OK) {
-            ibuf in = {resp, rlen, 0};
-            g_port = i16(&in);
-            snprintf(g_sid, sizeof g_sid, "%s", sid);
-            snprintf(g_token, sizeof g_token, "%s", tok);
-            return g_port;
-        }
-        /* The parent's lease is gone; fall through and register afresh. */
-    }
     return mvx_msg_register();
 }
 
 int mvx_msg_register(void) {
     if (g_port) return g_port;
     if (msg_connect() < 0) return 0;
+
+    /* JOIN, DO NOT START.  A verb under a shell, a program under EXECUTE and
+       a subroutine library all carry their parent's session in the
+       environment; taking a fresh port for each would log a person on several
+       times over for one thing they typed. */
+    const char *sid = getenv("MVXMSGSESSION");
+    const char *tok = getenv("MVXMSGTOKEN");
+    if (sid && *sid && tok && *tok) {
+        obuf areq = {0, 0, 0};
+        ostr(&areq, sid);
+        ostr(&areq, tok);
+        char aresp[256];
+        size_t alen = sizeof aresp;
+        int ast = roundtrip(MVXMSG_OP_ATTACH, &areq, aresp, &alen);
+        free(areq.d);
+        if (ast == MVXMSG_ST_OK) {
+            ibuf in = {aresp, alen, 0};
+            g_port = i16(&in);
+            snprintf(g_sid, sizeof g_sid, "%s", sid);
+            snprintf(g_token, sizeof g_token, "%s", tok);
+            return g_port;
+        }
+        /* The parent's lease has gone; fall through and take a port. */
+    }
 
     char prefix[128], account[128], user[64], host[64];
     this_prefix(prefix, sizeof prefix);
