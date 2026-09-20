@@ -331,7 +331,7 @@ endif()
 # poll loop with no third-party dependency, so it builds wherever the runtime
 # does.  A transport that needs a library arrives later as its own dlopen'd
 # driver, and that is what gets an option.
-add_executable(mvx-msgd daemon/mvx_msgd.c)
+add_executable(mvx-msgd daemon/mvx_msgd.c daemon/msgdrv_loop.c)
 target_include_directories(mvx-msgd PRIVATE runtime/include)
 set_target_properties(mvx-msgd PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

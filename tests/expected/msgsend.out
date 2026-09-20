@@ -11,7 +11,7 @@ pending=4
   wall from port 1: to everyone
 drained=0
 mode was ON
-direct while off=0 pending=0
+direct while off=1 pending=0
 wall while off=1 pending=1
 the one that got through: not muted
 mode was OFF
