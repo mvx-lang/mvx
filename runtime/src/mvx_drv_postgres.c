@@ -13,8 +13,10 @@
 /* postgres driver — a MultiValue file on a PostgreSQL table.
  *
  * Each account/namespace is a schema; each file is a table
- * (id BYTEA PRIMARY KEY, doc JSONB) in it, so records round-trip
- * byte-exact (marks and all).  The connection is a named profile
+ * (id text PRIMARY KEY, doc JSONB) in it, so records round-trip
+ * byte-exact (marks and all) AND read as themselves in psql: the id is
+ * percent-escaped only where the database's character set cannot carry the
+ * byte (#236).  The connection is a named profile
  * (BINDINGS `ORDERS @pgmain`, .mvx-private/connections carries
  * driver/address/dbname/user/password/namespace) — the same indirection
  * the lmdbnet driver uses.

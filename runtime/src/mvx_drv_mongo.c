@@ -13,8 +13,11 @@
 /* mongo driver — a MultiValue file on a MongoDB collection.
  *
  * An MV record is a natural document, so each record is stored as
- * { _id: <id>, rec: <blob> } with both fields BinData, so ids and records
- * round-trip byte-exact (marks and all).  The account/namespace maps to a
+ * { _id: "<id>", doc: { … } } -- a string id that reads as the key somebody
+ * would recognise (#236) and the record as a BSON sub-document, one field per
+ * attribute (#157).  Both round-trip byte-exact, marks and all: a byte the
+ * id cannot spell in UTF-8 is percent-escaped and comes back as itself.  The
+ * account/namespace maps to a
  * database and each file to a collection.  The connection is a named profile
  * (BINDINGS `ORDERS @mongomain`, .mvx-private/connections carries
  * driver/address/namespace/user/password) — the same indirection the postgres
@@ -24,7 +27,7 @@
  * (the record blob stays authoritative; the columns are a derived projection):
  *   - relational mapping (#62) — a mapped file's dict columns are projected
  *     into native BSON fields on the same document, so a record reads as
- *     { _id, rec, CUST_NAME: "…", BALANCE: 152.34, LINES: [ {…}, … ] }:
+ *     { _id, doc, CUST_NAME: "…", BALANCE: 152.34, LINES: [ {…}, … ] }:
  *     parent columns are scalar fields, associations an embedded array of
  *     sub-documents (the Mongo-idiomatic nested form);
  *   - native indexes (#27/#62) — CREATE-INDEX builds a real Mongo index on a

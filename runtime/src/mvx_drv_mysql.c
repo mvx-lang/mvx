@@ -30,10 +30,12 @@
  * ordinary expression built from SUBSTRING_INDEX, so the driver needs no
  * privilege beyond the tables it owns.
  *
- * EVERYTHING IS BINARY.  ids are VARBINARY, records LONGBLOB.  MV sorts
- * and compares bytes, and a blob column does exactly that with no
- * collation to get wrong -- which is also why the ORDER BY push-down
- * needs no COLLATE clause the way postgres needs COLLATE "C".
+ * MAPPED COLUMNS ARE BINARY.  MV sorts and compares bytes, and a blob
+ * column does exactly that with no collation to get wrong -- which is also
+ * why the ORDER BY push-down needs no COLLATE clause the way postgres needs
+ * COLLATE "C".  The record id is the exception: it is VARCHAR in the
+ * database's own character set with a _bin collation, so it still compares
+ * byte for byte but reads as the key somebody would recognise (#236).
  */
 
 #include "mvx_driver.h"
