@@ -14,4 +14,8 @@ PRINT "who=[":W:"]"
 N = 0
 IF W # "" THEN N = DCOUNT(W, @AM)
 PRINT "sessions=":N
+* Sending, too, must be harmless with nothing to send through.
+PRINT "send=":MSGSEND("!1", "nobody is listening")
+PRINT "read=[":MSGREAD():"]"
+PRINT "dropped=":MSGDROPPED()
 PRINT "still running"

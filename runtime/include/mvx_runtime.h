@@ -408,6 +408,14 @@ const char *mvx_msg_session_token(void); /* a child ATTACHes with this */
 void        mvx_msg_bye(void);           /* graceful deregister */
 void        mvx_msg_who(mv_value *out, int64_t scope);
 void        mvx_msg_status(mv_value *out);
+/* `msgclass' rather than `class': this header is included by the compiler,
+   which is C++, where that is a keyword. */
+int64_t     mvx_msg_send(const char *target, const char *text,
+                         int64_t msgclass, const char *payload);
+int64_t     mvx_msg_pending(void);      /* -1 = no registry */
+int64_t     mvx_msg_dropped(void);
+void        mvx_msg_read(mv_value *out);          /* "" when empty */
+void        mvx_msg_mode(mv_value *out, const char *want);
 
 /* --- OS file access (see mvx_os.c) ------------------------------------- */
 void    mv_osread(mvx_ctx *ctx, mv_value *dst, const mv_value *path);

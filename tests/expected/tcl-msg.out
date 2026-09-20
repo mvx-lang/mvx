@@ -1,0 +1,4 @@
+sent to 1 port
+MSG: no logged-on port matches !4000
+not allowed: a message to every port requires an 'msgwall' permit for your groups
+sent to 1 port

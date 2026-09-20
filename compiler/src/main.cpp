@@ -131,7 +131,10 @@ fs::path systemDir() {
 // run against a bare tree still has to compile JSONENCODE.  Keep in step with
 // register_builtins() in runtime/src/mvx_ext.c.
 static const char *const kBuiltinExtFuncs[] = {"JSONENCODE", "JSONDECODE",
-                                               "MSGWHO", "MSGSTATUS"};
+                                               "MSGWHO", "MSGSTATUS",
+                                               "MSGSEND", "MSGPENDING",
+                                               "MSGREAD", "MSGMODE",
+                                               "MSGDROPPED"};
 
 std::set<std::string> loadExtFuncs() {
     std::set<std::string> out;
