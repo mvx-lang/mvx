@@ -3473,7 +3473,11 @@ IDEOF
       FAIL=$((FAIL+1)); echo "FAIL old-id refusal: got '$refused'" ;;
   esac
 
-  "$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" >/dev/null 2>&1
+  # CAPTURE WHAT THE TOOL SAYS.  Sending it to /dev/null turns "the driver
+  # could not be found" into "nothing was converted", which is a far harder
+  # thing to read off a CI log -- and is exactly how this test first failed.
+  migout="$("$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" 2>&1)"
+  migrc=$?
   conv="$(sqlite3 "$OLA/old.sqlite" \
     "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
     2>/dev/null)"
@@ -3490,23 +3494,30 @@ PRINT TRIM(OUT)
 IDREOF
   "$MVX" "$TESTROOT/idr.b" -o "$TESTROOT/idr" 2>/dev/null
   back="$(cd "$OLA" && MVXACCOUNT=. "$TESTROOT/idr" 2>&1)"
-  if [ "$conv" = '50%25 OFF|A%FDB|C1' ] && [ "$back" = "Acme Marked Sale" ]; then
+  if [ "$migrc" = 0 ] && [ "$conv" = '50%25 OFF|A%FDB|C1' ] && \
+     [ "$back" = "Acme Marked Sale" ]; then
     PASS=$((PASS+1)); echo "  and one command converts it, ids intact"
   else
     FAIL=$((FAIL+1))
-    echo "FAIL id migration: stored='$conv' read='$back'"
+    echo "FAIL id migration: rc=$migrc stored='$conv' read='$back'"
+    echo "     mvx-doc-migrate said: $migout"
   fi
 
   # Re-running must be safe: the ids are already text, and encoding one that
   # is already encoded would turn %25 into %2525.
-  "$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" >/dev/null 2>&1
+  rerun="$("$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" 2>&1)"
   again="$(sqlite3 "$OLA/old.sqlite" \
     "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
     2>/dev/null)"
-  if [ "$again" = "$conv" ]; then
+  # AND IT SAYS SO: a second run converts NOTHING, which is the difference
+  # between idempotent and merely harmless.
+  rerun0=0
+  case "$rerun" in "mvx-doc-migrate: 0 file(s) converted"*) rerun0=1 ;; esac
+  if [ "$again" = "$conv" ] && [ "$rerun0" = 1 ]; then
     PASS=$((PASS+1)); echo "  running the conversion twice changes nothing"
   else
-    FAIL=$((FAIL+1)); echo "FAIL re-run: got '$again' want '$conv'"
+    FAIL=$((FAIL+1))
+    echo "FAIL re-run: got '$again' want '$conv'; tool said: $rerun"
   fi
 else
   echo "  (record id tests skipped — sqlite driver or sqlite3 not available)"

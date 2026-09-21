@@ -74,6 +74,8 @@ const char *mvx_system_dir(void);
    files need not all live on the same one — and that is a question to ask the
    user about rather than a reason to abort.  Asking is why this exists. */
 int mvx_driver_available(const char *name);
+struct mvx_driver;
+const struct mvx_driver *mvx_driver_find(const char *name);
 
 /* The drivers this host actually has, comma-separated, so a prompt can offer
    real options instead of asking for a name the user has to guess. */

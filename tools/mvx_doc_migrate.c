@@ -37,35 +37,20 @@
  * an interrupted run leaves a file wholly in the old format, never half in
  * each.  Re-running is safe; a file already converted is skipped.
  *
- * It dlopen's the driver itself rather than going through the runtime's store,
- * because everything above the driver already assumes the new format. */
+ * It drives the DRIVER rather than going through the runtime's store, because
+ * everything above the driver already assumes the new format -- but it uses
+ * the runtime's own driver SEARCH (mvx_driver_find), because a tool with its
+ * own idea of where drivers live is a tool that works on the developer's
+ * machine and not on anybody else's. */
 
 #include "mvx_driver.h"
+#include "mvx_runtime.h"
 
-#ifndef MVX_DRIVER_DIR
-#define MVX_DRIVER_DIR "."
-#endif
-
-#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef __APPLE__
-#define DRV_SUFFIX ".dylib"
-#else
-#define DRV_SUFFIX ".so"
-#endif
 
-static const mvx_driver *load_driver(const char *name, const char *dir) {
-    char path[4096];
-    snprintf(path, sizeof path, "%s/libmvxdrv_%s" DRV_SUFFIX, dir, name);
-    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!h) return NULL;
-    mvx_driver_entry_fn entry =
-        (mvx_driver_entry_fn)dlsym(h, "mvx_driver_entry");
-    return entry ? entry(MVX_DRIVER_ABI) : NULL;
-}
 
 int main(int argc, char **argv) {
     if (argc != 3) {
@@ -93,15 +78,7 @@ int main(int argc, char **argv) {
     }
     const char *name = argv[1], *loc = argv[2];
 
-    const mvx_driver *d = NULL;
-    const char *dirs = getenv("MVXDRIVERS");
-    if (dirs && *dirs) {
-        char buf[4096];
-        snprintf(buf, sizeof buf, "%s", dirs);
-        for (char *tok = strtok(buf, ":"); tok && !d; tok = strtok(NULL, ":"))
-            d = load_driver(name, tok);
-    }
-    if (!d) d = load_driver(name, MVX_DRIVER_DIR);
+    const mvx_driver *d = mvx_driver_find(name);
     if (!d) {
         fprintf(stderr, "mvx-doc-migrate: no driver '%s' (set MVXDRIVERS)\n",
                 name);
