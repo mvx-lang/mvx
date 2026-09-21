@@ -139,6 +139,7 @@ jobs:
             cmake ninja-build gcc-toolset-14 \
             "llvm-devel-${LLVM_VERSION}*" \
             lmdb-devel libedit-devel libgit2-devel libpq-devel pkgconfig \
+            sqlite-devel \
             zlib-devel libzstd-devel ncurses-devel git tar gzip
           llvm-config --version
 
@@ -161,6 +162,20 @@ jobs:
       # THE FLOOR IS AN ASSERTION, NOT A HOPE (mvx#203).  A release that
       # quietly needed a newer libc than it claims is exactly the failure this
       # issue is about, and it is invisible until somebody downloads it.
+      # AND THE DRIVER SET (mvx#203).  A missing -devel package does not fail
+      # the build: the driver is skipped with a message nobody reads, and the
+      # release ships without a backend.  sqlite shipped at all only because
+      # the Ubuntu runner image happened to carry libsqlite3-dev -- the
+      # workflow never asked for it.  Name what must be there.
+      - name: Assert the drivers that must ship
+        run: |
+          miss=
+          for d in dir lmdb lmdbnet postgres sqlite; do
+            [ -f "stage/mvx-lang/lib/libmvxdrv_$d.so" ] || miss="$miss $d"
+          done
+          ls stage/mvx-lang/lib/
+          [ -z "$miss" ] || { echo "::error::drivers missing:$miss"; exit 1; }
+
       - name: Assert the glibc floor
         run: |
           max=$(objdump -T stage/mvx-lang/bin/* stage/mvx-lang/lib/*.so 2>/dev/null \
