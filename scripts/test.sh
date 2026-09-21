@@ -173,6 +173,9 @@ lang strfns world
 lang strmath
 lang ifdef
 lang equate
+# mvx#183: INT(a/b) on integers is an integer divide -- faster, and exact
+# above 2^53 where the float round trip was off by one.
+lang intdiv
 # mvx#226: messaging must cost nothing when no registry is running.
 lang msg
 lang matparse

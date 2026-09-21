@@ -1,0 +1,18 @@
+-- exact above 2^53 --
+9007199254740993
+9007199254740995
+3002399751580331
+-- truncation toward zero, both signs --
+3
+-3
+-3
+3
+-- a variable divisor, the shape MV code writes --
+6
+-- the undefined-for-sdiv cases still answer --
+9223372036854775807
+-9223372036854775808
+0
+9223372036854775807
+-- still fractional without INT() --
+3.5
