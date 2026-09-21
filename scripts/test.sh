@@ -2898,10 +2898,10 @@ OEOF
       >/dev/null 2>&1
     "$TCL" -a "$VMACCT" -c 'MAP-MODE ORD native' >/dev/null 2>&1
     # external edits straight to the tables (id 'O1' = \x4f31)
-    psql_ext "UPDATE vmtest.\"ORD\" SET \"CUSTOMER\"='Beta Ltd', \"WHEN\"=DATE '2027-01-15' WHERE id='\\x4f31'" >/dev/null
-    psql_ext "UPDATE vmtest.\"ORD_ORDITEMS\" SET \"QTY\"=99 WHERE id='\\x4f31' AND seq=1" >/dev/null
-    psql_ext "INSERT INTO vmtest.\"ORD_ORDITEMS\"(id,seq,\"PRODUCT\",\"QTY\") VALUES('\\x4f31',3,'Sprocket',5)" >/dev/null
-    psql_ext "INSERT INTO vmtest.\"ORD\"(id,\"CUSTOMER\",\"WHEN\") VALUES('\\x4f39','SQL Only',DATE '2026-12-31')" >/dev/null
+    psql_ext "UPDATE vmtest.\"ORD\" SET \"CUSTOMER\"='Beta Ltd', \"WHEN\"=DATE '2027-01-15' WHERE id='O1'" >/dev/null
+    psql_ext "UPDATE vmtest.\"ORD_ORDITEMS\" SET \"QTY\"=99 WHERE id='O1' AND seq=1" >/dev/null
+    psql_ext "INSERT INTO vmtest.\"ORD_ORDITEMS\"(id,seq,\"PRODUCT\",\"QTY\") VALUES('O1',3,'Sprocket',5)" >/dev/null
+    psql_ext "INSERT INTO vmtest.\"ORD\"(id,\"CUSTOMER\",\"WHEN\") VALUES('O9','SQL Only',DATE '2026-12-31')" >/dev/null
     cat > "$TESTROOT/vmordr.b" <<'REOF'
 OPEN "ORD" TO F ELSE STOP
 READ R FROM F, "O1" THEN
@@ -2940,7 +2940,7 @@ OPTEOF
     (cd "$VMACCT" && MVXACCOUNT=. "$TESTROOT/vmoptbin")
     "$TCL" -a "$VMACCT" -c 'CREATE-MAP OPT CUSTOMER PRODUCT QTY' >/dev/null 2>&1
     xchild() { psql_ext "SELECT string_agg(xmin::text,',' ORDER BY seq) \
-                 FROM vmtest.\"OPT_OITEMS\" WHERE id='\\x5031'"; }
+                 FROM vmtest.\"OPT_OITEMS\" WHERE id='P1'"; }
     cat > "$TESTROOT/vmd1.b" <<'D1'
 OPEN "OPT" TO F ELSE STOP
 READ R FROM F, "P1" THEN R<1> = "Renamed Co"
@@ -2969,8 +2969,8 @@ D3
       "parent-only leaves children: $([ "$X0" = "$X1" ] && echo yes || echo no)" \
       "line-item rewrites children: $([ "$X1" != "$X2" ] && echo yes || echo no)" \
       "identical write no-ops: $([ "$X2" = "$X3" ] && echo yes || echo no)" \
-      "customer=$(psql_ext "SELECT \"CUSTOMER\" FROM vmtest.\"OPT\" WHERE id='\\x5031'")" \
-      "qty1=$(psql_ext "SELECT \"QTY\" FROM vmtest.\"OPT_OITEMS\" WHERE id='\\x5031' AND seq=1")")"
+      "customer=$(psql_ext "SELECT \"CUSTOMER\" FROM vmtest.\"OPT\" WHERE id='P1'")" \
+      "qty1=$(psql_ext "SELECT \"QTY\" FROM vmtest.\"OPT_OITEMS\" WHERE id='P1' AND seq=1")")"
 
     # native Postgres indexes on mapped columns (#37): CREATE-INDEX emits a
     # real SQL index and equality WITH pushes down to it — but only on an
@@ -2997,7 +2997,7 @@ CIXEOF
     IXEXISTS=$(psql_ext "SELECT count(*) FROM pg_indexes WHERE schemaname='vmtest' AND indexname='CIX_STATE_idx'")
     # push-down proof: divert C2's STATE column to NSW in SQL only (rec still
     # VIC); if C2 appears, the SQL index ran, not a rec scan.
-    psql_ext "UPDATE vmtest.\"CIX\" SET \"STATE\"='NSW' WHERE id='\\x4332'" >/dev/null
+    psql_ext "UPDATE vmtest.\"CIX\" SET \"STATE\"='NSW' WHERE id='C2'" >/dev/null
     check tcl-pgindex "$( \
       echo "STATE index exists: $IXEXISTS"; \
       echo "-- WITH STATE = NSW (index push-down, C2 diverted in SQL) --"; \
@@ -3031,7 +3031,7 @@ PDNEOF
     # STATE + CREDIT mapped; TIER left unmapped; no index created
     "$TCL" -a "$VMACCT" -c 'CREATE-MAP PDN NAME STATE CREDIT' >/dev/null 2>&1
     # divert C2's STATE column to ZZZ in SQL only (rec blob still VIC)
-    psql_ext "UPDATE vmtest.\"PDN\" SET \"STATE\"='ZZZ' WHERE id='\\x4332'" >/dev/null
+    psql_ext "UPDATE vmtest.\"PDN\" SET \"STATE\"='ZZZ' WHERE id='C2'" >/dev/null
     check tcl-pgpushdown "$( \
       echo "-- WITH STATE = ZZZ (identity column; C2 diverted in SQL) --"; \
       "$TCL" -a "$VMACCT" -c 'LIST PDN NAME STATE WITH STATE = "ZZZ"' 2>&1; \
@@ -3362,11 +3362,12 @@ WRITE "widget":@AM:990 ON F, "D1"
 SQDEOF
     "$MVX" "$TESTROOT/sqdup.b" -o "$TESTROOT/sqdup" || dupok=0
     (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdup" >/dev/null 2>&1)
-    # an external writer changes both columns; id is a BLOB, so CAST or the
-    # UPDATE silently matches nothing and the test measures the old value
+    # An external writer changes both columns.  The id is TEXT now (mvx#236),
+    # so this is the query anybody would write -- it needed CAST('D1' AS BLOB)
+    # when ids were raw bytes, and getting that wrong matched nothing silently.
     sqlite3 "$SQA/acct.sqlite" \
       "UPDATE \"$f\" SET \"PRICE\"=55.55, \"PRICE.RAW\"='777' \
-       WHERE id=CAST('D1' AS BLOB);" 2>/dev/null
+       WHERE id='D1';" 2>/dev/null
     ch="$(sqlite3 "$SQA/acct.sqlite" \
       "SELECT COUNT(*) FROM \"$f\" WHERE \"PRICE.RAW\"='777';" 2>/dev/null)"
     cat > "$TESTROOT/sqdupr.b" <<SQREOF
@@ -3386,6 +3387,140 @@ SQREOF
   fi
 else
   echo "  (sqlite test skipped — driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# Record ids are text, not bytes (mvx#236).
+#
+# Run against sqlite because it needs no server, but what is asserted is the
+# CONTRACT, not the backend: an id reads as itself in the database's own
+# tools, only the bytes the character set cannot carry are escaped, and
+# everything round-trips byte for byte whatever was done to it.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1 && \
+   command -v sqlite3 >/dev/null 2>&1; then
+  echo "== record ids read as themselves"
+  IDA="$TESTROOT/idacct"; mkdir -p "$IDA"
+  printf '# MVX account descriptor\nname=idacct\nversion=1\n' > "$IDA/.mvx"
+  printf '* sqlite %s/ids.sqlite\n' "$IDA" > "$IDA/BINDINGS"
+  "$TCL" -a "$IDA" -c 'CREATE-FILE KEYS' >/dev/null 2>&1
+  cat > "$TESTROOT/idw.b" <<'IDEOF'
+OPEN "KEYS" TO F ELSE STOP "no KEYS"
+* plain, a value mark, valid UTF-8, a literal percent, a trailing space
+IDS = "INV-2026-001"
+IDS<-1> = "A":CHAR(253):"B"
+IDS<-1> = "Caf":CHAR(195):CHAR(169)
+IDS<-1> = "50% OFF"
+IDS<-1> = "TRAIL "
+FOR I = 1 TO DCOUNT(IDS, @AM)
+   WRITE "row ":I ON F, IDS<I>
+NEXT I
+BAD = 0
+FOR I = 1 TO DCOUNT(IDS, @AM)
+   READ V FROM F, IDS<I> THEN
+      IF V # "row ":I THEN BAD = BAD + 1
+   END ELSE BAD = BAD + 1
+NEXT I
+PRINT "misses=":BAD
+IDEOF
+  "$MVX" "$TESTROOT/idw.b" -o "$TESTROOT/idw" 2>/dev/null
+  idrt="$(cd "$IDA" && MVXACCOUNT=. "$TESTROOT/idw" 2>&1)"
+  if [ "$idrt" = "misses=0" ]; then
+    PASS=$((PASS+1)); echo "  every id round-trips byte for byte"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL id round-trip: got '$idrt' want 'misses=0'"
+  fi
+
+  # What the DATABASE holds.  A plain id is plain; only the byte that is not
+  # UTF-8 is escaped; a literal % is %25 (which is what makes decoding
+  # unambiguous); a trailing space is %20 (a PAD SPACE collation would
+  # otherwise read "TRAIL" and "TRAIL " as one key).
+  stored="$(sqlite3 "$IDA/ids.sqlite" \
+    "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
+    2>/dev/null)"
+  want='50%25 OFF|A%FDB|Caf'$(printf '\303\251')'|INV-2026-001|TRAIL%20'
+  if [ "$stored" = "$want" ]; then
+    PASS=$((PASS+1)); echo "  only what the character set cannot carry is escaped"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL stored ids: got '$stored' want '$want'"
+  fi
+
+  types="$(sqlite3 "$IDA/ids.sqlite" \
+    "SELECT DISTINCT typeof(id) FROM KEYS;" 2>/dev/null)"
+  if [ "$types" = "text" ]; then
+    PASS=$((PASS+1)); echo "  the id column holds text"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL id storage class: got '$types' want 'text'"
+  fi
+
+  # A database written by the previous release: binary ids, and a version
+  # that does not claim otherwise.  It must be REFUSED rather than read as
+  # empty, and then converted by one documented command.
+  OLA="$TESTROOT/oldids"; mkdir -p "$OLA"
+  printf '# MVX account descriptor\nname=oldids\nversion=1\n' > "$OLA/.mvx"
+  printf '* sqlite %s/old.sqlite\n' "$OLA" > "$OLA/BINDINGS"
+  rm -f "$OLA/old.sqlite"
+  sqlite3 "$OLA/old.sqlite" \
+    "CREATE TABLE KEYS (id BLOB PRIMARY KEY, doc TEXT);
+     INSERT INTO KEYS VALUES (CAST('C1' AS BLOB), '{\"1\":\"Acme\"}');
+     INSERT INTO KEYS VALUES (x'41FD42', '{\"1\":\"Marked\"}');
+     INSERT INTO KEYS VALUES (CAST('50% OFF' AS BLOB), '{\"1\":\"Sale\"}');" \
+    2>/dev/null
+  refused="$("$TCL" -a "$OLA" -c 'COUNT KEYS' 2>&1 | head -1)"
+  case "$refused" in
+    *"stores its ids as raw bytes"*)
+      PASS=$((PASS+1)); echo "  a database with binary ids is refused, by name" ;;
+    *)
+      FAIL=$((FAIL+1)); echo "FAIL old-id refusal: got '$refused'" ;;
+  esac
+
+  # CAPTURE WHAT THE TOOL SAYS.  Sending it to /dev/null turns "the driver
+  # could not be found" into "nothing was converted", which is a far harder
+  # thing to read off a CI log -- and is exactly how this test first failed.
+  migout="$("$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" 2>&1)"
+  migrc=$?
+  conv="$(sqlite3 "$OLA/old.sqlite" \
+    "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
+    2>/dev/null)"
+  cat > "$TESTROOT/idr.b" <<'IDREOF'
+OPEN "KEYS" TO F ELSE STOP "no KEYS"
+IDS = "C1"
+IDS<-1> = "A":CHAR(253):"B"
+IDS<-1> = "50% OFF"
+OUT = ""
+FOR I = 1 TO DCOUNT(IDS, @AM)
+   READ V FROM F, IDS<I> THEN OUT := V<1>:" " ELSE OUT := "MISS "
+NEXT I
+PRINT TRIM(OUT)
+IDREOF
+  "$MVX" "$TESTROOT/idr.b" -o "$TESTROOT/idr" 2>/dev/null
+  back="$(cd "$OLA" && MVXACCOUNT=. "$TESTROOT/idr" 2>&1)"
+  if [ "$migrc" = 0 ] && [ "$conv" = '50%25 OFF|A%FDB|C1' ] && \
+     [ "$back" = "Acme Marked Sale" ]; then
+    PASS=$((PASS+1)); echo "  and one command converts it, ids intact"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL id migration: rc=$migrc stored='$conv' read='$back'"
+    echo "     mvx-doc-migrate said: $migout"
+  fi
+
+  # Re-running must be safe: the ids are already text, and encoding one that
+  # is already encoded would turn %25 into %2525.
+  rerun="$("$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" 2>&1)"
+  again="$(sqlite3 "$OLA/old.sqlite" \
+    "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
+    2>/dev/null)"
+  # AND IT SAYS SO: a second run converts NOTHING, which is the difference
+  # between idempotent and merely harmless.
+  rerun0=0
+  case "$rerun" in "mvx-doc-migrate: 0 file(s) converted"*) rerun0=1 ;; esac
+  if [ "$again" = "$conv" ] && [ "$rerun0" = 1 ]; then
+    PASS=$((PASS+1)); echo "  running the conversion twice changes nothing"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL re-run: got '$again' want '$conv'; tool said: $rerun"
+  fi
+else
+  echo "  (record id tests skipped — sqlite driver or sqlite3 not available)"
 fi
 
 # mysql/mariadb backend — only when MVX_MYSQL names a reachable server, e.g.

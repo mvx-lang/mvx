@@ -155,6 +155,7 @@ add_library(mvxrt SHARED
   runtime/src/mvx_cred.c
   runtime/src/mvx_conn.c
   runtime/src/mvx_msg.c
+  runtime/src/mvx_id.c
   runtime/src/mvx_call.c
   runtime/src/mvx_term.c
   runtime/src/mvx_os.c

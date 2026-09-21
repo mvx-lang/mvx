@@ -30,10 +30,12 @@
  * ordinary expression built from SUBSTRING_INDEX, so the driver needs no
  * privilege beyond the tables it owns.
  *
- * EVERYTHING IS BINARY.  ids are VARBINARY, records LONGBLOB.  MV sorts
- * and compares bytes, and a blob column does exactly that with no
- * collation to get wrong -- which is also why the ORDER BY push-down
- * needs no COLLATE clause the way postgres needs COLLATE "C".
+ * MAPPED COLUMNS ARE BINARY.  MV sorts and compares bytes, and a blob
+ * column does exactly that with no collation to get wrong -- which is also
+ * why the ORDER BY push-down needs no COLLATE clause the way postgres needs
+ * COLLATE "C".  The record id is the exception: it is VARCHAR in the
+ * database's own character set with a _bin collation, so it still compares
+ * byte for byte but reads as the key somebody would recognise (#236).
  */
 
 #include "mvx_driver.h"
@@ -55,6 +57,11 @@ static struct {
        the file handle because many open files share one pooled connection, and
        a transaction belongs to the connection. */
     int in_txn;
+    /* The character set the DATABASE is in, asked once at connect and used to
+       decide how much of a record id has to be escaped (mvx#236).  The
+       session is set to it as well, so nothing transcodes on the way. */
+    char csname[64];
+    int cs;
 } g_conns[MAX_CONNS];
 static int g_nconns;
 
@@ -260,6 +267,24 @@ static MYSQL *my_connect(const char *loc, char *err, size_t errlen) {
     snprintf(g_conns[g_nconns].loc, sizeof g_conns[0].loc, "%s", loc);
     g_conns[g_nconns].db = db;
     g_conns[g_nconns].in_txn = 0;
+    /* @@character_set_database, not the session's: a session charset is
+       something anything may change, and encoding an id against it would mean
+       the same key spelled two ways in two sessions.  Pin the session to the
+       database so no byte is transcoded between them. */
+    g_conns[g_nconns].csname[0] = '\0';
+    if (mysql_query(db, "SELECT @@character_set_database") == 0) {
+        MYSQL_RES *r = mysql_store_result(db);
+        if (r) {
+            MYSQL_ROW row = mysql_fetch_row(r);
+            if (row && row[0])
+                snprintf(g_conns[g_nconns].csname,
+                         sizeof g_conns[0].csname, "%s", row[0]);
+            mysql_free_result(r);
+        }
+    }
+    if (g_conns[g_nconns].csname[0])
+        mysql_set_character_set(db, g_conns[g_nconns].csname);
+    g_conns[g_nconns].cs = mvx_id_charset(g_conns[g_nconns].csname);
     g_nconns++;
     return db;
 }
@@ -280,6 +305,63 @@ static int table_exists(MYSQL *db, const char *name) {
     int found = r && mysql_num_rows(r) > 0;
     if (r) mysql_free_result(r);
     return found;
+}
+
+/* ------------------------------------------------------ record ids (#236) */
+
+/* The character set of the database behind this handle, and its name. */
+static int my_cs(MYSQL *db) {
+    for (int i = 0; i < g_nconns; i++)
+        if (g_conns[i].db == db) return g_conns[i].cs;
+    return MVX_ID_CS_ASCII;
+}
+static const char *my_csname(MYSQL *db) {
+    for (int i = 0; i < g_nconns; i++)
+        if (g_conns[i].db == db) return g_conns[i].csname;
+    return "";
+}
+
+/* AN ID IS TEXT NOW: percent-escaped only where the database's character set
+   cannot carry the byte, so `id' holds the key somebody would recognise
+   instead of 0x494E562D.  Encode into `stack' where it fits, else malloc --
+   the caller frees only what it did not own. */
+static char *my_id_text(MYSQL *db, const char *id, int64_t idlen, char *stack,
+                        size_t cap) {
+    char *buf = stack;
+    if ((size_t)idlen * 3 + 1 > cap) {
+        buf = malloc((size_t)idlen * 3 + 1);
+        if (!buf) return NULL;
+        cap = (size_t)idlen * 3 + 1;
+    }
+    if (mvx_id_encode(id, idlen, my_cs(db), buf, cap) < 0) {
+        if (buf != stack) free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static void my_id_free(char *buf, char *stack) {
+    if (buf && buf != stack) free(buf);
+}
+
+/* The other direction: what came out of the id column, back to bytes. */
+static void my_id_bytes(const char *txt, int64_t txtlen, mv_value *out) {
+    char stack[512], *buf = stack;
+    if ((size_t)txtlen + 1 > sizeof stack) buf = malloc((size_t)txtlen + 1);
+    if (!buf) { mv_set_str(out, "", 0); return; }
+    int64_t n = mvx_id_decode(txt, txtlen, buf, (size_t)txtlen + 1);
+    mv_set_str(out, buf, n < 0 ? 0 : n);
+    if (buf != stack) free(buf);
+}
+
+/* The id column: VARCHAR and not VARBINARY, with a binary collation so it
+   still compares byte for byte and case-sensitively.  765 characters, because
+   the escaping can cost three per byte and the old limit was 255 bytes --
+   so the same ids fit, and 765 x 4 stays inside InnoDB's 3072-byte key. */
+static void my_id_coltype(MYSQL *db, char *out, size_t cap) {
+    const char *cs = my_csname(db);
+    if (!cs || !*cs) cs = "utf8mb4";
+    snprintf(out, cap, "VARCHAR(765) CHARACTER SET %s COLLATE %s_bin", cs, cs);
 }
 
 /* Run a statement whose one bound parameter is a byte string, collecting
@@ -338,7 +420,8 @@ static mvx_cursor *run_ids(MYSQL *db, const char *sql,
             c->ids = g;
         }
         mv_init(&c->ids[c->n]);
-        mv_set_str(&c->ids[c->n], buf, (int64_t)(outlen < sizeof buf ? outlen : sizeof buf));
+        my_id_bytes(buf, (int64_t)(outlen < sizeof buf ? outlen : sizeof buf),
+                    &c->ids[c->n]);
         c->n++;
         trunc = 0;
     }
@@ -357,7 +440,27 @@ static mvx_cursor *run_ids(MYSQL *db, const char *sql,
 /* The stored format of `table`: the stamped table comment when there is one,
    else 0 so the caller falls back to the shape.  SHOW CREATE TABLE shows it,
    which is where someone looking at the schema would find it. */
-static int my_format_of(MYSQL *db, const char *table) {
+/* One `word=value' out of the stamp comment.  Only format 3 and later carry
+   idcs/idenc; an older stamp leaves `out' empty and the caller treats the
+   file as matching, because before #236 the ids were bytes and no character
+   set applied to them. */
+static void my_stamp_word(const char *comment, const char *key, char *out,
+                          size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    const char *m = comment ? strstr(comment, key) : NULL;
+    if (!m) return;
+    m += strlen(key);
+    size_t n = strspn(m, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                         "abcdefghijklmnopqrstuvwxyz0123456789_-");
+    if (n >= cap) n = cap - 1;
+    memcpy(out, m, n);
+    out[n] = '\0';
+}
+
+static int my_format_of(MYSQL *db, const char *table, char *idenc,
+                        size_t encap) {
+    if (idenc && encap) idenc[0] = '\0';
     char q[600], esc[300];
     mysql_real_escape_string(db, esc, table, (unsigned long)strlen(table));
     snprintf(q, sizeof q,
@@ -371,10 +474,34 @@ static int my_format_of(MYSQL *db, const char *table) {
         if (row && row[0]) {
             const char *m = strstr(row[0], "mvx: format=");
             if (m) fmt = atoi(m + 12);
+            my_stamp_word(row[0], "idenc=", idenc, encap);
         }
         mysql_free_result(r);
     }
     return fmt;
+}
+
+/* A file written before ids became text (#236): the `id' column is still
+   binary.  Same reasoning as my_is_pre157 -- it must SAY so rather than read
+   as an empty file, because every key the runtime sends is text now. */
+static int my_id_is_binary(MYSQL *db, const char *table) {
+    char q[700], esc[300];
+    mysql_real_escape_string(db, esc, table, (unsigned long)strlen(table));
+    snprintf(q, sizeof q,
+             "SELECT data_type FROM information_schema.columns "
+             "WHERE table_schema = DATABASE() AND table_name = '%s' "
+             "AND column_name = 'id'", esc);
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(db);
+    int bin = 0;
+    if (r) {
+        MYSQL_ROW row = mysql_fetch_row(r);
+        bin = row && row[0] && (strcmp(row[0], "varbinary") == 0 ||
+                                strcmp(row[0], "binary") == 0 ||
+                                strcmp(row[0], "blob") == 0);
+        mysql_free_result(r);
+    }
+    return bin;
 }
 
 static int my_is_pre157(MYSQL *db, const char *table) {
@@ -402,18 +529,42 @@ static mvx_file *my_open(const char *spec, char *err, size_t errlen) {
     MYSQL *db = my_connect(loc, err, errlen);
     if (!db) return NULL;
     if (!table_exists(db, tbl)) return NULL;   /* not found: normal ELSE path */
-    int fmt = my_format_of(db, tbl);
+    char sidenc[64];
+    int fmt = my_format_of(db, tbl, sidenc, sizeof sidenc);
     if (fmt > MVX_FILE_FORMAT) {
         snprintf(err, errlen,
                  "mysql: %s is stored in format %d; this build understands %d "
                  "— it was written by a newer mvx", tbl, fmt, MVX_FILE_FORMAT);
         return NULL;
     }
-    if ((fmt > 0 && fmt < MVX_FILE_FORMAT) || (fmt == 0 && my_is_pre157(db, tbl))) {
+    /* Out of date, but SAY WHICH WAY -- the conversions are different work
+       and the operator should not have to guess which one ran short. */
+    if (fmt == 1 || (fmt == 0 && my_is_pre157(db, tbl))) {
         snprintf(err, errlen,
                  "mysql: %s was written before records became documents "
                  "(it has a `rec` column and no `doc`).  Convert it with:  "
                  "mvx-doc-migrate mysql <connection>", tbl);
+        return NULL;
+    }
+    if (fmt == 2 || (fmt == 0 && my_id_is_binary(db, tbl))) {
+        snprintf(err, errlen,
+                 "mysql: %s stores its record ids as bytes (the `id` column is "
+                 "binary).  Convert it with:  "
+                 "mvx-doc-migrate mysql <connection>", tbl);
+        return NULL;
+    }
+    /* The ids are text, but were they spelled for THIS database?  A dump
+       reloaded into a differently encoded database reads back the CHARACTERS
+       it was written with and not the BYTES, so every key the runtime builds
+       from now on would be spelled differently from the one on disk and
+       nothing would match. */
+    const char *nowenc = my_csname(db);
+    if (sidenc[0] && nowenc && *nowenc && strcmp(sidenc, nowenc) != 0) {
+        snprintf(err, errlen,
+                 "mysql: %s has its record ids spelled for a %s database and "
+                 "this one is %s — the character set changed under it.  "
+                 "Re-encode with:  mvx-doc-migrate mysql <connection>",
+                 tbl, sidenc, nowenc);
         return NULL;
     }
     my_file *f = calloc(1, sizeof(my_file));
@@ -442,12 +593,17 @@ static int my_read(mvx_file *fh, const char *id, int64_t idlen, mv_value *rec) {
         mysql_stmt_close(st); return 0;
     }
     MYSQL_BIND ib;
-    unsigned long il = (unsigned long)idlen;
+    char idb[512];
+    char *idp = my_id_text(f->db, id, idlen, idb, sizeof idb);
+    if (!idp) { mysql_stmt_close(st); return 0; }
+    unsigned long il = (unsigned long)strlen(idp);
     memset(&ib, 0, sizeof ib);
-    ib.buffer_type = MYSQL_TYPE_BLOB;
-    ib.buffer = (void *)id; ib.buffer_length = il; ib.length = &il;
+    ib.buffer_type = MYSQL_TYPE_STRING;
+    ib.buffer = idp; ib.buffer_length = il; ib.length = &il;
     mysql_stmt_bind_param(st, &ib);
-    if (mysql_stmt_execute(st) != 0 || mysql_stmt_store_result(st) != 0) {
+    int xok = mysql_stmt_execute(st) == 0 && mysql_stmt_store_result(st) == 0;
+    my_id_free(idp, idb);
+    if (!xok) {
         mysql_stmt_close(st); return 0;
     }
     /* Two-step fetch: ask for the length with a zero-length buffer, then
@@ -502,9 +658,12 @@ static int my_write(mvx_file *fh, const char *id, int64_t idlen,
     const char *rp;
     int64_t rl = mv_val_chars(&jdoc, buf, sizeof buf, &rp);
     MYSQL_BIND b[2];
-    unsigned long il = (unsigned long)idlen, rlen = (unsigned long)rl;
+    char idb[512];
+    char *idp = my_id_text(f->db, id, idlen, idb, sizeof idb);
+    if (!idp) { mysql_stmt_close(st); mv_clear(&jdoc); return 0; }
+    unsigned long il = (unsigned long)strlen(idp), rlen = (unsigned long)rl;
     memset(b, 0, sizeof b);
-    b[0].buffer_type = MYSQL_TYPE_BLOB; b[0].buffer = (void *)id;
+    b[0].buffer_type = MYSQL_TYPE_STRING; b[0].buffer = idp;
     b[0].buffer_length = il; b[0].length = &il;
     /* STRING, not BLOB: a JSON column takes text, and the document is valid
        UTF-8 by construction (bytes that are not get base64-wrapped). */
@@ -513,6 +672,7 @@ static int my_write(mvx_file *fh, const char *id, int64_t idlen,
     mysql_stmt_bind_param(st, b);
     int ok = mysql_stmt_execute(st) == 0;
     mysql_stmt_close(st);
+    my_id_free(idp, idb);
     mv_clear(&jdoc);
     return ok;
 }
@@ -528,14 +688,18 @@ static int my_del(mvx_file *fh, const char *id, int64_t idlen) {
         mysql_stmt_close(st); return 0;
     }
     MYSQL_BIND ib;
-    unsigned long il = (unsigned long)idlen;
+    char idb[512];
+    char *idp = my_id_text(f->db, id, idlen, idb, sizeof idb);
+    if (!idp) { mysql_stmt_close(st); return 0; }
+    unsigned long il = (unsigned long)strlen(idp);
     memset(&ib, 0, sizeof ib);
-    ib.buffer_type = MYSQL_TYPE_BLOB; ib.buffer = (void *)id;
+    ib.buffer_type = MYSQL_TYPE_STRING; ib.buffer = idp;
     ib.buffer_length = il; ib.length = &il;
     mysql_stmt_bind_param(st, &ib);
     int ok = mysql_stmt_execute(st) == 0;
     my_ulonglong n = mysql_stmt_affected_rows(st);
     mysql_stmt_close(st);
+    my_id_free(idp, idb);
     return ok && n > 0;
 }
 
@@ -574,13 +738,14 @@ static int my_create(const char *spec, char *err, size_t errlen) {
     if (table_exists(db, tbl)) return 0;      /* already exists */
     char qt[300], sql[600];
     quote_ident(tbl, qt, sizeof qt);
-    /* VARBINARY, not BLOB: a primary key needs a bounded length.  255 is
-       generous for an MV item-id and leaves the row well inside the index
-       limit.  The record itself is a LONGBLOB and unbounded. */
+    char idt[160];
+    my_id_coltype(db, idt, sizeof idt);
     snprintf(sql, sizeof sql,
-             "CREATE TABLE %s (id VARBINARY(255) NOT NULL PRIMARY KEY, "
-             "doc JSON) ENGINE=InnoDB COMMENT = 'mvx: format=%d'",
-             qt, MVX_FILE_FORMAT);
+             "CREATE TABLE %s (id %s NOT NULL PRIMARY KEY, "
+             "doc JSON) ENGINE=InnoDB "
+             "COMMENT = 'mvx: format=%d idcs=%s idenc=%s'",
+             qt, idt, MVX_FILE_FORMAT, mvx_id_csname(my_cs(db)),
+             my_csname(db));
     if (!exec_sql(db, sql)) {
         snprintf(err, errlen, "mysql: %s", mysql_error(db));
         return 0;
@@ -793,13 +958,19 @@ static int my_map_apply(mvx_file *fh, const char *id, int64_t idlen,
         b[i].length = &bl[i];
         b[i].is_null = &nulls[i];
     }
-    bl[ncols] = (unsigned long)idlen;
-    b[ncols].buffer_type = MYSQL_TYPE_BLOB;
-    b[ncols].buffer = (void *)id;
+    char idb[512];
+    char *idp = my_id_text(f->db, id, idlen, idb, sizeof idb);
+    if (!idp) { mysql_stmt_close(st); return 0; }
+    bl[ncols] = (unsigned long)strlen(idp);
+    b[ncols].buffer_type = MYSQL_TYPE_STRING;
+    b[ncols].buffer = idp;
     b[ncols].buffer_length = bl[ncols];
     b[ncols].length = &bl[ncols];
-    if (mysql_stmt_bind_param(st, b) != 0) { mysql_stmt_close(st); return 0; }
+    if (mysql_stmt_bind_param(st, b) != 0) {
+        my_id_free(idp, idb); mysql_stmt_close(st); return 0;
+    }
     int ok = mysql_stmt_execute(st) == 0;
+    my_id_free(idp, idb);
     mysql_stmt_close(st);
     return ok;
 }
@@ -815,9 +986,11 @@ static int my_map_child_ensure(mvx_file *fh, const char *assoc,
     char nm[512], qn[600], sql[4096];
     child_name(f, assoc, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
+    char idt[160];
+    my_id_coltype(f->db, idt, sizeof idt);
     size_t p = (size_t)snprintf(sql, sizeof sql,
-        "CREATE TABLE IF NOT EXISTS %s (id VARBINARY(255) NOT NULL, "
-        "seq INT NOT NULL", qn);
+        "CREATE TABLE IF NOT EXISTS %s (id %s NOT NULL, "
+        "seq INT NOT NULL", qn, idt);
     for (int i = 0; i < ncols; i++) {
         char qc[300];
         quote_ident(cols[i].name, qc, sizeof qc);
@@ -825,8 +998,12 @@ static int my_map_child_ensure(mvx_file *fh, const char *assoc,
                               qc, my_sqltype(cols[i].type));
         if (p >= sizeof sql) return 0;
     }
+    /* The same stamp as the parent: a child table has ids in it too, and a
+       re-spelling must never have to guess which encoding wrote one. */
     snprintf(sql + p, sizeof sql - p,
-             ", PRIMARY KEY (id, seq)) ENGINE=InnoDB");
+             ", PRIMARY KEY (id, seq)) ENGINE=InnoDB "
+             "COMMENT = 'mvx: format=%d idcs=%s idenc=%s'",
+             MVX_FILE_FORMAT, mvx_id_csname(my_cs(f->db)), my_csname(f->db));
     if (!exec_sql(f->db, sql)) {
         snprintf(err, errlen, "mysql: %s", mysql_error(f->db));
         return 0;
@@ -846,21 +1023,26 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     char nm[512], qn[600], dsql[700];
     child_name(f, assoc, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
+    char cidb[512];
+    char *cidp = my_id_text(f->db, id, idlen, cidb, sizeof cidb);
+    if (!cidp) return 0;
     /* The DELETE and the INSERTs are one replacement, not a sequence. */
     int started = txn_begin(f->db);
     snprintf(dsql, sizeof dsql, "DELETE FROM %s WHERE id = ?", qn);
     MYSQL_STMT *ds = mysql_stmt_init(f->db);
     if (ds && mysql_stmt_prepare(ds, dsql, (unsigned long)strlen(dsql)) == 0) {
         MYSQL_BIND ib;
-        unsigned long il = (unsigned long)idlen;
+        unsigned long il = (unsigned long)strlen(cidp);
         memset(&ib, 0, sizeof ib);
-        ib.buffer_type = MYSQL_TYPE_BLOB; ib.buffer = (void *)id;
+        ib.buffer_type = MYSQL_TYPE_STRING; ib.buffer = cidp;
         ib.buffer_length = il; ib.length = &il;
         mysql_stmt_bind_param(ds, &ib);
         mysql_stmt_execute(ds);
     }
     if (ds) mysql_stmt_close(ds);
-    if (nrows < 1) { txn_end(f->db, started, 1); return 1; }
+    if (nrows < 1) {
+        my_id_free(cidp, cidb); txn_end(f->db, started, 1); return 1;
+    }
 
     char sql[8192];
     size_t p = (size_t)snprintf(sql, sizeof sql, "INSERT INTO %s (id, seq", qn);
@@ -868,7 +1050,9 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         char qc[300];
         quote_ident(cols[c].name, qc, sizeof qc);
         p += (size_t)snprintf(sql + p, sizeof sql - p, ", %s", qc);
-        if (p >= sizeof sql) { txn_end(f->db, started, 0); return 0; }
+        if (p >= sizeof sql) {
+            my_id_free(cidp, cidb); txn_end(f->db, started, 0); return 0;
+        }
     }
     p += (size_t)snprintf(sql + p, sizeof sql - p, ") VALUES (?, ?");
     for (int c = 0; c < ncols; c++)
@@ -876,9 +1060,10 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     snprintf(sql + p, sizeof sql - p, ")");
 
     MYSQL_STMT *st = mysql_stmt_init(f->db);
-    if (!st) { txn_end(f->db, started, 0); return 0; }
+    if (!st) { my_id_free(cidp, cidb); txn_end(f->db, started, 0); return 0; }
     if (mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) != 0) {
-        mysql_stmt_close(st); txn_end(f->db, started, 0); return 0;
+        mysql_stmt_close(st); my_id_free(cidp, cidb);
+        txn_end(f->db, started, 0); return 0;
     }
     int ok = 1;
     for (int r = 0; r < nrows && ok; r++) {
@@ -887,8 +1072,8 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         my_bool nulls[62];
         int seq = r + 1;
         memset(b, 0, sizeof b);
-        bl[0] = (unsigned long)idlen;
-        b[0].buffer_type = MYSQL_TYPE_BLOB; b[0].buffer = (void *)id;
+        bl[0] = (unsigned long)strlen(cidp);
+        b[0].buffer_type = MYSQL_TYPE_STRING; b[0].buffer = cidp;
         b[0].buffer_length = bl[0]; b[0].length = &bl[0];
         b[1].buffer_type = MYSQL_TYPE_LONG; b[1].buffer = &seq;
         for (int c = 0; c < ncols; c++) {
@@ -905,6 +1090,7 @@ static int my_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         ok = mysql_stmt_execute(st) == 0;
     }
     mysql_stmt_close(st);
+    my_id_free(cidp, cidb);
     txn_end(f->db, started, ok);
     return ok;
 }
@@ -939,7 +1125,7 @@ static int my_map_read(mvx_file *fh, const char *id, int64_t idlen,
                        char **vals, int64_t *lens) {
     my_file *f = (my_file *)fh;
     if (ncols < 1) return 0;
-    char qt[300], sql[8192], esc[600];
+    char qt[300], sql[8192], esc[1600];   /* 765 escaped chars, x2 + 1 */
     quote_ident(f->table, qt, sizeof qt);
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT ");
     for (int i = 0; i < ncols; i++) {
@@ -948,7 +1134,11 @@ static int my_map_read(mvx_file *fh, const char *id, int64_t idlen,
         p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s", i ? ", " : "", qc);
         if (p >= sizeof sql) return -1;
     }
-    mysql_real_escape_string(f->db, esc, id, (unsigned long)idlen);
+    char idb[512];
+    char *idp = my_id_text(f->db, id, idlen, idb, sizeof idb);
+    if (!idp) return -1;
+    mysql_real_escape_string(f->db, esc, idp, (unsigned long)strlen(idp));
+    my_id_free(idp, idb);
     snprintf(sql + p, sizeof sql - p, " FROM %s WHERE id = '%s'", qt, esc);
     if (!exec_sql(f->db, sql)) return -1;
     MYSQL_RES *r = mysql_store_result(f->db);
@@ -979,7 +1169,7 @@ static int my_map_child_read(mvx_file *fh, const char *id, int64_t idlen,
     my_file *f = (my_file *)fh;
     *cells = NULL; *lens = NULL; *nrows = 0;
     if (ncols < 1) return -1;
-    char nm[512], qn[600], sql[8192], esc[600];
+    char nm[512], qn[600], sql[8192], esc[1600];  /* see my_map_read */
     child_name(f, assoc, nm, sizeof nm);
     quote_ident(nm, qn, sizeof qn);
     size_t p = (size_t)snprintf(sql, sizeof sql, "SELECT ");
@@ -989,7 +1179,11 @@ static int my_map_child_read(mvx_file *fh, const char *id, int64_t idlen,
         p += (size_t)snprintf(sql + p, sizeof sql - p, "%s%s", i ? ", " : "", qc);
         if (p >= sizeof sql) return -1;
     }
-    mysql_real_escape_string(f->db, esc, id, (unsigned long)idlen);
+    char idb[512];
+    char *idp = my_id_text(f->db, id, idlen, idb, sizeof idb);
+    if (!idp) return -1;
+    mysql_real_escape_string(f->db, esc, idp, (unsigned long)strlen(idp));
+    my_id_free(idp, idb);
     snprintf(sql + p, sizeof sql - p,
              " FROM %s WHERE id = '%s' ORDER BY seq", qn, esc);
     if (!exec_sql(f->db, sql)) return -1;
@@ -1404,7 +1598,179 @@ static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
 
 /* ------------------------------------------------------------- vtable */
 
-/* ------------------------------------------------------- doc migration */
+/* --------------------------------------------------- format migration */
+
+/* The primary key's columns, already quoted, as an ALTER can spell them. */
+static int my_pk_cols(MYSQL *db, const char *table, char *out, size_t cap) {
+    char q[800], esc[300];
+    mysql_real_escape_string(db, esc, table, (unsigned long)strlen(table));
+    snprintf(q, sizeof q,
+             "SELECT column_name FROM information_schema.statistics "
+             "WHERE table_schema = DATABASE() AND table_name = '%s' "
+             "AND index_name = 'PRIMARY' ORDER BY seq_in_index", esc);
+    out[0] = '\0';
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(db);
+    if (!r) return 0;
+    size_t p = 0;
+    int n = 0;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(r))) {
+        if (!row[0]) continue;
+        char qc[300];
+        quote_ident(row[0], qc, sizeof qc);
+        p += (size_t)snprintf(out + p, cap - p, "%s%s", n ? ", " : "", qc);
+        n++;
+        if (p >= cap) break;
+    }
+    mysql_free_result(r);
+    return n;
+}
+
+/* Convert one table's binary `id' into the text form -- or re-spell a text
+   one that was written for a different character set (#236).
+ *
+ * MySQL has no transform clause, so this is add-populate-swap: a helper
+ * column, one UPDATE per distinct id, a check that every row got one, and
+ * then a single ALTER that drops the old column, renames the helper into its
+ * place and puts the primary key back exactly as it was.  Doing the swap in
+ * ONE statement matters because MySQL commits each DDL statement on its own:
+ * a table is never left without its key.
+ *
+ * The old bytes come back through CONVERT(... USING <old charset>), which is
+ * MySQL's own inverse of the conversion a reload did -- so the recovery is
+ * exact rather than a guess, and it fails loudly when a character has no
+ * spelling in the old set, which is the one case that cannot be undone. */
+static int my_ids_to_text(MYSQL *db, const char *table, const char *qt,
+                          int from_binary, const char *oldenc, char *err,
+                          size_t errlen) {
+    char idt[160], sql[1200];
+    my_id_coltype(db, idt, sizeof idt);
+
+    snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN `mvx_idt`", qt);
+    mysql_query(db, sql);                 /* leftovers from a failed run */
+    snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN `mvx_idt` %s NULL",
+             qt, idt);
+    if (mysql_query(db, sql) != 0) {
+        snprintf(err, errlen, "mysql: %s: %s", table, mysql_error(db));
+        return 0;
+    }
+
+    if (from_binary)
+        snprintf(sql, sizeof sql, "SELECT DISTINCT id, id FROM %s", qt);
+    else {
+        char esc[160];
+        mysql_real_escape_string(db, esc, oldenc && *oldenc ? oldenc : "binary",
+                                 (unsigned long)strlen(oldenc && *oldenc
+                                                       ? oldenc : "binary"));
+        snprintf(sql, sizeof sql,
+                 "SELECT DISTINCT id, CAST(CONVERT(id USING %s) AS BINARY) "
+                 "FROM %s", esc, qt);
+    }
+    if (mysql_query(db, sql) != 0) {
+        snprintf(err, errlen,
+                 "mysql: %s: the record ids cannot be read back as %s (%s).  "
+                 "They were written for a different character set and at "
+                 "least one of them has no spelling in it.",
+                 table, oldenc && *oldenc ? oldenc : "themselves",
+                 mysql_error(db));
+        return 0;
+    }
+    MYSQL_RES *rows = mysql_store_result(db);
+    if (!rows) {
+        snprintf(err, errlen, "mysql: %s: %s", table, mysql_error(db));
+        return 0;
+    }
+    snprintf(sql, sizeof sql,
+             "UPDATE %s SET `mvx_idt` = ? WHERE id = ?", qt);
+    int failed = 0;
+    MYSQL_ROW row;
+    while (!failed && (row = mysql_fetch_row(rows))) {
+        unsigned long *lens = mysql_fetch_lengths(rows);
+        if (!row[0] || !row[1]) continue;
+        /* Back to the bytes the id really is: the old spelling (row[1] is
+           already transcoded back), then the percent-decode, which is one
+           operation whatever character set wrote it.  Skipping the decode
+           would re-escape an id that is already escaped -- `%25' becoming
+           `%2525' -- so it has to happen even though the value looks like
+           plain text. */
+        int64_t wl = (int64_t)(lens ? lens[1] : 0);
+        char rawbuf[512], *raw = rawbuf;
+        int64_t rawlen = wl;
+        if (!from_binary) {
+            if ((size_t)wl + 1 > sizeof rawbuf) raw = malloc((size_t)wl + 1);
+            if (!raw) { failed = 1; break; }
+            rawlen = mvx_id_decode(row[1], wl, raw, (size_t)wl + 1);
+            if (rawlen < 0) { if (raw != rawbuf) free(raw); failed = 1; break; }
+        } else {
+            raw = row[1];
+        }
+        char stack[512];
+        char *txt = my_id_text(db, raw, rawlen, stack, sizeof stack);
+        if (raw != rawbuf && raw != row[1]) free(raw);
+        if (!txt) { failed = 1; break; }
+        MYSQL_STMT *st = mysql_stmt_init(db);
+        if (st && mysql_stmt_prepare(st, sql, (unsigned long)strlen(sql)) == 0) {
+            MYSQL_BIND b[2];
+            unsigned long tl = (unsigned long)strlen(txt);
+            unsigned long kl = lens ? lens[0] : 0;
+            memset(b, 0, sizeof b);
+            b[0].buffer_type = MYSQL_TYPE_STRING;
+            b[0].buffer = txt; b[0].buffer_length = tl; b[0].length = &tl;
+            b[1].buffer_type = from_binary ? MYSQL_TYPE_BLOB
+                                           : MYSQL_TYPE_STRING;
+            b[1].buffer = (void *)row[0];
+            b[1].buffer_length = kl; b[1].length = &kl;
+            mysql_stmt_bind_param(st, b);
+            if (mysql_stmt_execute(st) != 0) failed = 1;
+        } else failed = 1;
+        if (st) mysql_stmt_close(st);
+        my_id_free(txt, stack);
+    }
+    mysql_free_result(rows);
+
+    /* PROVE EVERY ROW GOT ONE BEFORE DROPPING THE OLD COLUMN. */
+    if (!failed) {
+        snprintf(sql, sizeof sql,
+                 "SELECT COUNT(*) FROM %s WHERE `mvx_idt` IS NULL", qt);
+        long nulls = -1;
+        if (mysql_query(db, sql) == 0) {
+            MYSQL_RES *ck = mysql_store_result(db);
+            if (ck) {
+                MYSQL_ROW cr = mysql_fetch_row(ck);
+                if (cr && cr[0]) nulls = atol(cr[0]);
+                mysql_free_result(ck);
+            }
+        }
+        if (nulls != 0) {
+            snprintf(err, errlen,
+                     "mysql: %s: %ld record id(s) did not convert — left in "
+                     "the old form", table, nulls);
+            snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN `mvx_idt`", qt);
+            mysql_query(db, sql);
+            return 0;
+        }
+    }
+    if (failed) {
+        snprintf(err, errlen, "mysql: %s: %s", table, mysql_error(db));
+        snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN `mvx_idt`", qt);
+        mysql_query(db, sql);
+        return 0;
+    }
+
+    char pk[700];
+    int npk = my_pk_cols(db, table, pk, sizeof pk);
+    snprintf(sql, sizeof sql,
+             "ALTER TABLE %s %s DROP COLUMN id, "
+             "CHANGE `mvx_idt` id %s NOT NULL%s%s%s", qt,
+             npk ? "DROP PRIMARY KEY," : "", idt,
+             npk ? ", ADD PRIMARY KEY (" : "", npk ? pk : "", npk ? ")" : "");
+    if (mysql_query(db, sql) != 0) {
+        snprintf(err, errlen, "mysql: %s: %s", table, mysql_error(db));
+        return 0;
+    }
+    return 1;
+}
 
 /* Convert every pre-#157 file in this database to the document form.  Same
    shape as the other SQL drivers, different dialect: add `doc JSON`, encode
@@ -1413,12 +1779,23 @@ static int my_explain(mvx_file *fh, const mvx_pred *preds, int npred,
 static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
     MYSQL *db = my_connect(loc, err, errlen);
     if (!db) return -1;
+    const char *nowenc = my_csname(db);
+    /* Every BASE TABLE with an `id' column, and what it needs: the work is
+       found by looking for an id, not for a file, because a mapping's child
+       tables carry ids too and never appear in LISTF. */
     if (mysql_query(db,
-            "SELECT c.table_name FROM information_schema.columns c "
-            "WHERE c.table_schema = DATABASE() AND c.column_name = 'rec' "
-            "AND NOT EXISTS (SELECT 1 FROM information_schema.columns d "
-            "  WHERE d.table_schema = c.table_schema "
-            "  AND d.table_name = c.table_name AND d.column_name = 'doc') "
+            "SELECT c.table_name, "
+            "       MAX(c.column_name = 'rec'), MAX(c.column_name = 'doc'), "
+            "       MAX(c.column_name = 'id' AND c.data_type IN "
+            "           ('varbinary','binary','blob')), "
+            "       MAX(t.table_comment) "
+            "FROM information_schema.columns c "
+            "JOIN information_schema.tables t "
+            "  ON t.table_schema = c.table_schema "
+            " AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE' "
+            "WHERE c.table_schema = DATABASE() "
+            "GROUP BY c.table_name "
+            "HAVING MAX(c.column_name = 'id') = 1 "
             "ORDER BY c.table_name") != 0) {
         snprintf(err, errlen, "mysql: %s", mysql_error(db));
         return -1;
@@ -1426,32 +1803,58 @@ static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
     MYSQL_RES *lr = mysql_store_result(db);
     if (!lr) { snprintf(err, errlen, "mysql: %s", mysql_error(db)); return -1; }
     int n = (int)mysql_num_rows(lr);
-    char (*names)[128] = n ? calloc((size_t)n, sizeof *names) : NULL;
+    struct { char name[128]; char enc[64]; int docs, bin, txt; } *work =
+        n ? calloc((size_t)n, sizeof *work) : NULL;
+    char wasenc[64] = "";
     for (int i = 0; i < n; i++) {
         MYSQL_ROW row = mysql_fetch_row(lr);
-        snprintf(names[i], sizeof names[0], "%s", row && row[0] ? row[0] : "");
+        if (!row) continue;
+        snprintf(work[i].name, sizeof work[0].name, "%s", row[0] ? row[0] : "");
+        int has_rec = row[1] && atoi(row[1]);
+        int has_doc = row[2] && atoi(row[2]);
+        work[i].docs = has_rec && !has_doc;
+        work[i].bin = row[3] && atoi(row[3]);
+        my_stamp_word(row[4], "idenc=", work[i].enc, sizeof work[0].enc);
+        if (work[i].enc[0] && nowenc && *nowenc &&
+            strcmp(work[i].enc, nowenc) != 0) {
+            work[i].txt = !work[i].bin;
+            snprintf(wasenc, sizeof wasenc, "%s", work[i].enc);
+        }
     }
     mysql_free_result(lr);
+    /* EACH TABLE SAYS WHAT WROTE IT, and only the ones that disagree with the
+       database are re-spelled.  A table with no stamp was written by a
+       release that did not write one, so it can only be dated by the company
+       it keeps -- which is right for the case that produces them, a whole
+       database reloaded at once. */
+    if (wasenc[0])
+        for (int i = 0; i < n; i++)
+            if (!work[i].enc[0] && !work[i].bin) {
+                work[i].txt = 1;
+                snprintf(work[i].enc, sizeof work[0].enc, "%s", wasenc);
+            }
 
     int done = 0;
     for (int i = 0; i < n; i++) {
         char qt[300], sql[900];
-        quote_ident(names[i], qt, sizeof qt);
+        if (!work[i].docs && !work[i].bin && !work[i].txt) continue;
+        quote_ident(work[i].name, qt, sizeof qt);
         mysql_query(db, "START TRANSACTION");
+        if (!work[i].docs) goto ids;
         snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc JSON", qt);
         if (mysql_query(db, sql) != 0) {
-            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
-            mysql_query(db, "ROLLBACK"); free(names); return -1;
+            snprintf(err, errlen, "mysql: %s: %s", work[i].name, mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(work); return -1;
         }
         snprintf(sql, sizeof sql, "SELECT id, rec FROM %s", qt);
         if (mysql_query(db, sql) != 0) {
-            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
-            mysql_query(db, "ROLLBACK"); free(names); return -1;
+            snprintf(err, errlen, "mysql: %s: %s", work[i].name, mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(work); return -1;
         }
         MYSQL_RES *rows = mysql_store_result(db);
         if (!rows) {
-            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
-            mysql_query(db, "ROLLBACK"); free(names); return -1;
+            snprintf(err, errlen, "mysql: %s: %s", work[i].name, mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(work); return -1;
         }
         int rn = (int)mysql_num_rows(rows), failed = 0;
         snprintf(sql, sizeof sql, "UPDATE %s SET doc = ? WHERE id = ?", qt);
@@ -1502,27 +1905,41 @@ static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
             if (nulls != 0) {
                 snprintf(err, errlen,
                          "mysql: %s: %ld of %d record(s) did not convert — "
-                         "left in the old format", names[i], nulls, rn);
-                mysql_query(db, "ROLLBACK"); free(names); return -1;
+                         "left in the old format", work[i].name, nulls, rn);
+                mysql_query(db, "ROLLBACK"); free(work); return -1;
             }
         }
         if (!failed) {
             snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
             if (mysql_query(db, sql) != 0) failed = 1;
         }
-        if (!failed) {                    /* say what it is now (mvx#171) */
-            snprintf(sql, sizeof sql, "ALTER TABLE %s COMMENT = 'mvx: format=%d'",
-                     qt, MVX_FILE_FORMAT);
-            mysql_query(db, sql);         /* best effort: the data is converted */
-        }
         if (failed) {
-            snprintf(err, errlen, "mysql: %s: %s", names[i], mysql_error(db));
-            mysql_query(db, "ROLLBACK"); free(names); return -1;
+            snprintf(err, errlen, "mysql: %s: %s", work[i].name, mysql_error(db));
+            mysql_query(db, "ROLLBACK"); free(work); return -1;
+        }
+    ids:
+        if ((work[i].bin || work[i].txt) &&
+            !my_ids_to_text(db, work[i].name, qt, work[i].bin, work[i].enc,
+                            err, errlen)) {
+            mysql_query(db, "ROLLBACK"); free(work); return -1;
+        }
+        /* THE STAMP GOES LAST: a table that says format=3 has to actually be
+           one, or my_open would let a half-converted file through and every
+           read would miss (mvx#171, mvx#236). */
+        /* Stamp WHATEVER WAS TOUCHED, child tables included: they carry ids
+           and so they carry the encoding that spelled them.  A child left
+           with the old stamp would be re-spelled again on the next run. */
+        {
+            snprintf(sql, sizeof sql,
+                     "ALTER TABLE %s COMMENT = 'mvx: format=%d idcs=%s idenc=%s'",
+                     qt, MVX_FILE_FORMAT, mvx_id_csname(my_cs(db)),
+                     my_csname(db));
+            mysql_query(db, sql);         /* best effort: the data is converted */
         }
         mysql_query(db, "COMMIT");
         done++;
     }
-    free(names);
+    free(work);
     return done;
 }
 
