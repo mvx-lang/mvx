@@ -534,6 +534,20 @@ private:
             endStatementSoft();
             break;
         case Tok::Ident:
+            // SEND text TO port {THEN/ELSE} and MESSAGE ON|OFF|DEFER
+            // (mvx#238) — the spellings D3 uses, over the same intrinsics.
+            //
+            // CONTEXTUAL, NOT RESERVED.  `MESSAGE` is exactly the name a
+            // program would give a variable and `SEND` is not far behind, so
+            // neither becomes a keyword: each is a statement only in a shape
+            // that cannot be anything else, and stays an ordinary identifier
+            // everywhere else.  Making them keywords would break working
+            // code for the sake of two statements.
+            if (cur().text == "SEND" && sendAhead()) { s = sendStmt(); break; }
+            if (cur().text == "MESSAGE" && messageAhead()) {
+                s = messageStmt();
+                break;
+            }
             // NAME: at statement start is an alphanumeric label (distinct from
             // ':' concatenation, which only appears in expression context).  It
             // may stand alone or precede a statement on the same line, like a
@@ -794,6 +808,111 @@ private:
         if (!at(Tok::KwElse)) err("expected THEN or ELSE");
         elseClause(s);
         endStatementSoft();
+    }
+
+    // `SEND' opens a statement when an expression follows it and a TO turns
+    // up before the statement ends.  `SEND = 3', `SEND<1> = x' and `SEND(2)'
+    // are a variable being assigned or subscripted, and are left alone.
+    bool sendAhead() const {
+        switch (peek().kind) {
+        case Tok::Eq: case Tok::Lt: case Tok::LParen:
+        case Tok::Colon: case Tok::Eol: case Tok::Semi: case Tok::Eof:
+            return false;
+        default: break;
+        }
+        for (size_t k = 1; k < 64; k++)
+            switch (peek(k).kind) {
+            case Tok::KwTo: return true;
+            case Tok::Eol: case Tok::Semi: case Tok::Eof:
+            case Tok::KwThen: case Tok::KwElse: return false;
+            default: break;
+            }
+        return false;
+    }
+
+    // `MESSAGE' opens a statement only when ON, OFF or DEFER follows, which
+    // no assignment or subscript can look like.
+    bool messageAhead() const {
+        if (peek().kind == Tok::KwOn) return true;
+        return peek().kind == Tok::Ident &&
+               (peek().text == "OFF" || peek().text == "ON" ||
+                peek().text == "DEFER");
+    }
+
+    // A call to one of the messaging intrinsics, built as the expression it
+    // would have been written as.  The statements are SPELLINGS, not a second
+    // implementation: there is one path into the daemon and the privilege
+    // gate sits on it (a check the compiler emitted could be compiled around).
+    ExprP msgCall(const char *fn, std::vector<ExprP> args, int line) {
+        auto e = std::make_unique<Expr>();
+        e->kind = Expr::K::Paren;
+        e->sval = fn;
+        e->line = line;
+        e->call = true;             /* an extension call, not an array */
+        e->args = std::move(args);
+        return e;
+    }
+
+    ExprP intLit(int64_t v, int line) {
+        auto e = std::make_unique<Expr>();
+        e->kind = Expr::K::IntLit;
+        e->ival = v;
+        e->line = line;
+        return e;
+    }
+
+    ExprP strLit(const std::string &v, int line) {
+        auto e = std::make_unique<Expr>();
+        e->kind = Expr::K::StrLit;
+        e->sval = v;
+        e->line = line;
+        return e;
+    }
+
+    // SEND text TO port {THEN ... ELSE ...}
+    //
+    // A PORT, as D3 spelled it -- `!7' is the classic target and the daemon
+    // resolves it against the roster.  A user or an account is MSGSEND's
+    // business; widening the statement would only make two ways to say one
+    // thing.  The value is the delivered count, so THEN means it reached
+    // somebody and ELSE means that port is not logged on.
+    StmtP sendStmt() {
+        int line = advance().line;                  // SEND
+        ExprP text = expression();
+        expect(Tok::KwTo, "TO after the message text in SEND");
+        ExprP port = expression();
+        std::vector<ExprP> args;
+        args.push_back(bin(BinOp::Cat, strLit("!", line), std::move(port),
+                           line));
+        args.push_back(std::move(text));
+        auto s = mk(Stmt::K::If);
+        s->line = line;
+        // `> 0', NOT the bare count.  MSGSEND answers -1 for denied and -2
+        // for no transport, and both are TRUE to an MV IF -- so a bare
+        // condition would take THEN on a message that went nowhere, which is
+        // the one answer the statement exists to distinguish.
+        s->cond = bin(BinOp::Gt,
+                      msgCall("MSGSEND", std::move(args), line),
+                      intLit(0, line), line);
+        if (at(Tok::KwThen) || at(Tok::KwElse)) thenElse(*s);
+        else endStatementSoft();                    // a bare send is fine
+        return s;
+    }
+
+    // MESSAGE ON | OFF | DEFER — the mode this session wants arriving
+    // messages handled with.  An IF whose arms are empty: the call has to
+    // happen and its answer (the previous mode) has nowhere to go.
+    StmtP messageStmt() {
+        int line = advance().line;                  // MESSAGE
+        std::string mode = at(Tok::KwOn) ? (advance(), std::string("ON"))
+                                         : advance().text;
+        std::vector<ExprP> args;
+        args.push_back(strLit(mode, line));
+        auto s = mk(Stmt::K::If);
+        s->line = line;
+        s->cond = msgCall("MSGMODE", std::move(args), line);
+        endStatementSoft();
+        return s;
     }
 
     StmtP ifStmt() {

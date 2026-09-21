@@ -1,0 +1,13 @@
+port=1
+send-then=yes
+send-void=no
+pending after three sends=2
+muted send=1 pending=2
+mode restored=ON
+still a variable / so is this
+with payload=1
+attached: file=ORDERS id=O1234 mode=view
+  free positions are empty: []
+payloads seen=1
+drained=0
+plain payload=[] text=plain

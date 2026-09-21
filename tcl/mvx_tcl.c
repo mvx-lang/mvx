@@ -45,6 +45,8 @@
 
 #ifdef HAVE_EDITLINE
 #include <histedit.h>
+#include <poll.h>
+#include <errno.h>
 #endif
 
 
@@ -286,42 +288,6 @@ static int voc_lookup(const char *verb, char *path, size_t cap) {
  *
  * Costs nothing when no registry is running: mvx_msg_pending() answers -1
  * without talking to anything. */
-static void drain_messages(void) {
-    mv_value m;
-    mv_init(&m);
-    while (mvx_msg_pending() > 0) {
-        mvx_msg_read(&m);
-        char nb[40];
-        const char *p;
-        int64_t n = mv_val_chars(&m, nb, sizeof nb, &p);
-        if (n <= 0) break;
-        /* class \xfe port \xfe user \xfe account \xfe host \xfe sent \xfe text */
-        char buf[1024];
-        if ((size_t)n >= sizeof buf) n = (int64_t)sizeof buf - 1;
-        memcpy(buf, p, (size_t)n);
-        buf[n] = '\0';
-        char *f[9] = {0};
-        int nf = 0;
-        for (char *tok = buf; nf < 9; nf++) {
-            f[nf] = tok;
-            char *mark = strchr(tok, '\xfe');
-            if (!mark) { nf++; break; }
-            *mark = '\0';
-            tok = mark + 1;
-        }
-        long cls = nf > 1 ? strtol(f[1], NULL, 10) : 0;
-        const char *port = nf > 2 ? f[2] : "?";
-        const char *user = nf > 3 ? f[3] : "?";
-        const char *text = nf > 7 ? f[7] : "";
-        if (cls & 32)               /* signed: say who it is from */
-            printf("\n[%s] %s: %s\n", port, user, text);
-        else
-            printf("\n%s\n", text);
-        if (cls & 16) fputc('\a', stdout);   /* bell */
-        fflush(stdout);
-    }
-    mv_clear(&m);
-}
 
 static int run_verb(const char *path, const char *line) {
     pid_t pid = fork();
@@ -498,7 +464,160 @@ static char *el_prompt(EditLine *e) {   /* libedit asks for the prompt */
     return p;
 }
 static EditLine *g_el;                /* .R needs to type INTO the next prompt */
+static int g_recalled;                /* a stack entry is waiting in the line */
 #endif
+
+/* AN ATTACHED RECORD IS AN OFFER, NOT AN INSTRUCTION (mvx#238).
+ *
+ * Attribute 9 of a message carries, by value mark: file, id, program, mode.
+ * Positions 5 and beyond are free for an application; the shell reads the
+ * four it knows and ignores the rest, which is what lets the convention grow
+ * without every reader having to be taught first.
+ *
+ * What the shell does with it is PUT THE COMMAND ON THE STACK and say so.
+ * The record opens when the person at the terminal recalls it and presses
+ * return -- never because a message arrived.  That distinction is the whole
+ * design: a sender can hand you a screen, and cannot take yours. */
+static void msg_offer(const char *payload) {
+    if (!payload || !payload[0]) return;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", payload);
+    char *v[8] = {0};
+    int nv = 0;
+    for (char *tok = buf; nv < 8; nv++) {
+        v[nv] = tok;
+        char *mark = strchr(tok, '\xfd');       /* value mark */
+        if (!mark) { nv++; break; }
+        *mark = '\0';
+        tok = mark + 1;
+    }
+    const char *file = nv > 0 ? v[0] : "";
+    const char *id = nv > 1 ? v[1] : "";
+    const char *prog = nv > 2 ? v[2] : "";
+    const char *mode = nv > 3 ? v[3] : "";
+    if (!file[0] || !id[0]) return;             /* nothing openable */
+
+    /* The sender says what it is FOR, and the verb follows from that: CT to
+       look at a record, ED to change one.  A named program wins -- an
+       application knows its own screens better than the shell does. */
+    char cmd[1024];
+    if (prog[0])
+        snprintf(cmd, sizeof cmd, "%s %s %s", prog, file, id);
+    else if (strcmp(mode, "edit") == 0)
+        snprintf(cmd, sizeof cmd, "ED %s %s", file, id);
+    else
+        snprintf(cmd, sizeof cmd, "CT %s %s", file, id);
+
+    stack_push(cmd);
+    printf("     attached: %s %s — on the stack as \"%s\"", file, id, cmd);
+#ifdef HAVE_EDITLINE
+    if (g_el && isatty(0)) printf(" (.1 to recall)");
+#endif
+    printf("\n");
+}
+
+/* How long the prompt waits before looking in its inbox.  Short enough that
+   an arriving message feels immediate, long enough that an idle shell is not
+   doing anything worth measuring -- one PEEK over a unix socket per tick, and
+   only while a session is actually registered. */
+#define MSG_POLL_MS 250
+
+static void drain_messages(void);
+
+#ifdef HAVE_EDITLINE
+/* Read a line, and let a message land ON the prompt while it is being typed
+ * (mvx#238).
+ *
+ * The drain either side of el_gets already shows a message before the prompt
+ * and after a verb; what it cannot do is show one that arrives while the
+ * operator is sitting there, because el_gets is blocked in read().  So the
+ * SHELL owns the wait: EL_UNBUFFERED hands libedit's blocking read back to
+ * us, poll() waits on the terminal with a deadline, and a tick that finds
+ * something prints it and asks the editor to redraw underneath.  A
+ * half-typed command survives -- which is the same guarantee a full-screen
+ * program gets, arrived at the same way: nothing writes to the screen except
+ * between one keystroke and the next.
+ *
+ * STILL NO SIGNAL HANDLER.  This is a deadline on a poll, not an interrupt:
+ * mv_input treats an interrupted read as EOF and read_byte cannot tell EINTR
+ * from a timeout, so a signal-driven version of this would kill programs
+ * sitting at INPUT.
+ *
+ * Pushed text (a stack recall, an M macro) goes the old way, because
+ * EL_UNBUFFERED returns after ONE character of pushback and the loop would
+ * have to know how many are left.  A recall waits for a keystroke to show a
+ * message, which is exactly when the operator is looking anyway. */
+static const char *prompt_gets(int *n, int pushed) {
+    /* START FROM BUFFERED, ALWAYS.  libedit clears the line only when
+       EL_UNBUFFERED changes, so a completed command has to be dropped before
+       the next one begins -- without this every keystroke re-submits the
+       previous line with one more character on the end. */
+    el_set(g_el, EL_UNBUFFERED, 0);
+    if (pushed || mvx_msg_port() <= 0) {
+        /* No registry, or a recall to display: libedit does its own wait. */
+        return el_gets(g_el, n);
+    }
+    el_set(g_el, EL_UNBUFFERED, 1);
+    for (;;) {
+        struct pollfd p = {0, POLLIN, 0};
+        int r = poll(&p, 1, MSG_POLL_MS);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return el_gets(g_el, n);      /* poll is broken; wait the old way */
+        }
+        if (r == 0) {                     /* idle: this is the whole point */
+            if (mvx_msg_pending() > 0) {
+                drain_messages();
+                el_set(g_el, EL_REFRESH); /* the half-typed line comes back */
+            }
+            continue;
+        }
+        const char *l = el_gets(g_el, n);
+        if (!l) return NULL;
+        /* Unbuffered: el_gets returns what it has, which is a whole line only
+           once the return key is in it. */
+        if (*n > 0 && memchr(l, '\n', (size_t)*n)) return l;
+    }
+}
+#endif
+
+static void drain_messages(void) {
+    mv_value m;
+    mv_init(&m);
+    while (mvx_msg_pending() > 0) {
+        mvx_msg_read(&m);
+        char nb[40];
+        const char *p;
+        int64_t n = mv_val_chars(&m, nb, sizeof nb, &p);
+        if (n <= 0) break;
+        /* class \xfe port \xfe user \xfe account \xfe host \xfe sent \xfe text */
+        char buf[1024];
+        if ((size_t)n >= sizeof buf) n = (int64_t)sizeof buf - 1;
+        memcpy(buf, p, (size_t)n);
+        buf[n] = '\0';
+        char *f[9] = {0};
+        int nf = 0;
+        for (char *tok = buf; nf < 9; nf++) {
+            f[nf] = tok;
+            char *mark = strchr(tok, '\xfe');
+            if (!mark) { nf++; break; }
+            *mark = '\0';
+            tok = mark + 1;
+        }
+        long cls = nf > 1 ? strtol(f[1], NULL, 10) : 0;
+        const char *port = nf > 2 ? f[2] : "?";
+        const char *user = nf > 3 ? f[3] : "?";
+        const char *text = nf > 7 ? f[7] : "";
+        if (cls & 32)               /* signed: say who it is from */
+            printf("\n[%s] %s: %s\n", port, user, text);
+        else
+            printf("\n%s\n", text);
+        if (nf > 8) msg_offer(f[8]);
+        if (cls & 16) fputc('\a', stdout);   /* bell */
+        fflush(stdout);
+    }
+    mv_clear(&m);
+}
 
 /* Offer entry i for editing.  On a terminal that means seeding the next
    prompt with it, which is what "display and allow modification" means when
@@ -514,7 +633,11 @@ static void stack_recall(int i) {
        rl_startup_hook / rl_pre_input_hook but rl_insert_text from inside
        them never reaches the line buffer.  Measured, not assumed -- which is
        why this shell drives the native API.) */
-    if (g_el && isatty(0)) { el_push(g_el, g_stack[i]); return; }
+    if (g_el && isatty(0)) {
+        el_push(g_el, g_stack[i]);
+        g_recalled = 1;               /* the next read must display it */
+        return;
+    }
 #endif
     printf("%3d %s\n", i + 1, g_stack[i]);
     fflush(stdout);
@@ -1178,11 +1301,13 @@ int main(int argc, char **argv) {
                prompt in turn so it can be edited before it goes, which is
                what the M type is for (#177). */
             drain_messages();
-            if (g_mqi < g_mqn) el_push(g_el, g_mqueue[g_mqi++]);
+            int pushed = 0;
+            if (g_mqi < g_mqn) { el_push(g_el, g_mqueue[g_mqi++]); pushed = 1; }
             else if (g_mqn) { for (int i = 0; i < g_mqn; i++) free(g_mqueue[i]);
                               g_mqn = g_mqi = 0; }
+            if (g_recalled) { pushed = 1; g_recalled = 0; }
             int eln = 0;
-            const char *l = el_gets(g_el, &eln);
+            const char *l = prompt_gets(&eln, pushed);
             if (!l || eln <= 0) break;
             snprintf(line, sizeof line, "%s", l);
             size_t ll = strlen(line);
