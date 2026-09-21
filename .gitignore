@@ -1,4 +1,5 @@
 build/
+build-rel/
 *.o
 *.dSYM/
 .DS_Store

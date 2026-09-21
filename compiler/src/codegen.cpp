@@ -643,6 +643,51 @@ private:
         return b_.CreateGEP(a.elemTy, base, idx);
     }
 
+    /* INT(a / b) for integer a and b, without the float round trip (mvx#183).
+     *
+     * sdiv truncates toward zero and so does INT(), so the two agree on every
+     * pair sdiv is defined for.  It is NOT defined for b == 0, nor for
+     * INT64_MIN / -1, where the float path yields the saturating convert's
+     * answer -- so those branch away to it and keep the result identical.
+     *
+     * The guard is not a cost in the case this exists for.  A divisor that is
+     * a literal, or a variable holding one (`CHUNK = 16' at the top of a
+     * program, which is how MV code spells a constant), folds at compile time
+     * and the branch folds with it, leaving a shift.  Only a genuinely
+     * variable divisor pays the compare, and it pays it instead of a sitofp
+     * and an fdiv. */
+    Value *intDivTrunc(const Expr &lhs, const Expr &rhs) {
+        Value *a = evalNum(lhs), *b = evalNum(rhs);
+        Value *zero = ConstantInt::get(i64Ty_, 0);
+        Value *bad = b_.CreateOr(
+            b_.CreateICmpEQ(b, zero),
+            b_.CreateAnd(b_.CreateICmpEQ(b, ConstantInt::get(i64Ty_, -1)),
+                         b_.CreateICmpEQ(a, ConstantInt::get(
+                                                i64Ty_, INT64_MIN))));
+        BasicBlock *slowBB = newBB("idiv.slow");
+        BasicBlock *fastBB = newBB("idiv.fast");
+        BasicBlock *joinBB = newBB("idiv.join");
+        b_.CreateCondBr(bad, slowBB, fastBB,
+                        MDBuilder(llctx_).createUnlikelyBranchWeights());
+
+        b_.SetInsertPoint(fastBB);
+        Value *q = b_.CreateSDiv(a, b);
+        b_.CreateBr(joinBB);
+        BasicBlock *fastEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(slowBB);
+        Value *fq = dblToI64(b_.CreateFDiv(b_.CreateSIToFP(a, dblTy_),
+                                           b_.CreateSIToFP(b, dblTy_)));
+        b_.CreateBr(joinBB);
+        BasicBlock *slowEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(joinBB);
+        PHINode *phi = b_.CreatePHI(i64Ty_, 2);
+        phi->addIncoming(q, fastEnd);
+        phi->addIncoming(fq, slowEnd);
+        return phi;
+    }
+
     Value *fpIntrinsic(Intrinsic::ID id, ArrayRef<Value *> args) {
         Function *f =
             intrinsicDecl(&mod_, id, {dblTy_});
@@ -844,8 +889,29 @@ private:
                 return dblToI64(callRt("mvx_num_system", dblTy_,
                                        {ptrTy_, dblTy_},
                                        {ctxArg_, asDbl(*e.args[0])}));
-            if (f == "INT")
-                return asI64(*e.args[0]);   // fptosi_sat truncates to zero
+            if (f == "INT") {
+                /* INT(a / b) ON INTEGERS IS AN INTEGER DIVIDE (mvx#183).
+                 *
+                 * `/' is always real division in MV -- 7/2 is 3.5 -- so Div
+                 * is NK::Dbl and the pair compiles to sitofp, fdiv, fptosi.
+                 * Wrapped in INT() that round trip is pointless: sdiv also
+                 * truncates toward zero, so the results are identical for
+                 * every integer pair, and the banked sieve computes a bank
+                 * number this way on every element it marks.
+                 *
+                 * ONLY FOR A SAFE CONSTANT DIVISOR.  sdiv by zero is
+                 * undefined in LLVM where fdiv gives infinity and the
+                 * saturating convert clamps it, and INT64_MIN / -1 overflows;
+                 * a literal that is neither leaves nothing to check for at
+                 * run time.  A variable divisor keeps the float path rather
+                 * than buy a branch in the loop to avoid one. */
+                const Expr &arg = *e.args[0];
+                if (arg.kind == Expr::K::Bin && arg.op == BinOp::Div &&
+                    num_.kindOf(*arg.lhs) == NK::Int &&
+                    num_.kindOf(*arg.rhs) == NK::Int)
+                    return intDivTrunc(*arg.lhs, *arg.rhs);
+                return asI64(arg);   // fptosi_sat truncates to zero
+            }
             if (f == "SQRT")
                 return fpIntrinsic(Intrinsic::sqrt, {asDbl(*e.args[0])});
             {
