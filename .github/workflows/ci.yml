@@ -91,3 +91,67 @@ jobs:
           # which is rate-limited per IP; runners share IPs.
           GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/test.sh
+
+  # ---- the glibc floor, guarded on every change (mvx#203) -------------------
+  # The published Linux binaries are built in a glibc 2.28 container so they
+  # run on RHEL/Rocky 8 and everything newer.  Nothing about that is visible
+  # from a normal build -- the floor is set by whatever libc links the
+  # binaries, so it rises the moment the release image does, silently, and
+  # stays invisible until somebody downloads a release onto an older host.
+  #
+  # So build the same way here and ASSERT the floor.  This is a compile and a
+  # link only: the suite runs in build-test above, on a current image, because
+  # what is being checked is the floor rather than the behaviour.
+  glibc-floor:
+    name: builds against glibc 2.28
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: Install toolchain
+        run: |
+          dnf -y install epel-release
+          dnf -y install \
+            cmake ninja-build gcc-toolset-14 \
+            "llvm-devel-${LLVM_VERSION}*" \
+            lmdb-devel libedit-devel libgit2-devel libpq-devel pkgconfig \
+            sqlite-devel \
+            zlib-devel libzstd-devel ncurses-devel git tar gzip
+          ldd --version | head -1
+          llvm-config --version
+
+      - name: Build and install
+        run: |
+          . /opt/rh/gcc-toolset-14/enable
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          cmake --install build --prefix "$PWD/stage/mvx-lang"
+
+      # AND THE DRIVER SET (mvx#203).  A missing -devel package does not fail
+      # the build: the driver is skipped with a message nobody reads, and the
+      # release ships without a backend.  sqlite shipped at all only because
+      # the Ubuntu runner image happened to carry libsqlite3-dev -- the
+      # workflow never asked for it.  Name what must be there.
+      - name: Assert the drivers that must ship
+        run: |
+          miss=
+          for d in dir lmdb lmdbnet postgres sqlite; do
+            [ -f "stage/mvx-lang/lib/libmvxdrv_$d.so" ] || miss="$miss $d"
+          done
+          ls stage/mvx-lang/lib/
+          [ -z "$miss" ] || { echo "::error::drivers missing:$miss"; exit 1; }
+
+      - name: Assert the glibc floor
+        run: |
+          max=$(objdump -T stage/mvx-lang/bin/* stage/mvx-lang/lib/*.so 2>/dev/null \
+                | grep -oE 'GLIBC_2\.[0-9]+' | sort -t. -k2 -n | tail -1)
+          echo "highest required: ${max:-none}"
+          case "${max:-GLIBC_2.0}" in
+            GLIBC_2.[0-9]|GLIBC_2.1[0-9]|GLIBC_2.2[0-8]) ;;
+            *) echo "::error::floor rose to $max; mvx#203 pins it at GLIBC_2.28"
+               exit 1 ;;
+          esac

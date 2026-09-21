@@ -102,13 +102,23 @@ jobs:
           # succeeds, and the set of machines able to run mvx quietly shrinks.
           # CI cannot catch it either: CI runs on the image that built it.
           #
-          # This does not LOWER the floor -- 24.04 is what `ubuntu-latest'
-          # already resolves to -- it stops it moving without anyone deciding.
+          # BUILT IN A glibc 2.28 CONTAINER, not on the runner's own libc
+          # (mvx#203).  The binaries link against whatever libc builds them, so
+          # building on the runner made every published tarball require
+          # GLIBC_2.38 -- which excluded Debian 12, RHEL/Rocky 8 and 9, and
+          # Ubuntu 22.04, including every MV platform VM this project tests
+          # against.  manylinux_2_28 is AlmaLinux 8: glibc 2.28, the oldest
+          # thing worth supporting, and it carries gcc-toolset-14 and
+          # llvm-devel 21 in AppStream.  The runner label still only decides
+          # the host architecture.
           - runner: ubuntu-24.04
             arch: amd64
+            image: quay.io/pypa/manylinux_2_28_x86_64
           - runner: ubuntu-24.04-arm
             arch: arm64
+            image: quay.io/pypa/manylinux_2_28_aarch64
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -120,38 +130,18 @@ jobs:
 
       - name: Install toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build gcc g++ liblmdb-dev libedit-dev \
-            libgit2-dev libpq-dev pkg-config \
-            zlib1g-dev libzstd-dev libncurses-dev \
-            wget lsb-release software-properties-common gnupg ca-certificates
-          # apt.llvm.org, WITH RETRIES.  LLVM 21 is not in Debian or Ubuntu, so
-          # this host is the only source and a release cannot avoid depending on
-          # it — but it does not have to depend on it being up at one instant.
-          # v0.1.3 failed here on llvm.sh's own key check
-          # ("GPG key not reachable at .../llvm-snapshot.gpg.key") while both
-          # binary jobs had installed the same way minutes earlier; it passed on
-          # re-run (mvx#141).  Retry the fetch, the script AND the install
-          # together: the script adds the repository, the install pulls from it,
-          # and either can be the one that cannot reach the host.
-          llvm_ok=
-          for attempt in 1 2 3 4 5; do
-            if wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
-               && chmod +x /tmp/llvm.sh \
-               && sudo /tmp/llvm.sh "${LLVM_VERSION}" \
-               && sudo apt-get install -y --no-install-recommends \
-                    "llvm-${LLVM_VERSION}-dev"; then
-              llvm_ok=1; break
-            fi
-            echo "apt.llvm.org attempt ${attempt} failed; retrying in $((attempt * 15))s"
-            sleep $((attempt * 15))
-          done
-          if [ -z "$llvm_ok" ]; then
-            echo "::error::apt.llvm.org unreachable after 5 attempts over ~4 minutes."
-            echo "::error::Nothing is wrong with the code; re-run when the host is back."
-            exit 1
-          fi
+          # AppStream carries llvm-devel 21, so apt.llvm.org is no longer in
+          # the path of a release at all.  That host was a single point of
+          # failure with a five-attempt retry loop around it, and it still took
+          # v0.1.3 down on its own key check (mvx#141).
+          dnf -y install epel-release
+          dnf -y install \
+            cmake ninja-build gcc-toolset-14 \
+            "llvm-devel-${LLVM_VERSION}*" \
+            lmdb-devel libedit-devel libgit2-devel libpq-devel pkgconfig \
+            sqlite-devel \
+            zlib-devel libzstd-devel ncurses-devel git tar gzip
+          llvm-config --version
 
       - name: Build and install
         env:
@@ -162,10 +152,40 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           MVX_INSTALL_PROMPT: never
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="/usr/lib/llvm-${LLVM_VERSION}"
+          # gcc-toolset-14 is not on PATH until its enable script is sourced;
+          # EL8's stock gcc is 8.5 and does not do C++17 well enough.
+          . /opt/rh/gcc-toolset-14/enable
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
           cmake --install build --prefix "$PWD/stage/mvx-lang"
+
+      # THE FLOOR IS AN ASSERTION, NOT A HOPE (mvx#203).  A release that
+      # quietly needed a newer libc than it claims is exactly the failure this
+      # issue is about, and it is invisible until somebody downloads it.
+      # AND THE DRIVER SET (mvx#203).  A missing -devel package does not fail
+      # the build: the driver is skipped with a message nobody reads, and the
+      # release ships without a backend.  sqlite shipped at all only because
+      # the Ubuntu runner image happened to carry libsqlite3-dev -- the
+      # workflow never asked for it.  Name what must be there.
+      - name: Assert the drivers that must ship
+        run: |
+          miss=
+          for d in dir lmdb lmdbnet postgres sqlite; do
+            [ -f "stage/mvx-lang/lib/libmvxdrv_$d.so" ] || miss="$miss $d"
+          done
+          ls stage/mvx-lang/lib/
+          [ -z "$miss" ] || { echo "::error::drivers missing:$miss"; exit 1; }
+
+      - name: Assert the glibc floor
+        run: |
+          max=$(objdump -T stage/mvx-lang/bin/* stage/mvx-lang/lib/*.so 2>/dev/null \
+                | grep -oE 'GLIBC_2\.[0-9]+' | sort -t. -k2 -n | tail -1)
+          echo "highest required: ${max:-none}"
+          case "${max:-GLIBC_2.0}" in
+            GLIBC_2.[0-9]|GLIBC_2.1[0-9]|GLIBC_2.2[0-8]) ;;
+            *) echo "::error::floor rose to $max; mvx#203 pins it at GLIBC_2.28"
+               exit 1 ;;
+          esac
 
       - name: Smoke test the install
         run: |

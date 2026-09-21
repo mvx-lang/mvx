@@ -170,6 +170,13 @@ find_library(M_LIBRARY m)
 if(M_LIBRARY)
   target_link_libraries(mvxrt PRIVATE ${M_LIBRARY})
 endif()
+# DECLARE THE dlopen DEPENDENCY (mvx#203).  The runtime dlopen's storage
+# drivers, extension libraries and cataloged subroutines.  glibc 2.34 merged
+# libdl into libc, so on anything newer this links by accident and the
+# omission is invisible; on the glibc 2.28 the release now builds against,
+# `dlopen' is in libdl and has to be asked for.  CMAKE_DL_LIBS is empty where
+# it is not needed, so this is correct everywhere rather than a special case.
+target_link_libraries(mvxrt PRIVATE ${CMAKE_DL_LIBS})
 target_compile_definitions(mvxrt PRIVATE
   MVX_VERSION="${MVX_VERSION}"
   MVX_DRIVER_DIR="${CMAKE_BINARY_DIR}/lib"
@@ -377,12 +384,15 @@ endif()
 # driver, and that is what gets an option.
 add_executable(mvx-msgd daemon/mvx_msgd.c daemon/msgdrv_loop.c)
 target_include_directories(mvx-msgd PRIVATE runtime/include)
+# It dlopen's its transport driver, and links nothing else -- see mvxrt above
+# for why the dependency has to be spelled out (mvx#203).
+target_link_libraries(mvx-msgd PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(mvx-msgd PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # --- mvx-git-adopt: adopt a plain-git checkout into a native account ----
 add_executable(mvx-git-adopt tools/mvx_git_adopt.c)
-target_link_libraries(mvx-git-adopt PRIVATE mvxrt)
+target_link_libraries(mvx-git-adopt PRIVATE mvxrt ${CMAKE_DL_LIBS})
 set_target_properties(mvx-git-adopt PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
