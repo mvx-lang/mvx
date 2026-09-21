@@ -148,6 +148,30 @@ void  mvx_ctx_store_set(mvx_ctx *ctx, void *p) { ctx->store = p; }
 mvx_ctx *mvx_ctx_create(void) {
     mvx_ctx *ctx = calloc(1, sizeof(mvx_ctx));
     if (!ctx) mvx_fatal("out of memory creating context");
+
+    /* EVERY PROGRAM IS PRESENT, whether or not it ever sends a message
+       (mvx#234).  Being logged on is not a messaging feature: WHO should
+       show a report that runs for an hour, and a message sent to that port
+       should have somewhere to go.  Registering only when a program first
+       calls MSGSEND would make the roster a list of the programs that happen
+       to use messaging.
+
+       And a program joins the session it was STARTED FROM rather than taking
+       a port of its own -- a cataloged subroutine, an EXECUTE, a verb run
+       from TCL all keep the one port, because they are one person at one
+       terminal.  mvx_msg_register() attaches when the environment carries a
+       session to attach to, and that environment is exported below for
+       whatever this program starts in turn.
+
+       Costs nothing when no registry is running: one connect() to a socket
+       that is not there. */
+    if (mvx_msg_register() > 0) {
+        char portbuf[16];
+        snprintf(portbuf, sizeof portbuf, "%lld", (long long)mvx_msg_port());
+        setenv("MVXPORT", portbuf, 1);
+        setenv("MVXMSGSESSION", mvx_msg_session_id(), 1);
+        setenv("MVXMSGTOKEN", mvx_msg_session_token(), 1);
+    }
     return ctx;
 }
 

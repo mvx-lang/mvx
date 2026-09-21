@@ -13,8 +13,11 @@
 /* mongo driver — a MultiValue file on a MongoDB collection.
  *
  * An MV record is a natural document, so each record is stored as
- * { _id: <id>, rec: <blob> } with both fields BinData, so ids and records
- * round-trip byte-exact (marks and all).  The account/namespace maps to a
+ * { _id: "<id>", doc: { … } } -- a string id that reads as the key somebody
+ * would recognise (#236) and the record as a BSON sub-document, one field per
+ * attribute (#157).  Both round-trip byte-exact, marks and all: a byte the
+ * id cannot spell in UTF-8 is percent-escaped and comes back as itself.  The
+ * account/namespace maps to a
  * database and each file to a collection.  The connection is a named profile
  * (BINDINGS `ORDERS @mongomain`, .mvx-private/connections carries
  * driver/address/namespace/user/password) — the same indirection the postgres
@@ -24,7 +27,7 @@
  * (the record blob stays authoritative; the columns are a derived projection):
  *   - relational mapping (#62) — a mapped file's dict columns are projected
  *     into native BSON fields on the same document, so a record reads as
- *     { _id, rec, CUST_NAME: "…", BALANCE: 152.34, LINES: [ {…}, … ] }:
+ *     { _id, doc, CUST_NAME: "…", BALANCE: 152.34, LINES: [ {…}, … ] }:
  *     parent columns are scalar fields, associations an embedded array of
  *     sub-documents (the Mongo-idiomatic nested form);
  *   - native indexes (#27/#62) — CREATE-INDEX builds a real Mongo index on a
@@ -145,11 +148,58 @@ static mongoc_collection_t *coll_of(mongo_file *f) {
     return mongoc_client_get_collection(f->client, f->db, f->coll);
 }
 
-/* Selector { _id: <id> } as BinData. */
+/* ------------------------------------------------------ record ids (#236) */
+
+/* An _id is a STRING now, not BinData: percent-escaped only where UTF-8
+   cannot carry the byte, so `_id' in the shell reads as the key somebody
+   would recognise instead of BinData(0, "SU5WLTIwMjYtMDAx").
+ *
+ * UTF-8 is not a choice here and there is nothing to stamp: a BSON string is
+ * defined to be UTF-8, so every backend that speaks BSON agrees, and unlike
+ * the SQL drivers there is no database-level character set that could be
+ * changed underneath the data. */
+static char *id_text(const char *id, int64_t idlen, char *stack, size_t cap) {
+    char *buf = stack;
+    if ((size_t)idlen * 3 + 1 > cap) {
+        buf = malloc((size_t)idlen * 3 + 1);
+        if (!buf) return NULL;
+        cap = (size_t)idlen * 3 + 1;
+    }
+    if (mvx_id_encode(id, idlen, MVX_ID_CS_UTF8, buf, cap) < 0) {
+        if (buf != stack) free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static void id_free(char *buf, char *stack) {
+    if (buf && buf != stack) free(buf);
+}
+
+/* The other direction: what came out of _id, back to bytes. */
+static void id_bytes(const char *txt, int64_t txtlen, mv_value *out) {
+    char stack[512], *buf = stack;
+    if ((size_t)txtlen + 1 > sizeof stack) buf = malloc((size_t)txtlen + 1);
+    if (!buf) { mv_set_str(out, "", 0); return; }
+    int64_t n = mvx_id_decode(txt, txtlen, buf, (size_t)txtlen + 1);
+    mv_set_str(out, buf, n < 0 ? 0 : n);
+    if (buf != stack) free(buf);
+}
+
+/* Append { _id: "<encoded>" } to an already-initialised document. */
+static int append_id(bson_t *b, const char *id, int64_t idlen) {
+    char stack[512];
+    char *t = id_text(id, idlen, stack, sizeof stack);
+    if (!t) return 0;
+    int ok = bson_append_utf8(b, "_id", 3, t, (int)strlen(t));
+    id_free(t, stack);
+    return ok;
+}
+
+/* Selector { _id: <id> }. */
 static void sel_id(bson_t *sel, const char *id, int64_t idlen) {
     bson_init(sel);
-    bson_append_binary(sel, "_id", 3, BSON_SUBTYPE_BINARY,
-                       (const uint8_t *)id, (uint32_t)idlen);
+    append_id(sel, id, idlen);
 }
 
 static mvx_file *mongo_open(const char *spec, char *err, size_t errlen) {
@@ -163,6 +213,37 @@ static mvx_file *mongo_open(const char *spec, char *err, size_t errlen) {
     bool exists = mongoc_database_has_collection(d, rspec, &berr);
     mongoc_database_destroy(d);
     if (!exists) return NULL;             /* not found: normal ELSE path */
+
+    /* Written before ids became text (#236): _id is still BinData.  It must
+       SAY so rather than read as an empty collection, because every key the
+       runtime sends is a string now and no document would ever match --
+       COUNT would report the documents it can see, every READ would say the
+       record is not there, and neither would look like an error. */
+    {
+        mongoc_collection_t *cc = mongoc_client_get_collection(c, db, rspec);
+        bson_t q, ty, opts;
+        bson_init(&q);
+        bson_append_document_begin(&q, "_id", 3, &ty);
+        bson_append_utf8(&ty, "$type", 5, "binData", 7);
+        bson_append_document_end(&q, &ty);
+        bson_init(&opts);
+        bson_append_int64(&opts, "limit", 5, 1);
+        mongoc_cursor_t *mc =
+            mongoc_collection_find_with_opts(cc, &q, &opts, NULL);
+        const bson_t *one;
+        int binary = mongoc_cursor_next(mc, &one) ? 1 : 0;
+        mongoc_cursor_destroy(mc);
+        bson_destroy(&opts);
+        bson_destroy(&q);
+        mongoc_collection_destroy(cc);
+        if (binary) {
+            snprintf(err, errlen,
+                     "mongo: %s stores its record ids as bytes (_id is "
+                     "BinData).  Convert it with:  "
+                     "mvx-doc-migrate mongo <connection>", rspec);
+            return NULL;
+        }
+    }
 
     mongo_file *f = calloc(1, sizeof(mongo_file));
     if (!f) mvx_fatal("out of memory opening %s", spec);
@@ -346,19 +427,17 @@ static mvx_cursor *query_ids(mongo_file *f, const bson_t *filter) {
     const bson_t *doc;
     while (mongoc_cursor_next(mc, &doc)) {
         bson_iter_t it;
-        if (!bson_iter_init_find(&it, doc, "_id") || !BSON_ITER_HOLDS_BINARY(&it))
+        if (!bson_iter_init_find(&it, doc, "_id") || !BSON_ITER_HOLDS_UTF8(&it))
             continue;
-        bson_subtype_t st;
-        uint32_t len;
-        const uint8_t *data;
-        bson_iter_binary(&it, &st, &len, &data);
+        uint32_t len = 0;
+        const char *data = bson_iter_utf8(&it, &len);
         if (c->n == c->cap) {
             c->cap = c->cap ? c->cap * 2 : 64;
             c->ids = realloc(c->ids, (size_t)c->cap * sizeof(mv_value));
             if (!c->ids) mvx_fatal("out of memory in mongo select");
         }
         mv_init(&c->ids[c->n]);
-        mv_set_str(&c->ids[c->n], (const char *)data, (int64_t)len);
+        id_bytes(data, (int64_t)len, &c->ids[c->n]);
         c->n++;
     }
     mongoc_cursor_destroy(mc);
@@ -849,6 +928,61 @@ static int mongo_migrate_docs(const char *loc, char *err, size_t errlen) {
         }
         mongoc_cursor_destroy(cur);
         bson_destroy(&filter);
+
+        /* THE ID PASS (#236).  Mongo cannot change an _id in place, so each
+           document is re-inserted under its text id and the old one deleted
+           -- in that order, because a crash between the two leaves a
+           duplicate that the next run removes, while the other order would
+           lose the record.  Re-runnable for the same reason: a document that
+           already has a text _id is not selected at all. */
+        if (!failed) {
+            bson_t idf, ty;
+            bson_init(&idf);
+            bson_append_document_begin(&idf, "_id", 3, &ty);
+            bson_append_utf8(&ty, "$type", 5, "binData", 7);
+            bson_append_document_end(&idf, &ty);
+            mongoc_cursor_t *ic =
+                mongoc_collection_find_with_opts(coll, &idf, NULL, NULL);
+            const bson_t *od;
+            while (!failed && mongoc_cursor_next(ic, &od)) {
+                bson_iter_t idit;
+                if (!bson_iter_init_find(&idit, od, "_id") ||
+                    !BSON_ITER_HOLDS_BINARY(&idit)) continue;
+                bson_subtype_t st;
+                uint32_t il = 0;
+                const uint8_t *ip = NULL;
+                bson_iter_binary(&idit, &st, &il, &ip);
+
+                bson_t nd;
+                bson_init(&nd);
+                if (!append_id(&nd, (const char *)ip, (int64_t)il)) {
+                    bson_destroy(&nd); failed = 1; break;
+                }
+                bson_iter_t cp;
+                if (bson_iter_init(&cp, od))
+                    while (bson_iter_next(&cp))
+                        if (strcmp(bson_iter_key(&cp), "_id") != 0)
+                            bson_append_value(&nd, bson_iter_key(&cp),
+                                              (int)strlen(bson_iter_key(&cp)),
+                                              bson_iter_value(&cp));
+                if (!mongoc_collection_insert_one(coll, &nd, NULL, NULL, &berr))
+                    failed = 1;
+                bson_destroy(&nd);
+                if (!failed) {
+                    bson_t osel;
+                    bson_init(&osel);
+                    bson_append_value(&osel, "_id", 3, bson_iter_value(&idit));
+                    if (!mongoc_collection_delete_one(coll, &osel, NULL, NULL,
+                                                      &berr))
+                        failed = 1;
+                    else converted++;
+                    bson_destroy(&osel);
+                }
+            }
+            mongoc_cursor_destroy(ic);
+            bson_destroy(&idf);
+        }
+
         mongoc_collection_destroy(coll);
         if (failed) {
             snprintf(err, errlen, "mongo: %s: %s", colls[i], berr.message);

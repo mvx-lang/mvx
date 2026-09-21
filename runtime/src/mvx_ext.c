@@ -119,6 +119,7 @@ static void register_builtins(void) {
     if (done) return;
     done = 1;
     register_ext(mvx_json_builtin());
+    register_ext(mvx_msg_builtin());
 }
 
 void mvx_ext_load_libs(void) {

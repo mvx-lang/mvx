@@ -371,6 +371,8 @@ typedef struct mvx_file_base {
  *
  *   1  the record is an opaque blob (pre-#157)
  *   2  the record is a JSON document, one field per attribute
+ *   3  the record id is text, percent-escaped only where the database's
+ *      character set cannot carry the byte (#236)
  *
  * Where the backend can carry a text note on the table — postgres and mysql
  * both can — the drivers stamp `mvx: format=N` there, so the database says
@@ -378,9 +380,10 @@ typedef struct mvx_file_base {
  * syntax at all (a comment written into CREATE TABLE does not survive: it
  * normalises the DDL it stores) and mongo has no collection metadata, so on
  * those the version is INFERRED from the shape — a `rec` column means 1, a
- * `doc` column means 2.  The inference is the fallback everywhere, because a
- * file created before the stamp existed has no note either. */
-#define MVX_FILE_FORMAT 2
+ * `doc` column with a binary id means 2, a text id means 3.  The inference is
+ * the fallback everywhere, because a file created before the stamp existed
+ * has no note either. */
+#define MVX_FILE_FORMAT 3
 
 #define MVX_DRIVER_ABI 14
 

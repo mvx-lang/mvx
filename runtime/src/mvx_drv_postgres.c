@@ -13,8 +13,10 @@
 /* postgres driver — a MultiValue file on a PostgreSQL table.
  *
  * Each account/namespace is a schema; each file is a table
- * (id BYTEA PRIMARY KEY, doc JSONB) in it, so records round-trip
- * byte-exact (marks and all).  The connection is a named profile
+ * (id text PRIMARY KEY, doc JSONB) in it, so records round-trip
+ * byte-exact (marks and all) AND read as themselves in psql: the id is
+ * percent-escaped only where the database's character set cannot carry the
+ * byte (#236).  The connection is a named profile
  * (BINDINGS `ORDERS @pgmain`, .mvx-private/connections carries
  * driver/address/dbname/user/password/namespace) — the same indirection
  * the lmdbnet driver uses.
@@ -120,6 +122,21 @@ static PGconn *pg_connect(const char *loc, char *schema, size_t scap,
         return NULL;
     }
     PQsetNoticeProcessor(c, noop_notice, NULL);   /* swallow NOTICEs */
+    /* Speak the database's own encoding, so no byte we send or receive is
+       transcoded on the way (mvx#236).  PGCLIENTENCODING in the environment
+       would otherwise silently re-spell every record id. */
+    {
+        const char *se = PQparameterStatus(c, "server_encoding");
+        if (se && *se) {
+            char *q = PQescapeLiteral(c, se, strlen(se));
+            if (q) {
+                char sql[160];
+                snprintf(sql, sizeof sql, "SET client_encoding TO %s", q);
+                PQclear(PQexec(c, sql));
+                PQfreemem(q);
+            }
+        }
+    }
     snprintf(g_conns[g_nconns].loc, sizeof g_conns[0].loc, "%s", loc);
     g_conns[g_nconns].conn = c;
     g_nconns++;
@@ -215,10 +232,46 @@ static void pg_num_expr(int64_t attr, char *out, size_t cap) {
    looks for `doc`), COUNT reports the rows it can see, and every READ says
    the record is not there.  Three answers about one file and no error, which
    reads as "mvx lost my data". */
+/* The character set THE DATABASE is in, which is what decides how much of an
+   id has to be escaped: on a UTF-8 database only bytes that are not valid
+   UTF-8 are escaped, on a LATIN1 or SQL_ASCII one almost nothing is.
+ *
+ * server_encoding AND NOT client_encoding.  client_encoding is a session
+ * setting that anything may change, and encoding an id against it would mean
+ * the same key hashed to two different strings in two sessions; server_encoding
+ * is fixed when the database is created and postgres has no ALTER for it.
+ * libpq caches both from the startup handshake, so this is a lookup and not a
+ * round trip.  pg_connect pins client_encoding to it, so nothing transcodes
+ * the bytes on the way in or out. */
+static int pg_cs(PGconn *c) {
+    return mvx_id_charset(PQparameterStatus(c, "server_encoding"));
+}
+
+/* One `word=value' out of the stamp comment.  Only format 3 and later carry
+   idcs/idenc; an older stamp leaves `out' empty and the caller treats the
+   file as matching, because before #236 the ids were bytes and no character
+   set applied to them. */
+static void pg_stamp_word(const char *comment, const char *key, char *out,
+                          size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    const char *m = comment ? strstr(comment, key) : NULL;
+    if (!m) return;
+    m += strlen(key);
+    size_t n = strspn(m, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                         "abcdefghijklmnopqrstuvwxyz0123456789_-");
+    if (n >= cap) n = cap - 1;
+    memcpy(out, m, n);
+    out[n] = '\0';
+}
+
 /* The stored format of `table`: the stamped comment when there is one, else
    inferred from the shape.  0 when the table does not exist / cannot be
    read. */
-static int pg_format_of(PGconn *c, const char *schema, const char *table) {
+static int pg_format_of(PGconn *c, const char *schema, const char *table,
+                        char *idcs, size_t idcap, char *idenc, size_t encap) {
+    if (idcs && idcap) idcs[0] = '\0';
+    if (idenc && encap) idenc[0] = '\0';
     const char *pv[2] = {schema, table};
     PGresult *r = PQexecParams(c,
         "SELECT obj_description((quote_ident($1)||'.'||quote_ident($2))::regclass)",
@@ -229,9 +282,27 @@ static int pg_format_of(PGconn *c, const char *schema, const char *table) {
         const char *cm = PQgetvalue(r, 0, 0);
         const char *m = strstr(cm, "mvx: format=");
         if (m) fmt = atoi(m + 12);
+        pg_stamp_word(cm, "idcs=", idcs, idcap);
+        pg_stamp_word(cm, "idenc=", idenc, encap);
     }
     if (r) PQclear(r);
     return fmt;
+}
+
+/* A file written before ids became text (#236): the `id' column is still
+   bytea.  Same reasoning as pg_is_pre157 -- it must SAY so rather than read
+   as an empty file, because every key the runtime sends is text now and no
+   row would ever match. */
+static int pg_id_is_bytea(PGconn *c, const char *schema, const char *table) {
+    const char *pv[2] = {schema, table};
+    PGresult *r = PQexecParams(c,
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_schema=$1 AND table_name=$2 AND column_name='id'",
+        2, NULL, pv, NULL, NULL, 0);
+    int bin = r && PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1 &&
+              strcmp(PQgetvalue(r, 0, 0), "bytea") == 0;
+    if (r) PQclear(r);
+    return bin;
 }
 
 static int pg_is_pre157(PGconn *c, const char *schema, const char *table) {
@@ -307,7 +378,9 @@ static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
                  PQntuples(r) == 1 && !PQgetisnull(r, 0, 0);
     if (r) PQclear(r);
     if (!exists) return NULL;             /* not found: normal ELSE path */
-    int fmt = pg_format_of(c, schema, rspec);
+    char sidcs[16], sidenc[64];
+    int fmt = pg_format_of(c, schema, rspec, sidcs, sizeof sidcs,
+                           sidenc, sizeof sidenc);
     if (fmt > MVX_FILE_FORMAT) {
         snprintf(err, errlen,
                  "postgres: %s is stored in format %d; this build understands "
@@ -315,13 +388,40 @@ static mvx_file *pg_open(const char *spec, char *err, size_t errlen) {
                  MVX_FILE_FORMAT);
         return NULL;
     }
-    if ((fmt > 0 && fmt < MVX_FILE_FORMAT) || (fmt == 0 && pg_is_pre157(c, schema, rspec))) {
+    /* Out of date, but SAY WHICH WAY -- the two conversions are different
+       work and the operator should not have to guess which one ran short. */
+    if (fmt == 1 || (fmt == 0 && pg_is_pre157(c, schema, rspec))) {
         snprintf(err, errlen,
                  "postgres: %s was written before records became documents "
                  "(it has a `rec` column and no `doc`).  Convert it with:  "
                  "mvx-doc-migrate postgres @<connection>", rspec);
         return NULL;
     }
+    if (fmt == 2 || (fmt == 0 && pg_id_is_bytea(c, schema, rspec))) {
+        snprintf(err, errlen,
+                 "postgres: %s stores its record ids as bytes (the `id` column "
+                 "is bytea).  Convert it with:  "
+                 "mvx-doc-migrate postgres @<connection>", rspec);
+        return NULL;
+    }
+    /* The ids are text, but were they spelled for THIS database?  A file
+       restored into a database with a different encoding reads back the
+       CHARACTERS it was written with and not the BYTES: postgres transcodes
+       text on the way in, so an id that was the byte 0xFD under LATIN1 is two
+       bytes under UTF-8, and every key the runtime builds from now on would
+       be spelled differently from the one on disk.  Nothing would match, and
+       "record not on file" for exactly the ids with a mark in them is the
+       worst answer available — so refuse, loudly, and name the fix. */
+    const char *nowenc = PQparameterStatus(c, "server_encoding");
+    if (sidenc[0] && nowenc && strcmp(sidenc, nowenc) != 0) {
+        snprintf(err, errlen,
+                 "postgres: %s has its record ids spelled for a %s database "
+                 "and this one is %s — the encoding changed under it.  "
+                 "Re-encode with:  mvx-doc-migrate postgres @<connection>",
+                 rspec, sidenc, nowenc);
+        return NULL;
+    }
+    (void)sidcs;
 
     pg_file *f = calloc(1, sizeof(pg_file));
     if (!f) mvx_fatal("out of memory opening %s", spec);
@@ -342,6 +442,38 @@ static void pg_close(mvx_file *fh) {
     free(f);                              /* the PGconn is pooled */
 }
 
+/* AN ID IS A TEXT PARAMETER NOW (mvx#236): percent-encoded, so `id' holds the
+   key somebody would recognise instead of \x494e562d.  Encode into `stack'
+   where it fits, else malloc -- the caller frees only what it did not own. */
+static char *id_text(PGconn *c, const char *id, int64_t idlen, char *stack,
+                     size_t cap) {
+    char *buf = stack;
+    if ((size_t)idlen * 3 + 1 > cap) {
+        buf = malloc((size_t)idlen * 3 + 1);
+        if (!buf) return NULL;
+        cap = (size_t)idlen * 3 + 1;
+    }
+    if (mvx_id_encode(id, idlen, pg_cs(c), buf, cap) < 0) {
+        if (buf != stack) free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static void id_free(char *buf, char *stack) {
+    if (buf && buf != stack) free(buf);
+}
+
+/* The other direction: what came out of the id column, back to bytes. */
+static void id_bytes(const char *txt, int64_t txtlen, mv_value *out) {
+    char stack[512], *buf = stack;
+    if ((size_t)txtlen + 1 > sizeof stack) buf = malloc((size_t)txtlen + 1);
+    if (!buf) { mv_set_str(out, "", 0); return; }
+    int64_t n = mvx_id_decode(txt, txtlen, buf, (size_t)txtlen + 1);
+    mv_set_str(out, buf, n < 0 ? 0 : n);
+    if (buf != stack) free(buf);
+}
+
 static int pg_read(mvx_file *fh, const char *id, int64_t idlen,
                    mv_value *rec) {
     pg_file *f = (pg_file *)fh;
@@ -349,12 +481,16 @@ static int pg_read(mvx_file *fh, const char *id, int64_t idlen,
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
     char sql[640];
     snprintf(sql, sizeof sql, "SELECT doc::text FROM %s WHERE id=$1", qt);
-    const char *pv[1] = {id};
-    int pl[1] = {(int)idlen};
-    int pf[1] = {1};                      /* binary id */
+    char idb[512];
+    char *idp = id_text(f->conn, id, idlen, idb, sizeof idb);
+    if (!idp) return 0;
+    const char *pv[1] = {idp};
+    int pl[1] = {0};
+    int pf[1] = {0};                      /* text id */
     /* Result in TEXT: jsonb has no useful binary wire form for us, and the
        document is text anyway. */
     PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 0);
+    id_free(idp, idb);
     int ok = r && PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1;
     if (ok) {
         mv_value doc;
@@ -387,10 +523,14 @@ static int pg_write(mvx_file *fh, const char *id, int64_t idlen,
        valid UTF-8 by construction — a value whose bytes are not get wrapped as
        base64 — which is what makes jsonb usable at all here: postgres rejects
        invalid UTF-8 in a json string outright. */
-    const char *pv[2] = {id, rp};
-    int pl[2] = {(int)idlen, (int)rl};
-    int pf[2] = {1, 0};                   /* binary id, text document */
+    char idb[512];
+    char *idp = id_text(f->conn, id, idlen, idb, sizeof idb);
+    if (!idp) { mv_clear(&doc); return 0; }
+    const char *pv[2] = {idp, rp};
+    int pl[2] = {0, (int)rl};
+    int pf[2] = {0, 0};                   /* text id, text document */
     PGresult *r = PQexecParams(f->conn, sql, 2, NULL, pv, pl, pf, 0);
+    id_free(idp, idb);
     int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
     if (r) PQclear(r);
     mv_clear(&doc);
@@ -403,10 +543,14 @@ static int pg_del(mvx_file *fh, const char *id, int64_t idlen) {
     qualify(f->conn, f->schema, f->table, qt, sizeof qt);
     char sql[640];
     snprintf(sql, sizeof sql, "DELETE FROM %s WHERE id=$1", qt);
-    const char *pv[1] = {id};
-    int pl[1] = {(int)idlen};
-    int pf[1] = {1};
+    char idb[512];
+    char *idp = id_text(f->conn, id, idlen, idb, sizeof idb);
+    if (!idp) return 0;
+    const char *pv[1] = {idp};
+    int pl[1] = {0};
+    int pf[1] = {0};
     PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 0);
+    id_free(idp, idb);
     int deleted = r && PQresultStatus(r) == PGRES_COMMAND_OK &&
                   atoi(PQcmdTuples(r)) > 0;
     if (r) PQclear(r);
@@ -585,7 +729,7 @@ static int pg_create(const char *spec, char *err, size_t errlen) {
     qualify(c, schema, rspec, qt, sizeof qt);
     char sql[700];
     snprintf(sql, sizeof sql,
-             "CREATE TABLE %s (id bytea primary key, doc jsonb)", qt);
+             "CREATE TABLE %s (id text primary key, doc jsonb)", qt);
     r = PQexec(c, sql);
     int ok = r && PQresultStatus(r) == PGRES_COMMAND_OK;
     if (ok) {
@@ -594,7 +738,9 @@ static int pg_create(const char *spec, char *err, size_t errlen) {
            file created before this existed has none (mvx#171). */
         char csql[800];
         snprintf(csql, sizeof csql,
-                 "COMMENT ON TABLE %s IS 'mvx: format=%d'", qt, MVX_FILE_FORMAT);
+                 "COMMENT ON TABLE %s IS 'mvx: format=%d idcs=%s idenc=%s'",
+                 qt, MVX_FILE_FORMAT, mvx_id_csname(pg_cs(c)),
+                 PQparameterStatus(c, "server_encoding"));
         PGresult *cr = PQexec(c, csql);
         if (cr) PQclear(cr);
     }
@@ -712,7 +858,7 @@ static int pg_map_child_ensure(mvx_file *fh, const char *assoc,
     char sql[4096];
     size_t p = 0;
     p += (size_t)snprintf(sql + p, sizeof sql - p,
-                          "CREATE TABLE IF NOT EXISTS %s (id bytea, seq int",
+                          "CREATE TABLE IF NOT EXISTS %s (id text, seq int",
                           qt);
     for (int i = 0; i < ncols && p < sizeof sql; i++) {
         char *qc = PQescapeIdentifier(f->conn, cols[i].name,
@@ -727,6 +873,19 @@ static int pg_map_child_ensure(mvx_file *fh, const char *assoc,
     if (!ok && r)
         snprintf(err, errlen, "postgres: %s", PQerrorMessage(f->conn));
     if (r) PQclear(r);
+    if (ok) {
+        /* A child table has ids in it too, so it needs the same stamp as its
+           parent (mvx#236) -- otherwise a re-spelling would have to GUESS
+           which encoding wrote it, and a guess is what this whole mechanism
+           exists to avoid. */
+        char csql[800];
+        snprintf(csql, sizeof csql,
+                 "COMMENT ON TABLE %s IS 'mvx: format=%d idcs=%s idenc=%s'",
+                 qt, MVX_FILE_FORMAT, mvx_id_csname(pg_cs(f->conn)),
+                 PQparameterStatus(f->conn, "server_encoding"));
+        PGresult *cr = PQexec(f->conn, csql);
+        if (cr) PQclear(cr);
+    }
     return ok;
 }
 
@@ -743,9 +902,12 @@ static int pg_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
     /* replace: delete the record's rows, then insert the new ones */
     char dsql[720];
     snprintf(dsql, sizeof dsql, "DELETE FROM %s WHERE id=$1", qt);
-    const char *dpv[1] = {id};
-    int dpl[1] = {(int)idlen};
-    int dpf[1] = {1};
+    char didb[512];
+    char *didp = id_text(f->conn, id, idlen, didb, sizeof didb);
+    if (!didp) { txn_end(f->conn, started, 0); return 0; }
+    const char *dpv[1] = {didp};
+    int dpl[1] = {0};
+    int dpf[1] = {0};
     PGresult *dr = PQexecParams(f->conn, dsql, 1, NULL, dpv, dpl, dpf, 0);
     int ok = dr && PQresultStatus(dr) == PGRES_COMMAND_OK;
     if (dr) PQclear(dr);
@@ -779,7 +941,7 @@ static int pg_map_child_apply(mvx_file *fh, const char *id, int64_t idlen,
         const char *pv[66];
         int pl[66], pf[66];
         if (ncols > 63) { txn_end(f->conn, started, 0); return 0; }
-        pv[0] = id; pl[0] = (int)idlen; pf[0] = 1;          /* id (binary) */
+        pv[0] = didp; pl[0] = 0; pf[0] = 0;                 /* id (text) */
         pv[1] = seqbuf; pl[1] = 0; pf[1] = 0;               /* seq (text) */
         for (int c = 0; c < ncols; c++) {
             int64_t vl = vlens[r * ncols + c];
@@ -851,9 +1013,13 @@ static int pg_map_read(mvx_file *fh, const char *id, int64_t idlen,
         if (qc) PQfreemem(qc);
     }
     snprintf(sql + p, sizeof sql - p, " FROM %s WHERE id=$1", qt);
-    const char *pv[1] = {id};
-    int pl[1] = {(int)idlen}, pf[1] = {1};
+    char idb[512];
+    char *idp = id_text(f->conn, id, idlen, idb, sizeof idb);
+    if (!idp) return -1;
+    const char *pv[1] = {idp};
+    int pl[1] = {0}, pf[1] = {0};
     PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 0);
+    id_free(idp, idb);
     if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
         if (r) PQclear(r);
         return -1;
@@ -894,9 +1060,13 @@ static int pg_map_child_read(mvx_file *fh, const char *id, int64_t idlen,
         if (qc) PQfreemem(qc);
     }
     snprintf(sql + p, sizeof sql - p, " FROM %s WHERE id=$1 ORDER BY seq", qt);
-    const char *pv[1] = {id};
-    int pl[1] = {(int)idlen}, pf[1] = {1};
+    char idb[512];
+    char *idp = id_text(f->conn, id, idlen, idb, sizeof idb);
+    if (!idp) return -1;
+    const char *pv[1] = {idp};
+    int pl[1] = {0}, pf[1] = {0};
     PGresult *r = PQexecParams(f->conn, sql, 1, NULL, pv, pl, pf, 0);
+    id_free(idp, idb);
     if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
         if (r) PQclear(r);
         return -1;
@@ -1613,123 +1783,318 @@ static int pg_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     return 1;
 }
 
-/* ------------------------------------------------------- doc migration */
+/* --------------------------------------------------- format migration */
 
-/* Convert every pre-#157 file in this schema to the document form.
+/* Convert one table's `rec' blob column into `doc' (#157).
+ *
+ * Add `doc jsonb', encode each record into it, prove every row converted,
+ * then drop `rec'.  The encode is mvx_doc_encode -- C, not something SQL can
+ * express -- so this reads every row rather than doing a clever UPDATE.  The
+ * caller owns the transaction, so an interruption leaves a file wholly in the
+ * old format. */
+static int pg_recs_to_docs(PGconn *c, const char *qt, const char *name,
+                           char *err, size_t errlen) {
+    char sql[900];
+    snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc jsonb", qt);
+    PGresult *a = PQexec(c, sql);
+    int ok = a && PQresultStatus(a) == PGRES_COMMAND_OK;
+    if (a) PQclear(a);
+    if (!ok) {
+        snprintf(err, errlen, "postgres: %s: %s", name, PQerrorMessage(c));
+        return 0;
+    }
+    snprintf(sql, sizeof sql, "SELECT id, rec FROM %s", qt);
+    PGresult *rows = PQexecParams(c, sql, 0, NULL, NULL, NULL, NULL, 1);
+    if (!rows || PQresultStatus(rows) != PGRES_TUPLES_OK) {
+        snprintf(err, errlen, "postgres: %s: %s", name, PQerrorMessage(c));
+        if (rows) PQclear(rows);
+        return 0;
+    }
+    int rn = PQntuples(rows), failed = 0;
+    snprintf(sql, sizeof sql, "UPDATE %s SET doc = $2::jsonb WHERE id = $1", qt);
+    for (int k = 0; k < rn && !failed; k++) {
+        mv_value rec, doc;
+        mv_init(&rec); mv_init(&doc);
+        mv_set_str(&rec, PQgetvalue(rows, k, 1), PQgetlength(rows, k, 1));
+        mvx_doc_encode(&doc, &rec);
+        char nb[64];
+        const char *dp;
+        int64_t dl = mv_val_chars(&doc, nb, sizeof nb, &dp);
+        const char *pv[2] = {PQgetvalue(rows, k, 0), dp};
+        int pl[2] = {PQgetlength(rows, k, 0), (int)dl};
+        /* The id is matched AS IT IS STORED, which at this point is still
+           bytea: the id conversion is a separate pass and runs after this
+           one, in the same transaction. */
+        int pf[2] = {1, 0};
+        PGresult *u = PQexecParams(c, sql, 2, NULL, pv, pl, pf, 0);
+        if (!u || PQresultStatus(u) != PGRES_COMMAND_OK ||
+            atoi(PQcmdTuples(u)) != 1)
+            failed = 1;                 /* wrote nothing: do not drop */
+        if (u) PQclear(u);
+        mv_clear(&rec); mv_clear(&doc);
+    }
+    PQclear(rows);
+    /* PROVE EVERY ROW CONVERTED BEFORE DROPPING THE OLD COLUMN.  An UPDATE
+       that matches nothing is not an error in SQL, so without this the
+       migration reports success, drops `rec', and the records are gone. */
+    if (!failed) {
+        snprintf(sql, sizeof sql,
+                 "SELECT count(*) FROM %s WHERE doc IS NULL", qt);
+        PGresult *ck = PQexec(c, sql);
+        long nulls = (ck && PQresultStatus(ck) == PGRES_TUPLES_OK &&
+                      PQntuples(ck)) ? atol(PQgetvalue(ck, 0, 0)) : -1;
+        if (ck) PQclear(ck);
+        if (nulls != 0) {
+            snprintf(err, errlen,
+                     "postgres: %s: %ld of %d record(s) did not convert — "
+                     "left in the old format", name, nulls, rn);
+            return 0;
+        }
+    }
+    if (!failed) {
+        snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
+        PGresult *d = PQexec(c, sql);
+        failed = !(d && PQresultStatus(d) == PGRES_COMMAND_OK);
+        if (d) PQclear(d);
+    }
+    if (failed) {
+        snprintf(err, errlen, "postgres: %s: %s", name, PQerrorMessage(c));
+        return 0;
+    }
+    return 1;
+}
+
+/* Convert one table's `id bytea' into the text form (#236).
+ *
+ * ONE `ALTER COLUMN ... TYPE text USING', not a drop-and-rename, because the
+ * primary key, the not-nulls and every index come with it -- a child table's
+ * PRIMARY KEY (id, seq) would otherwise have to be taken apart and put back
+ * exactly, and getting that subtly wrong is how a migration loses a
+ * constraint nobody notices for a year.
+ *
+ * The encoding is C (it depends on the database's character set), so the
+ * translation is carried in as a temporary table and the USING clause looks
+ * each id up -- THROUGH A TEMPORARY FUNCTION, because postgres rejects a bare
+ * subquery in a transform expression but is happy with one inside a function.
+ * A missing entry yields NULL, which the primary key rejects and the whole
+ * transaction rolls back: the failure mode is "nothing happened", never "half
+ * the ids are wrong". */
+static int pg_ids_to_text(PGconn *c, const char *qt, const char *name,
+                          int from_bytea, const char *oldenc, char *err,
+                          size_t errlen) {
+    const char *keytype = from_bytea ? "bytea" : "text";
+    const char *fn = from_bytea ? "mvx_idmap_b" : "mvx_idmap_t";
+    char ddl[512];
+    PQclear(PQexec(c, "DROP TABLE IF EXISTS pg_temp.mvx_idmap"));
+    snprintf(ddl, sizeof ddl,
+             "CREATE TEMP TABLE mvx_idmap (b %s primary key, t text not null)",
+             keytype);
+    PGresult *t = PQexec(c, ddl);
+    int ok = t && PQresultStatus(t) == PGRES_COMMAND_OK;
+    if (t) PQclear(t);
+    if (ok) {
+        snprintf(ddl, sizeof ddl,
+                 "CREATE OR REPLACE FUNCTION pg_temp.%s(%s) RETURNS text AS "
+                 "'SELECT t FROM pg_temp.mvx_idmap WHERE b = $1' "
+                 "LANGUAGE sql STABLE", fn, keytype);
+        PGresult *fr = PQexec(c, ddl);
+        ok = fr && PQresultStatus(fr) == PGRES_COMMAND_OK;
+        if (fr) PQclear(fr);
+    }
+    if (!ok) {
+        snprintf(err, errlen, "postgres: %s: %s", name, PQerrorMessage(c));
+        return 0;
+    }
+
+    /* Two columns for a re-spelling: the id AS STORED, which is the map's
+       key, and the id TRANSCODED BACK to the encoding it was written in,
+       which is what the bytes originally were.  convert_to is postgres's own
+       inverse of the conversion the restore did, so the recovery is exact
+       rather than a guess -- and it raises if a character has no spelling in
+       the old encoding, which is the one case that genuinely cannot be
+       undone and must be reported instead of approximated. */
+    char sql[900];
+    if (from_bytea)
+        snprintf(sql, sizeof sql, "SELECT DISTINCT id, id FROM %s", qt);
+    else if (oldenc && *oldenc) {
+        char *q = PQescapeLiteral(c, oldenc, strlen(oldenc));
+        if (!q) { snprintf(err, errlen, "postgres: out of memory"); return 0; }
+        snprintf(sql, sizeof sql,
+                 "SELECT DISTINCT id, convert_to(id, %s) FROM %s", q, qt);
+        PQfreemem(q);
+    } else
+        snprintf(sql, sizeof sql,
+                 "SELECT DISTINCT id, convert_to(id, current_setting("
+                 "'server_encoding')) FROM %s", qt);
+    PGresult *rows = PQexecParams(c, sql, 0, NULL, NULL, NULL, NULL, 1);
+    if (!rows || PQresultStatus(rows) != PGRES_TUPLES_OK) {
+        snprintf(err, errlen,
+                 "postgres: %s: the record ids cannot be read back as %s "
+                 "(%s).  They were written for a different encoding and at "
+                 "least one of them has no spelling in it.", name,
+                 oldenc && *oldenc ? oldenc : "themselves",
+                 PQerrorMessage(c));
+        if (rows) PQclear(rows);
+        return 0;
+    }
+    int rn = PQntuples(rows), failed = 0;
+    for (int k = 0; k < rn && !failed; k++) {
+        if (PQgetisnull(rows, k, 0)) continue;
+        const char *stored = PQgetvalue(rows, k, 0);
+        int storedlen = PQgetlength(rows, k, 0);
+        const char *was = PQgetvalue(rows, k, 1);
+        int waslen = PQgetlength(rows, k, 1);
+        /* Back to the bytes the id really is: the old spelling, then the
+           percent-decode, which is one operation whatever character set wrote
+           it.  That is why a changed encoding costs a re-spelling and never a
+           lost key. */
+        char rawbuf[512], *raw = rawbuf;
+        int64_t rawlen = waslen;
+        if (!from_bytea) {
+            if ((size_t)waslen + 1 > sizeof rawbuf) raw = malloc((size_t)waslen + 1);
+            if (!raw) { failed = 1; break; }
+            rawlen = mvx_id_decode(was, waslen, raw, (size_t)waslen + 1);
+            if (rawlen < 0) { if (raw != rawbuf) free(raw); failed = 1; break; }
+        } else {
+            raw = (char *)was;
+        }
+        char stack[512];
+        char *txt = id_text(c, raw, rawlen, stack, sizeof stack);
+        if (raw != rawbuf && raw != was) free(raw);
+        if (!txt) { failed = 1; break; }
+        const char *pv[2] = {stored, txt};
+        int pl[2] = {storedlen, (int)strlen(txt)};
+        int pf[2] = {from_bytea, 0};
+        PGresult *ins = PQexecParams(c,
+            "INSERT INTO mvx_idmap (b, t) VALUES ($1, $2)", 2, NULL, pv, pl,
+            pf, 0);
+        failed = !(ins && PQresultStatus(ins) == PGRES_COMMAND_OK);
+        if (ins) PQclear(ins);
+        id_free(txt, stack);
+    }
+    PQclear(rows);
+    if (!failed) {
+        snprintf(sql, sizeof sql,
+                 "ALTER TABLE %s ALTER COLUMN id TYPE text "
+                 "USING pg_temp.%s(id)", qt, fn);
+        PGresult *al = PQexec(c, sql);
+        failed = !(al && PQresultStatus(al) == PGRES_COMMAND_OK);
+        if (al) PQclear(al);
+    }
+    PQclear(PQexec(c, "DROP TABLE IF EXISTS pg_temp.mvx_idmap"));
+    if (failed) {
+        snprintf(err, errlen, "postgres: %s: %s", name, PQerrorMessage(c));
+        return 0;
+    }
+    return 1;
+}
+
+/* Bring every out-of-date file in this schema up to the current format.
  *
  * Whole-schema rather than per file: an old file cannot be opened (pg_open
  * refuses it) and LISTF does not list it, so the set of them only exists in
- * information_schema.
+ * information_schema.  Child tables have no `doc' and never appear in LISTF
+ * at all, and they carry ids too -- so the work is found by looking for an
+ * `id' column, not for a file.
  *
- * Per file: add `doc jsonb`, encode each record into it, prove every row
- * converted, then drop `rec`.  The encode is mvx_doc_encode — C, not
- * something SQL can express — so this reads every row rather than doing a
- * clever UPDATE.  One transaction per file, so an interruption leaves a file
- * wholly in the old format.  A file that already has `doc` is skipped. */
+ * One transaction per table covering BOTH passes, and THE STAMP GOES LAST:
+ * a table that says format=3 has to actually be one, or pg_open would let a
+ * half-converted file through and every read would miss. */
 static int pg_migrate_docs(const char *loc, char *err, size_t errlen) {
     char schema[128];
     PGconn *c = pg_connect(loc, schema, sizeof schema, err, errlen);
     if (!c) return -1;
 
+    const char *nowenc = PQparameterStatus(c, "server_encoding");
     const char *sv[1] = {schema};
     PGresult *r = PQexecParams(c,
-        "SELECT table_name FROM information_schema.columns c "
-        "WHERE table_schema=$1 AND column_name='rec' "
-        "AND NOT EXISTS (SELECT 1 FROM information_schema.columns d "
-        "                WHERE d.table_schema=c.table_schema "
-        "                AND d.table_name=c.table_name AND d.column_name='doc') "
-        "ORDER BY table_name", 1, NULL, sv, NULL, NULL, 0);
+        "SELECT c.table_name, "
+        "       bool_or(c.column_name='rec') AND NOT bool_or(c.column_name='doc'), "
+        "       bool_or(c.column_name='id' AND c.data_type='bytea'), "
+        "       bool_or(c.column_name='doc'), "
+        "       obj_description((quote_ident(c.table_schema)||'.'||"
+        "                        quote_ident(c.table_name))::regclass) "
+        "FROM information_schema.columns c "
+        "JOIN information_schema.tables t "
+        "  ON t.table_schema=c.table_schema AND t.table_name=c.table_name "
+        " AND t.table_type='BASE TABLE' "
+        "WHERE c.table_schema=$1 "
+        "GROUP BY c.table_schema, c.table_name "
+        "HAVING bool_or(c.column_name='id') "
+        "ORDER BY c.table_name", 1, NULL, sv, NULL, NULL, 0);
     if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
         snprintf(err, errlen, "postgres: %s", PQerrorMessage(c));
         if (r) PQclear(r);
         return -1;
     }
     int n = PQntuples(r);
-    char (*names)[128] = n ? calloc((size_t)n, sizeof *names) : NULL;
-    for (int i = 0; i < n; i++)
-        snprintf(names[i], sizeof names[0], "%s", PQgetvalue(r, i, 0));
+    struct { char name[128]; char enc[64]; int docs, bin, txt; } *work =
+        n ? calloc((size_t)n, sizeof *work) : NULL;
+    char wasenc[64] = "";
+    for (int i = 0; i < n; i++) {
+        snprintf(work[i].name, sizeof work[0].name, "%s", PQgetvalue(r, i, 0));
+        work[i].docs = PQgetvalue(r, i, 1)[0] == 't';
+        work[i].bin = PQgetvalue(r, i, 2)[0] == 't';
+        pg_stamp_word(PQgetisnull(r, i, 4) ? NULL : PQgetvalue(r, i, 4),
+                      "idenc=", work[i].enc, sizeof work[0].enc);
+        if (work[i].enc[0] && nowenc && strcmp(work[i].enc, nowenc) != 0) {
+            work[i].txt = !work[i].bin;
+            snprintf(wasenc, sizeof wasenc, "%s", work[i].enc);
+        }
+    }
     PQclear(r);
+    /* EACH TABLE SAYS WHAT WROTE IT, and only the ones that disagree with the
+       database are re-spelled -- a table already spelled correctly is left
+       completely alone, because "re-encoding it is harmless" is only true
+       when the old encoding is known, and the whole point here is that it may
+       not be the same for every table.
+     *
+     * A table with no stamp at all was written by a release that did not
+     * write one.  It can only be dated by the company it keeps, so it
+     * inherits the encoding of the tables that do say -- which is right for
+     * the case that produces them, a whole database restored at once. */
+    if (wasenc[0])
+        for (int i = 0; i < n; i++)
+            if (!work[i].enc[0] && !work[i].bin) {
+                work[i].txt = 1;
+                snprintf(work[i].enc, sizeof work[0].enc, "%s", wasenc);
+            }
 
     int done = 0;
     for (int i = 0; i < n; i++) {
         char qt[512], sql[900];
-        qualify(c, schema, names[i], qt, sizeof qt);
+        if (!work[i].docs && !work[i].bin && !work[i].txt) continue;
+        qualify(c, schema, work[i].name, qt, sizeof qt);
         PQclear(PQexec(c, "BEGIN"));
-        snprintf(sql, sizeof sql, "ALTER TABLE %s ADD COLUMN doc jsonb", qt);
-        PGresult *a = PQexec(c, sql);
-        int ok = a && PQresultStatus(a) == PGRES_COMMAND_OK;
-        if (a) PQclear(a);
-        if (!ok) {
-            snprintf(err, errlen, "postgres: %s: %s", names[i], PQerrorMessage(c));
-            PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
+        if (work[i].docs && !pg_recs_to_docs(c, qt, work[i].name, err, errlen)) {
+            PQclear(PQexec(c, "ROLLBACK")); free(work); return -1;
         }
-        snprintf(sql, sizeof sql, "SELECT id, rec FROM %s", qt);
-        PGresult *rows = PQexecParams(c, sql, 0, NULL, NULL, NULL, NULL, 1);
-        if (!rows || PQresultStatus(rows) != PGRES_TUPLES_OK) {
-            snprintf(err, errlen, "postgres: %s: %s", names[i], PQerrorMessage(c));
-            if (rows) PQclear(rows);
-            PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
+        if ((work[i].bin || work[i].txt) &&
+            !pg_ids_to_text(c, qt, work[i].name, work[i].bin, work[i].enc,
+                            err, errlen)) {
+            PQclear(PQexec(c, "ROLLBACK")); free(work); return -1;
         }
-        int rn = PQntuples(rows), failed = 0;
-        snprintf(sql, sizeof sql,
-                 "UPDATE %s SET doc = $2::jsonb WHERE id = $1", qt);
-        for (int k = 0; k < rn && !failed; k++) {
-            mv_value rec, doc;
-            mv_init(&rec); mv_init(&doc);
-            mv_set_str(&rec, PQgetvalue(rows, k, 1), PQgetlength(rows, k, 1));
-            mvx_doc_encode(&doc, &rec);
-            char nb[64];
-            const char *dp;
-            int64_t dl = mv_val_chars(&doc, nb, sizeof nb, &dp);
-            const char *pv[2] = {PQgetvalue(rows, k, 0), dp};
-            int pl[2] = {PQgetlength(rows, k, 0), (int)dl};
-            int pf[2] = {1, 0};
-            PGresult *u = PQexecParams(c, sql, 2, NULL, pv, pl, pf, 0);
-            if (!u || PQresultStatus(u) != PGRES_COMMAND_OK ||
-                atoi(PQcmdTuples(u)) != 1)
-                failed = 1;                 /* wrote nothing: do not drop */
-            if (u) PQclear(u);
-            mv_clear(&rec); mv_clear(&doc);
-        }
-        PQclear(rows);
-        /* PROVE EVERY ROW CONVERTED BEFORE DROPPING THE OLD COLUMN.  An UPDATE
-           that matches nothing is not an error in SQL, so without this the
-           migration reports success, drops `rec`, and the records are gone. */
-        if (!failed) {
+        {   /* Say what it is now (mvx#171) -- for whatever was touched,
+               child tables included: they carry ids and so they carry the
+               encoding that spelled them.  A child left with the old stamp
+               would be re-spelled again on the next run. */
             snprintf(sql, sizeof sql,
-                     "SELECT count(*) FROM %s WHERE doc IS NULL", qt);
-            PGresult *ck = PQexec(c, sql);
-            long nulls = (ck && PQresultStatus(ck) == PGRES_TUPLES_OK &&
-                          PQntuples(ck)) ? atol(PQgetvalue(ck, 0, 0)) : -1;
-            if (ck) PQclear(ck);
-            if (nulls != 0) {
-                snprintf(err, errlen,
-                         "postgres: %s: %ld of %d record(s) did not convert — "
-                         "left in the old format", names[i], nulls, rn);
-                PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
-            }
-        }
-        if (!failed) {
-            snprintf(sql, sizeof sql, "ALTER TABLE %s DROP COLUMN rec", qt);
-            PGresult *d = PQexec(c, sql);
-            failed = !(d && PQresultStatus(d) == PGRES_COMMAND_OK);
-            if (d) PQclear(d);
-        }
-        if (!failed) {                    /* say what it is now (mvx#171) */
-            snprintf(sql, sizeof sql,
-                     "COMMENT ON TABLE %s IS 'mvx: format=%d'",
-                     qt, MVX_FILE_FORMAT);
+                     "COMMENT ON TABLE %s IS 'mvx: format=%d idcs=%s idenc=%s'",
+                     qt, MVX_FILE_FORMAT, mvx_id_csname(pg_cs(c)),
+                     PQparameterStatus(c, "server_encoding"));
             PGresult *cm = PQexec(c, sql);
+            int ok = cm && PQresultStatus(cm) == PGRES_COMMAND_OK;
             if (cm) PQclear(cm);
-        }
-        if (failed) {
-            snprintf(err, errlen, "postgres: %s: %s", names[i], PQerrorMessage(c));
-            PQclear(PQexec(c, "ROLLBACK")); free(names); return -1;
+            if (!ok) {
+                snprintf(err, errlen, "postgres: %s: %s", work[i].name,
+                         PQerrorMessage(c));
+                PQclear(PQexec(c, "ROLLBACK")); free(work); return -1;
+            }
         }
         PQclear(PQexec(c, "COMMIT"));
         done++;
     }
-    free(names);
+    free(work);
     return done;
 }
 

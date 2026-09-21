@@ -114,6 +114,16 @@ int mvx_driver_available(const char *name) {
     return name && name[0] && driver_find(name) != NULL;
 }
 
+/* The driver itself, or NULL -- for a tool that wants to talk to a backend
+   without going through the store above it.  mvx-doc-migrate is the case:
+   the files it converts are in a format the store refuses to open, so it
+   drives the driver directly.  What it must NOT have is a second idea of
+   where drivers live: this is the one search, and it is the one that knows
+   about $MVXDRIVERS and about libmvxrt's own directory. */
+const mvx_driver *mvx_driver_find(const char *name) {
+    return name && name[0] ? driver_find(name) : NULL;
+}
+
 /* The drivers this host actually has, as a comma-separated list — so a prompt
    can offer real options rather than ask the user to guess a name.  Read off
    the same directories the loader searches, by their file names, since that is

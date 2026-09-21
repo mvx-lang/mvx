@@ -154,6 +154,8 @@ add_library(mvxrt SHARED
   runtime/src/mvx_perm.c
   runtime/src/mvx_cred.c
   runtime/src/mvx_conn.c
+  runtime/src/mvx_msg.c
+  runtime/src/mvx_id.c
   runtime/src/mvx_call.c
   runtime/src/mvx_term.c
   runtime/src/mvx_os.c
@@ -310,6 +312,49 @@ if(MVX_MONGO_ENABLED)
   target_link_libraries(mvxdrv_mongo PRIVATE PkgConfig::MONGOC)
 endif()
 
+# mqtt message transport (mvx#232) — gated by MVX_WITH_MQTT.  Built as its own
+# shared library, dlopen'd by mvx-msgd, so libmosquitto is linked HERE and
+# nowhere else: not into the runtime, not into the shell, not into a compiled
+# BASIC program.  Absent, messaging still works on one host through the
+# built-in loop transport.
+set(MVX_MQTT_ENABLED OFF)
+if(NOT MVX_WITH_MQTT STREQUAL "OFF")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(MOSQUITTO QUIET IMPORTED_TARGET libmosquitto)
+  endif()
+  if(NOT MOSQUITTO_FOUND)
+    find_path(MOSQUITTO_INCLUDE_DIR mosquitto.h
+      HINTS /opt/homebrew/opt/mosquitto/include /usr/local/opt/mosquitto/include)
+    find_library(MOSQUITTO_LIBRARY mosquitto
+      HINTS /opt/homebrew/opt/mosquitto/lib /usr/local/opt/mosquitto/lib)
+    if(MOSQUITTO_INCLUDE_DIR AND MOSQUITTO_LIBRARY)
+      set(MOSQUITTO_FOUND TRUE)
+    endif()
+  endif()
+  if(MOSQUITTO_FOUND)
+    set(MVX_MQTT_ENABLED ON)
+  elseif(MVX_WITH_MQTT STREQUAL "ON")
+    message(FATAL_ERROR "MVX_WITH_MQTT=ON but libmosquitto was not found")
+  else()
+    message(STATUS "libmosquitto not found, skipping the mqtt transport")
+  endif()
+endif()
+if(MVX_MQTT_ENABLED)
+  add_library(mvxmsg_mqtt SHARED runtime/src/mvx_msg_mqtt.c)
+  target_include_directories(mvxmsg_mqtt PRIVATE runtime/include)
+  set_target_properties(mvxmsg_mqtt PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib PREFIX "lib")
+  if(TARGET PkgConfig::MOSQUITTO)
+    target_link_libraries(mvxmsg_mqtt PRIVATE PkgConfig::MOSQUITTO)
+    message(STATUS "Building mqtt transport against ${MOSQUITTO_LIBRARIES}")
+  else()
+    target_include_directories(mvxmsg_mqtt PRIVATE ${MOSQUITTO_INCLUDE_DIR})
+    target_link_libraries(mvxmsg_mqtt PRIVATE ${MOSQUITTO_LIBRARY})
+    message(STATUS "Building mqtt transport against ${MOSQUITTO_LIBRARY}")
+  endif()
+endif()
+
 # --- the networked LMDB daemon (optional) ------------------------------
 if(MVX_WITH_DAEMON)
   add_executable(mvx-lmdbd daemon/mvxd.c daemon/sha256.c)
@@ -324,6 +369,16 @@ if(MVX_WITH_DAEMON)
   set_target_properties(mvx-lmdbd-admin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
+
+# --- the session registry (mvx#226) ------------------------------------
+# Not gated behind an option and not part of MVX_WITH_DAEMON: it is libc and a
+# poll loop with no third-party dependency, so it builds wherever the runtime
+# does.  A transport that needs a library arrives later as its own dlopen'd
+# driver, and that is what gets an option.
+add_executable(mvx-msgd daemon/mvx_msgd.c daemon/msgdrv_loop.c)
+target_include_directories(mvx-msgd PRIVATE runtime/include)
+set_target_properties(mvx-msgd PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # --- mvx-git-adopt: adopt a plain-git checkout into a native account ----
 add_executable(mvx-git-adopt tools/mvx_git_adopt.c)
@@ -442,13 +497,16 @@ endif()
 set_target_properties(mvx mvx-basic mvx-git-adopt PROPERTIES
   INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 
-set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt)
+set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd)
 if(MVX_WITH_DAEMON)
   list(APPEND MVX_INSTALL_BINS mvx-lmdbd mvx-lmdbd-admin)
 endif()
 install(TARGETS ${MVX_INSTALL_BINS} RUNTIME DESTINATION bin)
 
 set(MVX_INSTALL_DRIVERS mvxrt mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
+if(MVX_MQTT_ENABLED)
+  list(APPEND MVX_INSTALL_DRIVERS mvxmsg_mqtt)
+endif()
 if(MVX_POSTGRES_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxdrv_postgres)
 endif()
@@ -477,6 +535,7 @@ message(STATUS "MVX components:")
 message(STATUS "  postgres driver : ${MVX_POSTGRES_ENABLED}")
 message(STATUS "  mongo driver    : ${MVX_MONGO_ENABLED}")
 message(STATUS "  lmdbd daemon    : ${MVX_WITH_DAEMON}")
+message(STATUS "  mqtt transport  : ${MVX_MQTT_ENABLED}")
 message(STATUS "")
 
 set(MVX_SOURCE_DIR ${CMAKE_SOURCE_DIR})

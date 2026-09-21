@@ -1,0 +1,9 @@
+port=0
+state=unavailable
+port-field=0
+who=[]
+sessions=0
+send=-2
+read=[]
+dropped=0
+still running

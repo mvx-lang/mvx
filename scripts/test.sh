@@ -173,6 +173,8 @@ lang strfns world
 lang strmath
 lang ifdef
 lang equate
+# mvx#226: messaging must cost nothing when no registry is running.
+lang msg
 lang matparse
 lang include
 lang matches
@@ -2006,6 +2008,344 @@ check tcl-namespace "$( \
 kill $DPID 2>/dev/null
 rm -f "$DSOCK"
 
+# the session registry (mvx#226): ports, the roster, and the lease.  Offline
+# and deterministic -- ports are allocated lowest-free, so a fresh daemon
+# always hands out 1, 2, 3 -- and sessions are never run in parallel.
+MSOCK="/tmp/mvx-msgd-test-$$.sock"
+MACCT="$TESTROOT/macct"
+"$ROOT/scripts/mkaccount.sh" "$MACCT" >/dev/null 2>&1
+"$ROOT/build/bin/mvx-msgd" -s "$MSOCK" 2>/dev/null &
+MPID=$!
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [ -S "$MSOCK" ] && break
+  sleep 0.1
+done
+if [ ! -S "$MSOCK" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL msgd: the registry did not start"
+else
+  # A session that stays logged on while we ask about it.  Its stdin is a
+  # fifo, not a pipeline: that way $! is the SHELL's own pid and `kill -9`
+  # reaches it, which is the whole point of the lease test.  Killing a
+  # pipeline's subshell leaves the process inside it running.
+  MFIFO="$TESTROOT/mfifo"
+  mkfifo "$MFIFO" 2>/dev/null
+  sleep 30 > "$MFIFO" &
+  MSLEEP=$!
+  MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" < "$MFIFO" >/dev/null 2>&1 &
+  HOLDER=$!
+  # Wait for it to be ON the roster rather than guessing how long a shell
+  # takes to start; each probe is itself a session, and its own port is the
+  # second one, so "2" is the number that says the holder is up.
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ "$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>/dev/null | \
+         sed -n 's/^\([0-9]*\) session(s).*/\1/p')" = 2 ] && break
+    sleep 0.1
+  done
+
+  # A verb runs as a child of its shell and ATTACHes to the port the shell
+  # already holds -- it must not take a second one, or every command would
+  # log a new session on.
+  msg_who="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c WHO 2>&1 | awk '{print $1}')"
+  case "$msg_who" in
+    [0-9]*) PASS=$((PASS + 1)); echo "  WHO reports this session's port" ;;
+    *) FAIL=$((FAIL + 1)); echo "FAIL msgd: WHO gave no port: $msg_who" ;;
+  esac
+
+  msg_n="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+           sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+  if [ "$msg_n" = 2 ]; then
+    PASS=$((PASS + 1)); echo "  the roster lists both sessions"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgd: roster has [$msg_n] sessions, want 2"
+  fi
+
+  # THE LEASE.  Kill the holder outright: the daemon must drop it when the
+  # connection goes, with no cleanup step anywhere.
+  kill -9 $HOLDER 2>/dev/null
+  wait $HOLDER 2>/dev/null
+  kill $MSLEEP 2>/dev/null
+  wait $MSLEEP 2>/dev/null
+  sleep 0.5
+  msg_n2="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+            sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+  if [ "$msg_n2" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  a killed session leaves the roster by itself"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgd: after SIGKILL the roster has [$msg_n2], want 1"
+  fi
+
+  # Ports are scoped by a prefix that defaults to the ACCOUNT, so the same
+  # user has the same address wherever they logged on.
+  msg_pfx="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+             sed -n 's/.*on prefix //p')"
+  if [ "$msg_pfx" = "macct" ]; then
+    PASS=$((PASS + 1)); echo "  the port prefix defaults to the account name"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgd: prefix is [$msg_pfx], want macct"
+  fi
+
+  # ONE PERSON, ONE PORT (mvx#234).  A verb, an EXECUTE and a subroutine are
+  # not three logons: they are one thing somebody typed.  And a program that
+  # never mentions messaging is still logged on -- the roster is who is here,
+  # not who uses the feature.
+  mkdir -p "$MACCT/BP" "$MACCT/BP.DICT"
+  printf 'FILE\375dir\n' > "$MACCT/BP.DICT/%FILE%"
+  cat > "$MACCT/BP/PORTSHOW" <<'PEOF'
+PRINT "port=":@USERNO
+EXECUTE "WHO" CAPTURING OUT
+PRINT "execute=":FIELD(OUT<1>, " ", 1)
+PEOF
+  msg_ports="$(MVXMSGD="$MSOCK" MVXPRIV=developer "$TCL" -a "$MACCT" 2>&1 <<'PTCL' | grep -E '^(port|execute)=|session' | tr '\n' ' '
+CATALOG BP PORTSHOW
+PORTSHOW
+LISTU
+PTCL
+)"
+  case "$msg_ports" in
+    "port=1 execute=1 1 session(s) on prefix macct "*|"port=1 execute=1 1 session(s) on prefix macct")
+      PASS=$((PASS + 1))
+      echo "  a verb and its EXECUTE keep the session's port, and add no sessions" ;;
+    *)
+      FAIL=$((FAIL + 1))
+      echo "FAIL msgd: ports through TCL were [$msg_ports]" ;;
+  esac
+
+  # A PROGRAM THAT DIES DOES NOT LOG ANYONE OFF.  A verb's connection is an
+  # attachment, not the lease -- the shell holds that -- so a crash drops the
+  # attachment, returns to TCL, and leaves the port and the roster untouched.
+  # The person is still at their terminal; only their program is gone.
+  cat > "$MACCT/BP/BOOM" <<'BEOF'
+PRINT "port=":@USERNO
+OPEN "NOSUCHFILE" TO F ELSE PRINT "about to fail"
+READ R FROM F, "X" THEN PRINT R
+PRINT "never reached"
+BEOF
+  msg_crash="$(MVXMSGD="$MSOCK" MVXPRIV=developer "$TCL" -a "$MACCT" 2>&1 <<'CTCL' | grep -E '^(port=|never|[0-9]+ session)' | tr '\n' ' '
+CATALOG BP BOOM
+BOOM
+LISTU
+CTCL
+)"
+  case "$msg_crash" in
+    "port=1 1 session(s) on prefix macct"*)
+      PASS=$((PASS + 1))
+      echo "  a program that dies returns to TCL with its session intact" ;;
+    *)
+      FAIL=$((FAIL + 1))
+      echo "FAIL msgd: after a crash TCL saw [$msg_crash]" ;;
+  esac
+
+  # Messaging itself (mvx#228): one session, sending to itself and draining.
+  # The inbox lives in the daemon, so a receiver need not be running when a
+  # message is sent -- which is what lets this be one process and therefore
+  # deterministic.  The limiter is turned right up for the overflow case,
+  # which is a different question from whether the limiter works.
+  "$ROOT/build/bin/mvx-msgd" -s "$MSOCK.send" -r 100000 -k 100000 2>/dev/null &
+  MPID2=$!
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -S "$MSOCK.send" ] && break
+    sleep 0.1
+  done
+  if "$MVX" "$ROOT/tests/msgsend.b" -o "$TESTROOT/msgsendbin" 2>/dev/null; then
+    check msgsend "$( \
+      cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$MSOCK.send" MVXPRIV=unrestricted \
+        "$TESTROOT/msgsendbin" 2>&1 | normalise)"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgsend: did not compile"
+  fi
+
+  # THE TEST THAT PROVES THE ABSTRACTION (mvx#230).  The same scenario, run
+  # against a transport forced to admit fewer and fewer capabilities: what a
+  # program sees must not change.  A future driver for another service is
+  # correct by construction if it passes this, because the daemon has already
+  # been made to work without retained messages, without a will, and without
+  # wildcards.
+  msgcaps_same=1
+  msgcaps_want="$(cat "$EXP/msgsend.out" 2>/dev/null)"
+  for caps in "retain" "will" "loopback" "retain,will,persist,wildcard,loopback"; do
+    CSOCK="$MSOCK.caps"
+    "$ROOT/build/bin/mvx-msgd" -s "$CSOCK" -r 100000 -k 100000 \
+      -X "nocaps=$caps" 2>/dev/null &
+    CPID=$!
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ -S "$CSOCK" ] && break
+      sleep 0.1
+    done
+    got="$(cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$CSOCK" MVXPRIV=unrestricted \
+             "$TESTROOT/msgsendbin" 2>&1 | normalise)"
+    kill $CPID 2>/dev/null
+    wait $CPID 2>/dev/null
+    rm -f "$CSOCK"
+    if [ "$got" != "$msgcaps_want" ]; then
+      msgcaps_same=0
+      echo "FAIL tcl-msgcaps: delivery changed with nocaps=$caps"
+      printf '%s\n' "$got" | diff -u "$EXP/msgsend.out" - | head -10 | sed 's/^/    /'
+    fi
+  done
+  if [ "$msgcaps_same" = 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  delivery is the same whatever the transport admits to"
+  else
+    FAIL=$((FAIL + 1))
+  fi
+
+  # The verb, its addressing forms, and the gate on a wall broadcast.  A
+  # restricted session may message one port and may not message every port:
+  # the check is in the RUNTIME, so calling MSGSEND directly is refused too.
+  check tcl-msg "$( \
+    export MVXMSGD="$MSOCK.send"; \
+    MVXPRIV=unrestricted "$TCL" -a "$MACCT" -c "MSG !1 hello port one" 2>&1; \
+    MVXPRIV=unrestricted "$TCL" -a "$MACCT" -c "MSG !4000 nobody there" 2>&1; \
+    MVXPRIV=restricted "$TCL" -a "$MACCT" -c "MSG * everyone" 2>&1; \
+    MVXPRIV=unrestricted "$TCL" -a "$MACCT" -c "MSG * everyone" 2>&1; \
+    unset MVXMSGD)"
+
+  # PAYLOADS AND THE STATEMENT SPELLINGS (mvx#238).  Same shape as msgsend:
+  # one session, which sends and then drains.
+  if "$MVX" "$ROOT/tests/msgpayload.b" -o "$TESTROOT/msgpaybin" 2>/dev/null; then
+    check msgpayload "$( \
+      cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$MSOCK.send" MVXPRIV=unrestricted \
+        "$TESTROOT/msgpaybin" 2>&1 | normalise)"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL msgpayload: did not compile"
+  fi
+
+  # THE HAND-OFF, END TO END: a record attached by the verb, and the offer
+  # the receiving shell makes.  One session sending to itself -- the verb is
+  # a child that ATTACHes to the shell's port, so the message lands in the
+  # shell's inbox and the drain before the next prompt prints it.
+  #
+  # What is asserted is that the shell OFFERS: it names the record and puts a
+  # command on the stack.  Nothing opens.  A session that opened an attached
+  # record on arrival would be a way to take over somebody's terminal.
+  #
+  # The sender's name is masked, not the port: a golden file must not depend
+  # on who ran the suite.
+  cat > "$TESTROOT/attseed.b" <<'ATTEOF'
+OPEN "ORDERS" TO F ELSE STOP "no ORDERS"
+WRITE "Acme Ltd":@AM:"1500.00" ON F, "O1234"
+ATTEOF
+  "$TCL" -a "$MACCT" -c 'CREATE-FILE ORDERS' >/dev/null 2>&1
+  "$MVX" "$TESTROOT/attseed.b" -o "$TESTROOT/attseed" 2>/dev/null
+  (cd "$MACCT" && MVXACCOUNT=. "$TESTROOT/attseed" >/dev/null 2>&1)
+  check tcl-msgwith "$( \
+    export MVXMSGD="$MSOCK.send" MVXPRIV=unrestricted; \
+    printf 'MSG !1 WITH ORDERS O1234 have a look\nWHO\nOFF\n' | \
+      "$TCL" -a "$MACCT" 2>&1 | grep -E 'attached|have a look|sent to' | \
+      sed -E 's/^\[([0-9]+)\] [^:]*:/[\1] <user>:/'; \
+    "$TCL" -a "$MACCT" -c 'MSG !1 WITH ORDERS NOSUCH nope' 2>&1; \
+    "$TCL" -a "$MACCT" -c 'MSG !1 WITH NOSUCHFILE X nope' 2>&1; \
+    "$TCL" -a "$MACCT" -c 'MSG !1 WITH ORDERS' 2>&1; \
+    unset MVXMSGD MVXPRIV)"
+
+  kill $MPID2 2>/dev/null
+  wait $MPID2 2>/dev/null
+  rm -f "$MSOCK.send"
+
+  # THE BROKER TESTS ARE OPT-IN.  The suite stays network-free by default, so
+  # an offline build and a laptop without a broker both pass; CI can set
+  # MVX_TEST_MQTT=tcp://host:1883 to run the cross-host case for real.
+  if [ -n "${MVX_TEST_MQTT:-}" ] && [ -f "$ROOT/build/lib/libmvxmsg_mqtt.dylib" -o -f "$ROOT/build/lib/libmvxmsg_mqtt.so" ]; then
+    QPFX="mvxtest$$"
+    QA="$MSOCK.qa"; QB="$MSOCK.qb"
+    MVXDRIVERS="$ROOT/build/lib" "$ROOT/build/bin/mvx-msgd" -s "$QA" -t mqtt \
+      -c "$MVX_TEST_MQTT" -x "$QPFX" -b 1 2>/dev/null &
+    QPIDA=$!
+    MVXDRIVERS="$ROOT/build/lib" "$ROOT/build/bin/mvx-msgd" -s "$QB" -t mqtt \
+      -c "$MVX_TEST_MQTT" -x "$QPFX" -b 201 2>/dev/null &
+    QPIDB=$!
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ -S "$QA" ] && [ -S "$QB" ] && break
+      sleep 0.1
+    done
+    sleep 1                     # let both reach the broker
+    # Wait on the CLOCK, not on KEYIN: KEYIN does not wait when stdin is not a
+    # terminal, and the suite drives everything through pipes -- a poll loop
+    # built on it would spin through its iterations in a millisecond and
+    # report that nothing arrived.
+    cat > "$TESTROOT/qrecv.b" <<'QEOF'
+PRINT "port=":@USERNO
+DEADLINE = SYSTEM(12) + 5000
+LOOP WHILE SYSTEM(12) < DEADLINE DO
+   IF MSGPENDING() > 0 THEN
+      M = MSGREAD()
+      PRINT "received: ":M<8>
+      STOP
+   END
+REPEAT
+PRINT "received: nothing"
+QEOF
+    printf 'X = MSGSEND("*", "across the broker")
+PRINT "sent=":X
+' \
+      > "$TESTROOT/qsend.b"
+    if "$MVX" "$TESTROOT/qrecv.b" -o "$TESTROOT/qrecvbin" 2>/dev/null &&
+       "$MVX" "$TESTROOT/qsend.b" -o "$TESTROOT/qsendbin" 2>/dev/null; then
+      ( cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QB" "$TESTROOT/qrecvbin" \
+          > "$TESTROOT/qrecv.out" 2>&1 ) &
+      QRPID=$!
+      sleep 1
+      ( cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QA" MVXPRIV=unrestricted \
+          "$TESTROOT/qsendbin" >/dev/null 2>&1 )
+      wait $QRPID 2>/dev/null
+      if grep -q "received: across the broker" "$TESTROOT/qrecv.out"; then
+        PASS=$((PASS + 1)); echo "  a wall crosses hosts through the broker"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL mqtt: the other host received [$(cat "$TESTROOT/qrecv.out" | tr '\n' ' ')]"
+      fi
+
+      # PRESENCE (mvx#234): the roster spans hosts, and a daemon that is
+      # killed outright takes its sessions off every other roster -- the case
+      # a session's own lease cannot cover, because nothing is left to clear.
+      ( cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QB" "$TESTROOT/qrecvbin" \
+          >/dev/null 2>&1 ) &
+      QHOLD=$!
+      sleep 1.5
+      qroster="$(cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QA" \
+                   "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+                   sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+      if [ "${qroster:-0}" -ge 2 ]; then
+        PASS=$((PASS + 1)); echo "  the roster spans hosts"
+      else
+        FAIL=$((FAIL + 1)); echo "FAIL mqtt: host A sees [$qroster] sessions, want 2+"
+      fi
+      kill -9 $QPIDB 2>/dev/null       # the other daemon dies without tidying
+      wait $QPIDB 2>/dev/null
+      sleep 3
+      qafter="$(cd "$MACCT" && MVXACCOUNT=. MVXMSGD="$QA" \
+                  "$TCL" -a "$MACCT" -c LISTU 2>&1 | \
+                  sed -n 's/^\([0-9]*\) session(s).*/\1/p')"
+      if [ "${qafter:-9}" -lt "${qroster:-0}" ]; then
+        PASS=$((PASS + 1))
+        echo "  a dead daemon's sessions leave every roster (its will)"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL mqtt: after killing the other daemon the roster still has [$qafter]"
+      fi
+      kill -9 $QHOLD 2>/dev/null
+      wait $QHOLD 2>/dev/null
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL mqtt: the test programs did not compile"
+    fi
+    kill $QPIDA $QPIDB 2>/dev/null
+    wait $QPIDA $QPIDB 2>/dev/null
+    rm -f "$QA" "$QB"
+  else
+    echo "  (skipped the broker tests -- set MVX_TEST_MQTT=tcp://host:1883)"
+  fi
+
+  # And with the registry gone, the same commands still work.
+  kill $MPID 2>/dev/null
+  wait $MPID 2>/dev/null
+  msg_off="$(MVXMSGD="$MSOCK" "$TCL" -a "$MACCT" -c WHO 2>&1)"
+  case "$msg_off" in
+    *"$MACCT"*) PASS=$((PASS + 1)); echo "  WHO still answers with no registry running" ;;
+    *) FAIL=$((FAIL + 1)); echo "FAIL msgd: WHO broke without a registry: $msg_off" ;;
+  esac
+fi
+rm -f "$MSOCK" "$TESTROOT/mfifo"
+
 # daemon authentication: mvx-lmdbd-admin provisions a namespace token
 # (offline, into <datadir>/accounts); a client with the token in
 # .mvx-private reads/writes, a client with the wrong token is denied.
@@ -2597,10 +2937,10 @@ OEOF
       >/dev/null 2>&1
     "$TCL" -a "$VMACCT" -c 'MAP-MODE ORD native' >/dev/null 2>&1
     # external edits straight to the tables (id 'O1' = \x4f31)
-    psql_ext "UPDATE vmtest.\"ORD\" SET \"CUSTOMER\"='Beta Ltd', \"WHEN\"=DATE '2027-01-15' WHERE id='\\x4f31'" >/dev/null
-    psql_ext "UPDATE vmtest.\"ORD_ORDITEMS\" SET \"QTY\"=99 WHERE id='\\x4f31' AND seq=1" >/dev/null
-    psql_ext "INSERT INTO vmtest.\"ORD_ORDITEMS\"(id,seq,\"PRODUCT\",\"QTY\") VALUES('\\x4f31',3,'Sprocket',5)" >/dev/null
-    psql_ext "INSERT INTO vmtest.\"ORD\"(id,\"CUSTOMER\",\"WHEN\") VALUES('\\x4f39','SQL Only',DATE '2026-12-31')" >/dev/null
+    psql_ext "UPDATE vmtest.\"ORD\" SET \"CUSTOMER\"='Beta Ltd', \"WHEN\"=DATE '2027-01-15' WHERE id='O1'" >/dev/null
+    psql_ext "UPDATE vmtest.\"ORD_ORDITEMS\" SET \"QTY\"=99 WHERE id='O1' AND seq=1" >/dev/null
+    psql_ext "INSERT INTO vmtest.\"ORD_ORDITEMS\"(id,seq,\"PRODUCT\",\"QTY\") VALUES('O1',3,'Sprocket',5)" >/dev/null
+    psql_ext "INSERT INTO vmtest.\"ORD\"(id,\"CUSTOMER\",\"WHEN\") VALUES('O9','SQL Only',DATE '2026-12-31')" >/dev/null
     cat > "$TESTROOT/vmordr.b" <<'REOF'
 OPEN "ORD" TO F ELSE STOP
 READ R FROM F, "O1" THEN
@@ -2639,7 +2979,7 @@ OPTEOF
     (cd "$VMACCT" && MVXACCOUNT=. "$TESTROOT/vmoptbin")
     "$TCL" -a "$VMACCT" -c 'CREATE-MAP OPT CUSTOMER PRODUCT QTY' >/dev/null 2>&1
     xchild() { psql_ext "SELECT string_agg(xmin::text,',' ORDER BY seq) \
-                 FROM vmtest.\"OPT_OITEMS\" WHERE id='\\x5031'"; }
+                 FROM vmtest.\"OPT_OITEMS\" WHERE id='P1'"; }
     cat > "$TESTROOT/vmd1.b" <<'D1'
 OPEN "OPT" TO F ELSE STOP
 READ R FROM F, "P1" THEN R<1> = "Renamed Co"
@@ -2668,8 +3008,8 @@ D3
       "parent-only leaves children: $([ "$X0" = "$X1" ] && echo yes || echo no)" \
       "line-item rewrites children: $([ "$X1" != "$X2" ] && echo yes || echo no)" \
       "identical write no-ops: $([ "$X2" = "$X3" ] && echo yes || echo no)" \
-      "customer=$(psql_ext "SELECT \"CUSTOMER\" FROM vmtest.\"OPT\" WHERE id='\\x5031'")" \
-      "qty1=$(psql_ext "SELECT \"QTY\" FROM vmtest.\"OPT_OITEMS\" WHERE id='\\x5031' AND seq=1")")"
+      "customer=$(psql_ext "SELECT \"CUSTOMER\" FROM vmtest.\"OPT\" WHERE id='P1'")" \
+      "qty1=$(psql_ext "SELECT \"QTY\" FROM vmtest.\"OPT_OITEMS\" WHERE id='P1' AND seq=1")")"
 
     # native Postgres indexes on mapped columns (#37): CREATE-INDEX emits a
     # real SQL index and equality WITH pushes down to it — but only on an
@@ -2696,7 +3036,7 @@ CIXEOF
     IXEXISTS=$(psql_ext "SELECT count(*) FROM pg_indexes WHERE schemaname='vmtest' AND indexname='CIX_STATE_idx'")
     # push-down proof: divert C2's STATE column to NSW in SQL only (rec still
     # VIC); if C2 appears, the SQL index ran, not a rec scan.
-    psql_ext "UPDATE vmtest.\"CIX\" SET \"STATE\"='NSW' WHERE id='\\x4332'" >/dev/null
+    psql_ext "UPDATE vmtest.\"CIX\" SET \"STATE\"='NSW' WHERE id='C2'" >/dev/null
     check tcl-pgindex "$( \
       echo "STATE index exists: $IXEXISTS"; \
       echo "-- WITH STATE = NSW (index push-down, C2 diverted in SQL) --"; \
@@ -2730,7 +3070,7 @@ PDNEOF
     # STATE + CREDIT mapped; TIER left unmapped; no index created
     "$TCL" -a "$VMACCT" -c 'CREATE-MAP PDN NAME STATE CREDIT' >/dev/null 2>&1
     # divert C2's STATE column to ZZZ in SQL only (rec blob still VIC)
-    psql_ext "UPDATE vmtest.\"PDN\" SET \"STATE\"='ZZZ' WHERE id='\\x4332'" >/dev/null
+    psql_ext "UPDATE vmtest.\"PDN\" SET \"STATE\"='ZZZ' WHERE id='C2'" >/dev/null
     check tcl-pgpushdown "$( \
       echo "-- WITH STATE = ZZZ (identity column; C2 diverted in SQL) --"; \
       "$TCL" -a "$VMACCT" -c 'LIST PDN NAME STATE WITH STATE = "ZZZ"' 2>&1; \
@@ -3061,11 +3401,12 @@ WRITE "widget":@AM:990 ON F, "D1"
 SQDEOF
     "$MVX" "$TESTROOT/sqdup.b" -o "$TESTROOT/sqdup" || dupok=0
     (cd "$SQA" && MVXACCOUNT=. "$TESTROOT/sqdup" >/dev/null 2>&1)
-    # an external writer changes both columns; id is a BLOB, so CAST or the
-    # UPDATE silently matches nothing and the test measures the old value
+    # An external writer changes both columns.  The id is TEXT now (mvx#236),
+    # so this is the query anybody would write -- it needed CAST('D1' AS BLOB)
+    # when ids were raw bytes, and getting that wrong matched nothing silently.
     sqlite3 "$SQA/acct.sqlite" \
       "UPDATE \"$f\" SET \"PRICE\"=55.55, \"PRICE.RAW\"='777' \
-       WHERE id=CAST('D1' AS BLOB);" 2>/dev/null
+       WHERE id='D1';" 2>/dev/null
     ch="$(sqlite3 "$SQA/acct.sqlite" \
       "SELECT COUNT(*) FROM \"$f\" WHERE \"PRICE.RAW\"='777';" 2>/dev/null)"
     cat > "$TESTROOT/sqdupr.b" <<SQREOF
@@ -3085,6 +3426,140 @@ SQREOF
   fi
 else
   echo "  (sqlite test skipped — driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# Record ids are text, not bytes (mvx#236).
+#
+# Run against sqlite because it needs no server, but what is asserted is the
+# CONTRACT, not the backend: an id reads as itself in the database's own
+# tools, only the bytes the character set cannot carry are escaped, and
+# everything round-trips byte for byte whatever was done to it.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1 && \
+   command -v sqlite3 >/dev/null 2>&1; then
+  echo "== record ids read as themselves"
+  IDA="$TESTROOT/idacct"; mkdir -p "$IDA"
+  printf '# MVX account descriptor\nname=idacct\nversion=1\n' > "$IDA/.mvx"
+  printf '* sqlite %s/ids.sqlite\n' "$IDA" > "$IDA/BINDINGS"
+  "$TCL" -a "$IDA" -c 'CREATE-FILE KEYS' >/dev/null 2>&1
+  cat > "$TESTROOT/idw.b" <<'IDEOF'
+OPEN "KEYS" TO F ELSE STOP "no KEYS"
+* plain, a value mark, valid UTF-8, a literal percent, a trailing space
+IDS = "INV-2026-001"
+IDS<-1> = "A":CHAR(253):"B"
+IDS<-1> = "Caf":CHAR(195):CHAR(169)
+IDS<-1> = "50% OFF"
+IDS<-1> = "TRAIL "
+FOR I = 1 TO DCOUNT(IDS, @AM)
+   WRITE "row ":I ON F, IDS<I>
+NEXT I
+BAD = 0
+FOR I = 1 TO DCOUNT(IDS, @AM)
+   READ V FROM F, IDS<I> THEN
+      IF V # "row ":I THEN BAD = BAD + 1
+   END ELSE BAD = BAD + 1
+NEXT I
+PRINT "misses=":BAD
+IDEOF
+  "$MVX" "$TESTROOT/idw.b" -o "$TESTROOT/idw" 2>/dev/null
+  idrt="$(cd "$IDA" && MVXACCOUNT=. "$TESTROOT/idw" 2>&1)"
+  if [ "$idrt" = "misses=0" ]; then
+    PASS=$((PASS+1)); echo "  every id round-trips byte for byte"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL id round-trip: got '$idrt' want 'misses=0'"
+  fi
+
+  # What the DATABASE holds.  A plain id is plain; only the byte that is not
+  # UTF-8 is escaped; a literal % is %25 (which is what makes decoding
+  # unambiguous); a trailing space is %20 (a PAD SPACE collation would
+  # otherwise read "TRAIL" and "TRAIL " as one key).
+  stored="$(sqlite3 "$IDA/ids.sqlite" \
+    "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
+    2>/dev/null)"
+  want='50%25 OFF|A%FDB|Caf'$(printf '\303\251')'|INV-2026-001|TRAIL%20'
+  if [ "$stored" = "$want" ]; then
+    PASS=$((PASS+1)); echo "  only what the character set cannot carry is escaped"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL stored ids: got '$stored' want '$want'"
+  fi
+
+  types="$(sqlite3 "$IDA/ids.sqlite" \
+    "SELECT DISTINCT typeof(id) FROM KEYS;" 2>/dev/null)"
+  if [ "$types" = "text" ]; then
+    PASS=$((PASS+1)); echo "  the id column holds text"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL id storage class: got '$types' want 'text'"
+  fi
+
+  # A database written by the previous release: binary ids, and a version
+  # that does not claim otherwise.  It must be REFUSED rather than read as
+  # empty, and then converted by one documented command.
+  OLA="$TESTROOT/oldids"; mkdir -p "$OLA"
+  printf '# MVX account descriptor\nname=oldids\nversion=1\n' > "$OLA/.mvx"
+  printf '* sqlite %s/old.sqlite\n' "$OLA" > "$OLA/BINDINGS"
+  rm -f "$OLA/old.sqlite"
+  sqlite3 "$OLA/old.sqlite" \
+    "CREATE TABLE KEYS (id BLOB PRIMARY KEY, doc TEXT);
+     INSERT INTO KEYS VALUES (CAST('C1' AS BLOB), '{\"1\":\"Acme\"}');
+     INSERT INTO KEYS VALUES (x'41FD42', '{\"1\":\"Marked\"}');
+     INSERT INTO KEYS VALUES (CAST('50% OFF' AS BLOB), '{\"1\":\"Sale\"}');" \
+    2>/dev/null
+  refused="$("$TCL" -a "$OLA" -c 'COUNT KEYS' 2>&1 | head -1)"
+  case "$refused" in
+    *"stores its ids as raw bytes"*)
+      PASS=$((PASS+1)); echo "  a database with binary ids is refused, by name" ;;
+    *)
+      FAIL=$((FAIL+1)); echo "FAIL old-id refusal: got '$refused'" ;;
+  esac
+
+  # CAPTURE WHAT THE TOOL SAYS.  Sending it to /dev/null turns "the driver
+  # could not be found" into "nothing was converted", which is a far harder
+  # thing to read off a CI log -- and is exactly how this test first failed.
+  migout="$("$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" 2>&1)"
+  migrc=$?
+  conv="$(sqlite3 "$OLA/old.sqlite" \
+    "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
+    2>/dev/null)"
+  cat > "$TESTROOT/idr.b" <<'IDREOF'
+OPEN "KEYS" TO F ELSE STOP "no KEYS"
+IDS = "C1"
+IDS<-1> = "A":CHAR(253):"B"
+IDS<-1> = "50% OFF"
+OUT = ""
+FOR I = 1 TO DCOUNT(IDS, @AM)
+   READ V FROM F, IDS<I> THEN OUT := V<1>:" " ELSE OUT := "MISS "
+NEXT I
+PRINT TRIM(OUT)
+IDREOF
+  "$MVX" "$TESTROOT/idr.b" -o "$TESTROOT/idr" 2>/dev/null
+  back="$(cd "$OLA" && MVXACCOUNT=. "$TESTROOT/idr" 2>&1)"
+  if [ "$migrc" = 0 ] && [ "$conv" = '50%25 OFF|A%FDB|C1' ] && \
+     [ "$back" = "Acme Marked Sale" ]; then
+    PASS=$((PASS+1)); echo "  and one command converts it, ids intact"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL id migration: rc=$migrc stored='$conv' read='$back'"
+    echo "     mvx-doc-migrate said: $migout"
+  fi
+
+  # Re-running must be safe: the ids are already text, and encoding one that
+  # is already encoded would turn %25 into %2525.
+  rerun="$("$ROOT"/build/bin/mvx-doc-migrate sqlite "$OLA/old.sqlite" 2>&1)"
+  again="$(sqlite3 "$OLA/old.sqlite" \
+    "SELECT group_concat(id, '|') FROM (SELECT id FROM KEYS ORDER BY id);" \
+    2>/dev/null)"
+  # AND IT SAYS SO: a second run converts NOTHING, which is the difference
+  # between idempotent and merely harmless.
+  rerun0=0
+  case "$rerun" in "mvx-doc-migrate: 0 file(s) converted"*) rerun0=1 ;; esac
+  if [ "$again" = "$conv" ] && [ "$rerun0" = 1 ]; then
+    PASS=$((PASS+1)); echo "  running the conversion twice changes nothing"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL re-run: got '$again' want '$conv'; tool said: $rerun"
+  fi
+else
+  echo "  (record id tests skipped — sqlite driver or sqlite3 not available)"
 fi
 
 # mysql/mariadb backend — only when MVX_MYSQL names a reachable server, e.g.

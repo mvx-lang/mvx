@@ -74,6 +74,8 @@ const char *mvx_system_dir(void);
    files need not all live on the same one — and that is a question to ask the
    user about rather than a reason to abort.  Asking is why this exists. */
 int mvx_driver_available(const char *name);
+struct mvx_driver;
+const struct mvx_driver *mvx_driver_find(const char *name);
 
 /* The drivers this host actually has, comma-separated, so a prompt can offer
    real options instead of asking for a name the user has to guess. */
@@ -396,6 +398,44 @@ int64_t mvx_setconn(mvx_ctx *ctx, const mv_value *conn,
 void    mvx_listconn(mvx_ctx *ctx, mv_value *dst);
 int     mvx_conn_lookup(const char *conn, const char *field, char *out,
                         size_t outlen);
+
+/* --- Record ids as stored text (see mvx_id.c, mvx#236) -----------------
+   Percent-encoded: an ordinary id is itself, and only bytes that cannot be
+   text are escaped, so a database shows the keys it actually holds.  Storage
+   form only -- above the driver an id is bytes.  Size `out' at 3x+1. */
+/* Record ids are stored as text (mvx#236).  A driver asks its connection what
+   character set it is using, and only the bytes that character set cannot
+   carry are percent-escaped; see runtime/src/mvx_id.c. */
+enum {
+    MVX_ID_CS_ASCII = 0,   /* keep ASCII, escape the rest (unknown charset) */
+    MVX_ID_CS_UTF8 = 1,    /* keep valid UTF-8, escape what is not */
+    MVX_ID_CS_BYTE = 2,    /* every byte is a character; escape almost nothing */
+};
+int mvx_id_charset(const char *name);
+const char *mvx_id_csname(int cs);
+int64_t mvx_id_encode(const char *id, int64_t idlen, int cs, char *out,
+                      size_t cap);
+int64_t mvx_id_decode(const char *txt, int64_t txtlen, char *out, size_t cap);
+
+/* --- Sessions and messaging (see mvx_msg.c, mvx#226) -------------------
+   The session registry lives in mvx-msgd; every call here degrades to a
+   harmless value when there is no daemon, and none of them blocks for more
+   than a moment.  Messaging must never be able to stop a program running. */
+int         mvx_msg_register(void);      /* take a port; 0 = no registry */
+int64_t     mvx_msg_port(void);          /* @USERNO; 0 when unregistered */
+const char *mvx_msg_session_id(void);    /* "" until registered */
+const char *mvx_msg_session_token(void); /* a child ATTACHes with this */
+void        mvx_msg_bye(void);           /* graceful deregister */
+void        mvx_msg_who(mv_value *out, int64_t scope);
+void        mvx_msg_status(mv_value *out);
+/* `msgclass' rather than `class': this header is included by the compiler,
+   which is C++, where that is a keyword. */
+int64_t     mvx_msg_send(const char *target, const char *text,
+                         int64_t msgclass, const char *payload);
+int64_t     mvx_msg_pending(void);      /* -1 = no registry */
+int64_t     mvx_msg_dropped(void);
+void        mvx_msg_read(mv_value *out);          /* "" when empty */
+void        mvx_msg_mode(mv_value *out, const char *want);
 
 /* --- OS file access (see mvx_os.c) ------------------------------------- */
 void    mv_osread(mvx_ctx *ctx, mv_value *dst, const mv_value *path);

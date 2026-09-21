@@ -9,6 +9,17 @@
 * SPDX-License-Identifier: GPL-2.0-only
 * /**
 *  * @file WHO
-*  * @version 1.0
+*  * @version 2.0
 *  */
-PRINT ENV("USER"):" ":ENV("MVXACCTPATH")
+* WHO — this session: its port, user and account (mvx#226).
+*
+* The port comes from the session registry.  WITHOUT A REGISTRY THIS STILL
+* ANSWERS: a host with no mvx-msgd running prints what WHO has always printed,
+* because "who am I" is a question the shell can answer by itself and a missing
+* daemon must never take a working verb away.
+ST = MSGSTATUS()
+IF ST<1,1> = "up" THEN
+   PRINT @USERNO:" ":ENV("USER"):" ":ENV("MVXACCTPATH")
+END ELSE
+   PRINT ENV("USER"):" ":ENV("MVXACCTPATH")
+END
