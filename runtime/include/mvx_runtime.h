@@ -81,6 +81,17 @@ int64_t  mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
    come through here.  aborting = 0 stops at the level that ran this program,
    1 passes through it. */
 void     mvx_level_end(int64_t code, int aborting) __attribute__((noreturn));
+/* Resolve a verb to the cataloged program that is it: the account's VOC
+   first, then each linked package in PACKAGES order, then the system
+   account -- the same three-tier walk the runtime does for subroutines.
+   1 found, 0 no such verb, -1 no VOC at all to ask.  It lives here rather
+   than in the shell because a compiled program can EXECUTE with no shell
+   above it (mvx#248). */
+int      mvx_voc_lookup(mvx_ctx *ctx, const char *verb, char *path,
+                        size_t cap);
+/* Forget the cached resolution chain: anything that changes account must,
+   or verbs keep resolving against the one just left. */
+void     mvx_voc_reset(void);
 
 /* Directory of the loaded libmvxrt; the anchor for relocatable installs
    (drivers beside it, ../bin, ../share/mvx/system).  "" if unknown. */

@@ -4524,6 +4524,83 @@ else
   echo "  (unwind tests skipped — sqlite driver not built)"
 fi
 
+# ---------------------------------------------------------------------------
+# EXECUTE RUNS THE PROGRAM IN THIS PROCESS (mvx#248).
+#
+# The suite already drives the in-process path -- SSELECT feeding READNEXT,
+# CATALOG from inside BUILD, WHO with CAPTURING -- but only where it happens
+# to.  These are the three things that path changed and nothing else asserts:
+# what comes back, what a failure does to the caller, and the fallback that
+# makes an account cataloged before this still work.
+#
+# The abort case is the sharp one.  A program reached by EXECUTE used to be a
+# separate process, so one that died left its caller running; now it takes the
+# caller with it, which is UniData's behaviour and the thing most likely to be
+# "fixed" by somebody who thinks a crashing child should be contained.
+echo "== a program reached by EXECUTE runs in this process"
+EXA="$TESTROOT/exec-inproc"
+"$ROOT/scripts/mkaccount.sh" "$EXA" >/dev/null 2>&1
+printf 'ORD sqlite %s/acct.sqlite\n' "$EXA" >> "$EXA/BINDINGS"
+"$TCL" -a "$EXA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+mkdir -p "$EXA/BP"
+
+# The code a STOP hands back, and the caller carrying on after it.
+printf 'PRINT "  child: stopping 5"\nSTOP 5\n'        > "$EXA/BP/EXRC"
+# A child that gives up must take the caller with it.
+printf 'PRINT "  child: aborting"\nABORT\n'           > "$EXA/BP/EXAB"
+cat > "$EXA/BP/EXCALL" <<'EXEOF'
+EXECUTE "EXRC" RETURNING RC
+PRINT "caller: EXRC returned ":RC
+EXECUTE "EXAB"
+PRINT "caller: NOT REACHED -- an abort must not come back"
+EXEOF
+# And a verb whose loadable form is missing, as every account cataloged
+# before mvx#248 has: it must still run, by the old route.
+printf 'PRINT "  child: the old way"\n'                > "$EXA/BP/EXOLD"
+cat > "$EXA/BP/EXFALL" <<'EXEOF'
+EXECUTE "EXOLD" CAPTURING OUT
+PRINT "caller: captured [":TRIM(OUT):"]"
+EXEOF
+for v in EXRC EXAB EXCALL EXOLD EXFALL; do
+  MVXPRIV=developer "$TCL" -a "$EXA" -c "CATALOG BP $v" >/dev/null 2>&1
+done
+# Now make EXOLD look like an account cataloged BEFORE mvx#248: a plain
+# executable, and no loadable form at all.
+#
+# DELETING THE LIBRARY DOES NOT SIMULATE THAT, which is what this test did
+# first and what CI caught.  On macOS CATALOG/<name> is the program, so
+# removing a .dylib that was never there changes nothing and the test passed
+# while asserting nothing.  On Linux the .so IS the program and CATALOG/<name>
+# is the loader, so removing it leaves a loader pointing at nothing -- a state
+# no account has ever been in, and the failure was the loader saying so.
+rm -rf "$EXA/CATALOG/EXOLD"*
+"$MVX" "$EXA/BP/EXOLD" -o "$EXA/CATALOG/EXOLD" >/dev/null 2>&1
+
+exout="$(cd "$EXA" && MVXPRIV=developer MVXACCOUNT=. "$TCL" -a "$EXA" -c EXCALL 2>&1)"
+exrc=$?
+exwant="  child: stopping 5
+caller: EXRC returned 5
+  child: aborting"
+if [ "$exout" = "$exwant" ] && [ "$exrc" != 0 ]; then
+  PASS=$((PASS + 1))
+  echo "  STOP <code> comes back with its code; ABORT takes the caller too"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL execute inproc: rc=$exrc"
+  printf '%s\n' "$exout" | sed 's/^/    | /' | head -8
+fi
+
+# THE FALLBACK, which is what makes this safe for an account that predates
+# it: no loadable form, so EXECUTE spawns exactly as it always did -- and
+# CAPTURING still works down that route.
+fbout="$(cd "$EXA" && MVXPRIV=developer MVXACCOUNT=. "$TCL" -a "$EXA" -c EXFALL 2>&1)"
+if [ "$fbout" = "caller: captured [child: the old way]" ]; then
+  PASS=$((PASS + 1))
+  echo "  a verb with no loadable form still runs, by the old route"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL execute fallback: [$fbout]"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.

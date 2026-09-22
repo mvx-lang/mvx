@@ -36,6 +36,7 @@
  */
 #include "mvx_runtime.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -552,17 +553,118 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
    Dispatch stays in one place: spawn mvx -c <sentence>.  A `!` in
    the sentence is gated inside the child by this same module. */
 
+/* EXECUTE RUNS THE PROGRAM IN THIS PROCESS (mvx#248).
+ *
+ * It used to spawn `mvx -c <sentence>`, which kept every bit of dispatch in
+ * the shell and cost nothing while a program reached that way was meant to be
+ * a stranger.  It is not: an EXECUTE'd program is part of the same session,
+ * and as a separate process it could not be.  It reopened every file, took
+ * its own locks, could not see the caller's select list except through a file
+ * handed sideways, and -- measured -- sat OUTSIDE the caller's transaction
+ * looking at a stale view of what the caller had just written, with nothing
+ * reported.
+ *
+ * So it resolves the verb, loads the program and runs it at a LEVEL: its own
+ * unnamed COMMON, STATUS and sentence, sharing the caller's open files,
+ * locks, select list and transaction.  A STOP inside it comes back here; an
+ * ABORT or a fault passes through and takes the caller too, which is what
+ * UniData does.
+ *
+ * ANYTHING IT CANNOT DO IN-PROCESS FALLS BACK TO SPAWNING, which is what
+ * makes this safe to land: a verb with no loadable form -- an account
+ * cataloged before mvx#248 -- or one that does not resolve at all behaves
+ * exactly as it did, including how the failure is reported. */
+
+#ifdef __APPLE__
+#define MVX_LIB_SUFFIX ".dylib"
+#else
+#define MVX_LIB_SUFFIX ".so"
+#endif
+
+/* The program at `path`, if there is a loadable one.  Resolved the way the
+   whole system resolves it: the platform's library suffix first, then the
+   plain path, which on macOS is the executable and is also loadable. */
+static mvx_program_fn exec_load(const char *path) {
+    char p[4200];
+    snprintf(p, sizeof p, "%s%s", path, MVX_LIB_SUFFIX);
+    void *h = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) return NULL;
+    return (mvx_program_fn)dlsym(h, "mvx_main");
+}
+
+/* Run it with stdout going somewhere we can read back.  A TEMPORARY FILE and
+   not a pipe: nothing is draining the other end while the program runs, so a
+   pipe deadlocks the moment the program writes more than its buffer holds --
+   which for a report verb is the ordinary case, not the edge. */
+static int64_t exec_capture(mvx_ctx *ctx, mvx_program_fn fn, const char *sent,
+                            mv_value *capture) {
+    FILE *tmp = tmpfile();
+    if (!tmp) return mvx_level_run(ctx, fn, sent);   /* capture nothing */
+    fflush(stdout);
+    int saved = dup(1);
+    dup2(fileno(tmp), 1);
+
+    int64_t st = mvx_level_run(ctx, fn, sent);
+
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+
+    long n = ftell(tmp);
+    rewind(tmp);
+    char *buf = n > 0 ? malloc((size_t)n) : NULL;
+    size_t got = (buf && n > 0) ? fread(buf, 1, (size_t)n, tmp) : 0;
+    fclose(tmp);
+    while (got > 0 && buf[got - 1] == '\n') got--;
+    for (size_t i = 0; i < got; i++)
+        if (buf[i] == '\n') buf[i] = AM;
+    mv_set_str(capture, buf ? buf : "", (int64_t)got);
+    free(buf);
+    return st;
+}
+
 int64_t mvx_execute(mvx_ctx *ctx, const mv_value *sentence,
                     mv_value *capture, mv_value *rc) {
-    (void)ctx;
     char nb[40];
     const char *sp;
     int64_t sl = mv_val_chars(sentence, nb, sizeof nb, &sp);
 
-    char tcl[4096], sent[4096];
-    snprintf(tcl, sizeof tcl, "%s/mvx", bin_dir());
+    char sent[4096];
     snprintf(sent, sizeof sent, "%.*s", (int)sl, sp);
 
+    /* A raw Unix command is the runtime's own gate, not a verb: it has never
+       gone through VOC and must not start doing so. */
+    if (sent[0] == '!') {
+        int64_t st = mvx_unix_cmd(ctx, sent + 1);
+        if (rc) mv_set_int(rc, st);
+        return st == 0;
+    }
+
+    /* The verb is the first word. */
+    char verb[256];
+    size_t vi = 0;
+    const char *q = sent;
+    while (*q == ' ' || *q == '\t') q++;
+    while (*q && *q != ' ' && *q != '\t' && vi + 1 < sizeof verb)
+        verb[vi++] = *q++;
+    verb[vi] = '\0';
+
+    char path[2048];
+    mvx_program_fn fn = NULL;
+    if (vi > 0 && mvx_voc_lookup(ctx, verb, path, sizeof path) == 1)
+        fn = exec_load(path);
+
+    if (fn) {
+        int64_t st = capture ? exec_capture(ctx, fn, sent, capture)
+                             : mvx_level_run(ctx, fn, sent);
+        if (rc) mv_set_int(rc, st);
+        return st == 0;
+    }
+
+    /* Nothing loadable: the old way, unchanged. */
+    char tcl[4096];
+    snprintf(tcl, sizeof tcl, "%s/mvx", bin_dir());
     char *argv[5];
     argv[0] = tcl;
     argv[1] = "-c";

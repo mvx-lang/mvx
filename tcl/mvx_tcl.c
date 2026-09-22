@@ -152,6 +152,9 @@ static void account_refresh(void) {
     setenv("MVXACCTPATH", g_acct_path, 1);
 }
 
+/* Open a file by spec into `voc`.  The shell keeps this because it opens the
+   account's VOC for its OWN purposes -- `.C` macros live there, and `.X` can
+   name any file -- which is a shell concern and not resolution. */
 static int voc_open(mv_value *voc, const char *spec) {
     mv_value s;
     mv_init(&s);
@@ -162,116 +165,16 @@ static int voc_open(mv_value *voc, const char *spec) {
     return ok;
 }
 
-/* Read a V-record from the given VOC; path receives attribute 2. */
-static int voc_read(mv_value *voc, const char *verb, char *path,
-                    size_t cap) {
-    mv_value id, rec, a1, a2;
-    mv_init(&id); mv_init(&rec); mv_init(&a1); mv_init(&a2);
-    mv_set_str(&id, verb, (int64_t)strlen(verb));
-    int found = 0;
-    if (mvx_read(g_ctx, &rec, voc, &id, 0)) {
-        mv_extract_fn(&a1, &rec, 1, 0, 0);
-        mv_extract_fn(&a2, &rec, 2, 0, 0);
-        char nb[40];
-        const char *p;
-        int64_t n = mv_val_chars(&a1, nb, sizeof nb, &p);
-        if (n >= 1 && (p[0] == 'V' || p[0] == 'v')) {
-            n = mv_val_chars(&a2, nb, sizeof nb, &p);
-            if (n > 0 && (size_t)n < cap) {
-                memcpy(path, p, (size_t)n);
-                path[n] = '\0';
-                found = 1;
-            }
-        }
-    }
-    mv_clear(&id); mv_clear(&rec); mv_clear(&a1); mv_clear(&a2);
-    return found;
-}
+static mv_value g_voc;
+static int g_voc_state;
 
-/* Linked packages: the account's PACKAGES record (one path per line,
-   maintained by LINK-PKG / UNLINK-PKG) names package directories whose
-   VOCs join the resolution chain.  Reloaded when the file changes, so
-   a LINK-PKG takes effect in the same session. */
-#define MAX_PKGS 16
-static char g_pkgs[MAX_PKGS][1024];
-static mv_value g_pkgvoc[MAX_PKGS];
-static int g_pkgvoc_state[MAX_PKGS];
-static int g_npkgs;
-static long long g_pkg_stamp = -1;
-
-static void pkgs_reload(void) {
-    struct stat sb;
-    long long mt = 0;
-    if (stat("PACKAGES", &sb) == 0) {
-        /* Nanosecond stamp + size: whole-second mtime misses a LINK-PKG
-           landing in the same second as the previous reload. */
-#ifdef __APPLE__
-        mt = (long long)sb.st_mtimespec.tv_sec * 1000000000LL +
-             sb.st_mtimespec.tv_nsec + sb.st_size;
-#else
-        mt = (long long)sb.st_mtim.tv_sec * 1000000000LL +
-             sb.st_mtim.tv_nsec + sb.st_size;
-#endif
-    }
-    if (mt == g_pkg_stamp) return;
-    g_pkg_stamp = mt;
-    for (int i = 0; i < g_npkgs; i++)
-        if (g_pkgvoc_state[i] > 0) mv_clear(&g_pkgvoc[i]);
-    g_npkgs = 0;
-    FILE *fp = fopen("PACKAGES", "r");
-    if (!fp) return;
-    char ln[1024];
-    while (fgets(ln, sizeof ln, fp) && g_npkgs < MAX_PKGS) {
-        size_t n = strlen(ln);
-        while (n && (ln[n - 1] == '\n' || ln[n - 1] == '\r' ||
-                     ln[n - 1] == ' '))
-            ln[--n] = '\0';
-        if (n == 0) continue;
-        snprintf(g_pkgs[g_npkgs], sizeof g_pkgs[0], "%s", ln);
-        g_pkgvoc_state[g_npkgs] = 0;
-        g_npkgs++;
-    }
-    fclose(fp);
-}
-
-/* Resolution: account VOC (local overrides), then linked packages in
-   listed order, then the system account's master VOC.  Foreign verbs
-   execute by path from their own CATALOG but run in the user's
-   account (cwd). */
+/* RESOLUTION IS THE RUNTIME'S (mvx_voc_lookup, mvx#248).  It used to live
+   here, and had to move when EXECUTE stopped spawning a shell to do it: a
+   compiled program can EXECUTE with nothing above it, so the runtime has to
+   be able to resolve a verb by itself, or EXECUTE would work under `mvx` and
+   nowhere else.  One implementation, two callers. */
 static int voc_lookup(const char *verb, char *path, size_t cap) {
-    if (g_voc_state == 0) g_voc_state = voc_open(&g_voc, "VOC");
-    if (g_voc_state > 0 && voc_read(&g_voc, verb, path, cap))
-        return 1;
-
-    pkgs_reload();
-    for (int i = 0; i < g_npkgs; i++) {
-        if (g_pkgvoc_state[i] == 0) {
-            char pv[1152];
-            snprintf(pv, sizeof pv, "%s/VOC", g_pkgs[i]);
-            g_pkgvoc_state[i] = voc_open(&g_pkgvoc[i], pv);
-        }
-        if (g_pkgvoc_state[i] > 0) {
-            char rel[1024];
-            if (voc_read(&g_pkgvoc[i], verb, rel, sizeof rel)) {
-                snprintf(path, cap, "%s/%s", g_pkgs[i], rel);
-                return 1;
-            }
-        }
-    }
-
-    if (g_sysvoc_state == 0) {
-        char sysvoc[4096];
-        snprintf(sysvoc, sizeof sysvoc, "%s/VOC", system_dir());
-        g_sysvoc_state = voc_open(&g_sysvoc, sysvoc);
-    }
-    if (g_sysvoc_state > 0) {
-        char rel[1024];
-        if (voc_read(&g_sysvoc, verb, rel, sizeof rel)) {
-            snprintf(path, cap, "%s/%s", system_dir(), rel);
-            return 1;
-        }
-    }
-    return (g_voc_state < 0 && g_sysvoc_state < 0) ? -1 : 0;
+    return mvx_voc_lookup(g_ctx, verb, path, cap);
 }
 
 /* Run a cataloged verb and return its process exit status, so a verb (e.g.
@@ -1038,8 +941,10 @@ static int command(char *line) {
         }
         account_refresh();
         g_voc_state = 0;                /* re-resolve in the new account */
-        g_pkg_stamp = -1;
-        g_npkgs = 0;
+        /* And the RUNTIME's caches, which now hold the resolution chain: a
+           LOGTO that left them would keep resolving verbs against the account
+           just left (mvx#248). */
+        mvx_voc_reset();
         const char *sess = getenv("MVXSESSION");
         if (sess && sess[0]) {          /* select lists don't cross LOGTO */
             FILE *fp = fopen(sess, "wb");
