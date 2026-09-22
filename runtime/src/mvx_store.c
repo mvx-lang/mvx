@@ -25,6 +25,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -247,7 +248,33 @@ typedef struct store_state {
     int64_t sel_n, sel_pos;
     int sel_active;                     /* a list was formed this process */
     trans_ent *trans;                   /* TRANS() lookup-file cache */
+
+    /* TRANSACTION START / COMMIT / ABORT (mvx#247).
+     *
+     * A language transaction brackets MANY writes where the per-write bracket
+     * (#155) brackets one.  It is scoped to a CONNECTION, not to the account:
+     * every entry point in the driver contract takes a file, and the bracket
+     * applies to that file's connection, so two files can be in one
+     * transaction exactly when they share one.  A second connection is
+     * refused rather than given a second transaction -- that would commit
+     * atomically per backend and not overall, which is the failure nobody can
+     * detect afterwards.
+     *
+     * Enrolment is LAZY because the statement names no file: START arms the
+     * transaction and the first write binds it.  So "this backend has no
+     * transactions" is reported at that first write rather than at START. */
+    int txn_open;                       /* START seen, COMMIT/ABORT not yet */
+    int txn_enrolled;                   /* a connection is bound to it */
+    int txn_poisoned;                   /* a write inside it was refused */
+    const mvx_driver *txn_drv;          /* the connection: driver ... */
+    char txn_loc[1024];                 /* ... and the location half of a spec */
+    mvx_file *txn_file;                 /* whose bracket we opened */
 } store_state;
+
+/* The open transaction, for the exit handler -- see txn_atexit below.  STOP is
+   exit(0) and never reaches the teardown, so the handler is the only thing
+   that runs on that path, and it has no ctx to be given. */
+static store_state *g_txn_st;
 
 static void sel_push(store_state *st, int64_t *cap, const char *p,
                      int64_t len) {
@@ -339,6 +366,15 @@ static void clear_select(store_state *st) {
 void mvx_store_shutdown(mvx_ctx *ctx) {
     store_state *st = mvx_ctx_store_get(ctx);
     if (!st) return;
+    /* An open transaction does not survive the session (mvx#247).  Roll it
+       back HERE, while the files are still open, rather than leave it to the
+       driver's close -- and clear the exit handler's pointer, which would
+       otherwise outlive this state. */
+    if (st->txn_open && st->txn_enrolled && st->txn_drv &&
+        st->txn_drv->rollback)
+        st->txn_drv->rollback(st->txn_file);
+    st->txn_open = 0;
+    if (g_txn_st == st) g_txn_st = NULL;
     session_save(st);                   /* hand leftover list to session */
     clear_select(st);
     for (lock_ent *l = st->locks; l;) {
@@ -1400,6 +1436,207 @@ static int attr_is_numeric(const char *s, int64_t n) {
    target attribute `attr` — a number (classic, a raw attribute) or a dict-item
    name evaluated through the target's dictionary (nested, #53a).  Results are
    rejoined with @VM; a miss is "" ('X') or the key ('C'). */
+/* ---------------------------------------- TRANSACTION (mvx#247) --------- */
+
+/* The location half of a spec: a spec is "<location>\n<file>", or just
+   "<file>" for the account's own default backend.  Two files are on one
+   connection when their driver and their location both match. */
+/* Soft failures print like the rest of the store does -- OPEN says
+   "OPEN <spec>: <why>" on stderr -- so a transaction refusal reads the same
+   way and lands where an operator is already looking. */
+static void txn_log(const char *fmt, ...) {
+    va_list ap;
+    fputs("TRANSACTION: ", stderr);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+/* ROLLING BACK ON THE WAY OUT (mvx#247).
+ *
+ * UniData aborts an open transaction for you when a program dies, and MV code
+ * relies on it: the CueBic pattern starts a transaction in a pre-save and
+ * commits at the top of the next screen, and never writes an explicit ABORT
+ * at all -- the abort path IS abnormal termination.
+ *
+ * A crash or a kill is already right: the connection dies and the backend
+ * discards an uncommitted transaction (proven for sqlite in mvx#244).  STOP
+ * is NOT, because mvx_stop is exit(0) and never reaches mvx_ctx_destroy, so
+ * the store is never shut down and the rollback would only happen by the
+ * grace of whatever the OS does to the handle.  An atexit handler covers
+ * STOP, STOP <code> and a normal return with one mechanism.
+ *
+ * Registered only when a transaction is actually opened, so a program that
+ * never uses one pays nothing. */
+static void txn_atexit(void) {
+    store_state *st = g_txn_st;
+    if (!st || !st->txn_open) return;
+    if (st->txn_enrolled && st->txn_drv && st->txn_drv->rollback)
+        st->txn_drv->rollback(st->txn_file);
+    st->txn_open = 0;
+    st->txn_enrolled = 0;
+}
+
+static void spec_loc(const char *spec, char *out, size_t cap) {
+    const char *nl = spec ? strchr(spec, '\n') : NULL;
+    if (!nl) { out[0] = '\0'; return; }
+    size_t n = (size_t)(nl - spec);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, spec, n);
+    out[n] = '\0';
+}
+
+/* A spec for a MESSAGE.  "<location>\n<file>" cannot go into a log line as
+   it stands: the newline splits it in two, so an operator greps for the
+   driver's complaint and finds a bare file name on the line below it.  One
+   line, file first, because that is what the program named. */
+static void spec_show(const char *spec, char *out, size_t cap) {
+    const char *nl = spec ? strchr(spec, '\n') : NULL;
+    if (!nl) { snprintf(out, cap, "%s", spec ? spec : "?"); return; }
+    snprintf(out, cap, "%s on %.*s", nl + 1, (int)(nl - spec), spec);
+}
+
+/* Bind a write to the open transaction, or refuse it.
+ *
+ * Returns 1 when the write may proceed -- including when no transaction is
+ * open at all, which is the ordinary case and costs one load.  Returns 0 only
+ * when a transaction IS open and this write cannot join it, which is two
+ * situations and both are errors the program has to hear about:
+ *
+ *   the backend has no bracket        -- it cannot be atomic, so pretending
+ *                                        would be the whole bug
+ *   a second connection              -- it could be atomic per backend and
+ *                                        not overall, which is worse, because
+ *                                        nothing afterwards can tell */
+static int txn_enrol(mvx_ctx *ctx, mvx_file *f) {
+    store_state *st = state(ctx);
+    if (!st || !st->txn_open) return 1;
+    mvx_file_base *b = (mvx_file_base *)f;
+    char loc[1024], show[1200];
+    spec_loc(b->spec, loc, sizeof loc);
+    spec_show(b->spec, show, sizeof show);
+
+    if (!st->txn_enrolled) {
+        if (!b->driver->bulk_begin || !b->driver->bulk_commit ||
+            !b->driver->rollback) {
+            txn_log("the %s driver has no transaction support, so %s cannot "
+                    "be written inside one",
+                     b->driver->name, show);
+            st->txn_poisoned = 1;
+            return 0;
+        }
+        if (!b->driver->bulk_begin(f)) {
+            /* 0 means one was already open on this connection -- a backfill
+               batch around us.  That outer bracket owns the atomicity and we
+               must not end it, so there is nothing for a language transaction
+               to add and nothing it may commit. */
+            txn_log("a batch is already open on %s", show);
+            st->txn_poisoned = 1;
+            return 0;
+        }
+        st->txn_enrolled = 1;
+        st->txn_drv = b->driver;
+        st->txn_file = f;
+        snprintf(st->txn_loc, sizeof st->txn_loc, "%s", loc);
+        return 1;
+    }
+
+    if (b->driver != st->txn_drv || strcmp(loc, st->txn_loc) != 0) {
+        txn_log("%s is on a different connection from the one this "
+                "transaction holds; one transaction cannot span two",
+                 show);
+        st->txn_poisoned = 1;
+        return 0;
+    }
+    return 1;
+}
+
+/* TRANSACTION START -- arms it.  No file is named, so there is nothing to
+   check yet and nothing to open: the first write enrols a connection.
+   Returns 0 when one is already open, because nesting language transactions
+   would need savepoints and a partial rollback nobody has asked for. */
+int64_t mvx_txn_start(mvx_ctx *ctx) {
+    store_state *st = state(ctx);
+    if (!st) return 0;
+    if (st->txn_open) {
+        txn_log("one is already open");
+        return 0;
+    }
+    st->txn_open = 1;
+    st->txn_enrolled = 0;
+    st->txn_poisoned = 0;
+    st->txn_drv = NULL;
+    st->txn_file = NULL;
+    st->txn_loc[0] = '\0';
+    if (!g_txn_st) atexit(txn_atexit);
+    g_txn_st = st;
+    return 1;
+}
+
+/* TRANSACTION COMMIT.  A transaction that enrolled nothing commits nothing
+   and succeeds: a program that wrote no records inside one has not failed.
+ *
+ * A REFUSED WRITE POISONS THE TRANSACTION, and then COMMIT fails and rolls
+ * back what did enrol.  Without that the guarantee would be worth nothing in
+ * exactly the case it exists for: START, write A, write B refused because it
+ * is on another connection, COMMIT -- and A commits ALONE, which is the half
+ * a unit of work this whole feature exists to prevent.  The write already
+ * reported its own failure, but a program is entitled to handle that by
+ * logging it, and it must not be able to leave a partial commit behind by
+ * doing so.  An explicit ABORT remains the way to give up deliberately. */
+int64_t mvx_txn_commit(mvx_ctx *ctx) {
+    store_state *st = state(ctx);
+    if (!st || !st->txn_open) {
+        txn_log("COMMIT with none open");
+        return 0;
+    }
+    int ok = 1;
+    if (st->txn_poisoned) {
+        txn_log("a write inside this transaction was refused, so there is "
+                "nothing it can commit; rolling back");
+        if (st->txn_enrolled && st->txn_drv->rollback)
+            st->txn_drv->rollback(st->txn_file);
+        ok = 0;
+    } else if (st->txn_enrolled && st->txn_drv->bulk_commit) {
+        ok = st->txn_drv->bulk_commit(st->txn_file) ? 1 : 0;
+    }
+    st->txn_open = 0;
+    st->txn_enrolled = 0;
+    st->txn_poisoned = 0;
+    st->txn_file = NULL;
+    st->txn_drv = NULL;
+    return ok;
+}
+
+/* @TRANSACTION -- the nesting depth, 0 when there is none.  Answers 0 or 1
+   here because a second START is refused rather than nested; the value is a
+   depth rather than a flag so it can grow if savepoints ever arrive, and so
+   it reads the way UniData's and UniVerse's do. */
+int64_t mvx_txn_depth(mvx_ctx *ctx) {
+    store_state *st = mvx_ctx_store_get(ctx);
+    return (st && st->txn_open) ? 1 : 0;
+}
+
+/* TRANSACTION ABORT.  No result: an abort has no failure a program could
+   branch on, which is why UniData and UniVerse both refuse a THEN/ELSE on
+   it.  Discarding is best effort by definition -- if the rollback itself
+   fails there is nothing left to try. */
+void mvx_txn_abort(mvx_ctx *ctx) {
+    store_state *st = state(ctx);
+    if (!st || !st->txn_open) {
+        txn_log("ABORT with none open");
+        return;
+    }
+    if (st->txn_enrolled && st->txn_drv->rollback)
+        st->txn_drv->rollback(st->txn_file);
+    st->txn_open = 0;
+    st->txn_enrolled = 0;
+    st->txn_poisoned = 0;
+    st->txn_file = NULL;
+    st->txn_drv = NULL;
+}
+
 static void trans_core(mvx_ctx *ctx, mv_value *dst, const char *np, int64_t nl,
                        const mv_value *key, const char *attr, int64_t attrl,
                        char ctl, int depth) {
@@ -1553,6 +1790,18 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
        bulk_begin returns 0 when a transaction is ALREADY open (a backfill
        batch around this write); then the outer one owns the atomicity and
        this bracket must neither commit nor roll back. */
+    /* Enrol this write in a language transaction if one is open (mvx#247).
+       It must happen before the per-write bracket, because that bracket then
+       nests inside it -- bulk_begin already returns 0 when a transaction is
+       open, so the inner one becomes a no-op on its own. */
+    if (!txn_enrol(ctx, f)) {
+        if (need_old) mv_clear(&old);
+        if (onerr) return -2;
+        char tshow[1200];
+        spec_show(b->spec, tshow, sizeof tshow);
+        mvx_fatal("WRITE inside a transaction that cannot hold it: %s", tshow);
+    }
+
     int txn = 0;
     if (o && o->map.nf > 0 && b->driver->bulk_begin && b->driver->bulk_commit)
         txn = b->driver->bulk_begin(f);

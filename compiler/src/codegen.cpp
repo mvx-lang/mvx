@@ -1026,7 +1026,7 @@ private:
         }
         if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0 &&
             e.sval != "@USER.TYPE" && e.sval != "@SENTENCE" &&
-            e.sval != "@USERNO")
+            e.sval != "@USERNO" && e.sval != "@TRANSACTION")
             return getScalar(e.sval, e.line);
         if (e.kind == Expr::K::Paren && arrayNames_.count(e.sval))
             return arrayElemPtr(e);
@@ -1069,6 +1069,29 @@ private:
             if (e.sval == "@USER.TYPE") {          // session type (0 = interactive)
                 callRt("mv_user_type", voidTy_, {ptrTy_, ptrTy_},
                        {ctxArg_, dest});
+                return;
+            }
+            if (e.sval == "@TRANSACTION") {
+                /* Am I inside a transaction (mvx#247)?  The spelling is not
+                 * a choice -- measured on both platforms that have it:
+                 * @TRANSACTION is 0 outside a transaction and non-zero in one.
+                 *
+                 * IT IS A BOOLEAN, and MV code uses it as one -- `IF
+                 * @TRANSACTION THEN' is how it is written, and it is the ONLY
+                 * portable reading.  The non-zero value is not a small fixed
+                 * number: measured on UniVerse 14.2.1, one START answered 3,
+                 * then 4, then 7, 8, 9 on successive runs -- it is a
+                 * monotonically increasing transaction NUMBER, with nesting
+                 * counted on top of it (three nested STARTs gave n, n+1, n+2).
+                 * UniData answers 1.  So `IF @TRANSACTION = 1' is code that
+                 * works on one system and silently never fires on the other.
+                 *
+                 * MVX answers the nesting depth, 0 or 1, because a second
+                 * START is refused rather than nested -- which agrees with
+                 * UniData.  Nothing should depend on the number. */
+                Value *n = callRt("mvx_txn_depth", i64Ty_, {ptrTy_},
+                                  {ctxArg_});
+                callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_}, {dest, n});
                 return;
             }
             if (e.sval == "@USERNO") {
@@ -1508,6 +1531,12 @@ private:
         case Stmt::K::Assign: emitAssign(s); break;
         case Stmt::K::Dim:    emitDim(s);    break;
         case Stmt::K::If:     emitIf(s);     break;
+        case Stmt::K::TxnStart:
+        case Stmt::K::TxnCommit:
+            emitTxn(s);   break;
+        case Stmt::K::TxnAbort:
+            callRt("mvx_txn_abort", voidTy_, {ptrTy_}, {ctxArg_});
+            break;
         case Stmt::K::For:    emitFor(s);    break;
         case Stmt::K::Loop:   emitLoop(s);   break;
         case Stmt::K::Print:  emitPrint(s);  break;
@@ -2208,6 +2237,31 @@ private:
         Value *arr = callRt("mv_arr_create", ptrTy_, {i64Ty_, i64Ty_},
                             {d1, d2});
         b_.CreateStore(arr, slot);
+    }
+
+    /* TRANSACTION START / COMMIT (mvx#247).
+     *
+     * A direct runtime call, not an extension function: the transaction is
+     * session state the store owns, and routing it through the extension
+     * registry would put a name in a table that a package could shadow.
+     * The answer is 0/1 and the statement's THEN/ELSE tests it, so this is
+     * emitIf with the condition supplied rather than parsed. */
+    void emitTxn(const Stmt &s) {
+        const char *fn = s.kind == Stmt::K::TxnStart ? "mvx_txn_start"
+                                                     : "mvx_txn_commit";
+        Value *r = callRt(fn, i64Ty_, {ptrTy_}, {ctxArg_});
+        Value *c = b_.CreateICmpNE(r, ConstantInt::get(i64Ty_, 0));
+        BasicBlock *thenBB = newBB("txn.then");
+        BasicBlock *elseBB = newBB("txn.else");
+        BasicBlock *doneBB = newBB("txn.done");
+        b_.CreateCondBr(c, thenBB, elseBB);
+        b_.SetInsertPoint(thenBB);
+        emitBlock(s.body);
+        b_.CreateBr(doneBB);
+        b_.SetInsertPoint(elseBB);
+        emitBlock(s.elseBody);
+        b_.CreateBr(doneBB);
+        b_.SetInsertPoint(doneBB);
     }
 
     void emitIf(const Stmt &s) {

@@ -1,0 +1,18 @@
+stdout:
+outside=0
+started
+inside=1
+nesting refused
+committed
+after=0
+commit refused
+started again
+aborted=0
+started once more
+the boolean sees it
+still a variable
+and @TRANSACTION is a different thing=0
+stderr:
+TRANSACTION: one is already open
+TRANSACTION: COMMIT with none open
+TRANSACTION: ABORT with none open

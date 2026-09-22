@@ -188,6 +188,22 @@ lang ongoto
 lang uname
 lang opendict
 
+# mvx#247: the language transaction surface.  No file is opened, so this pins
+# the statement forms, the clause rules UniData and UniVerse enforce, and the
+# refusals -- the atomicity itself needs a backend and is proven below.
+#
+# The two streams are captured SEPARATELY and printed in a fixed order.  The
+# refusals go to stderr unbuffered while PRINT is block-buffered down a pipe,
+# so interleaving them would make the golden depend on flush timing.
+out="$TESTROOT/txn"
+if "$MVX" "$ROOT/tests/txn.b" -o "$out" 2>"$TESTROOT/cerr"; then
+  "$out" >"$TESTROOT/txn.o" 2>"$TESTROOT/txn.e"
+  check txn "$(printf 'stdout:\n%s\nstderr:\n%s' \
+                "$(cat "$TESTROOT/txn.o")" "$(cat "$TESTROOT/txn.e")")"
+else
+  check txn "COMPILE FAILED: $(cat "$TESTROOT/cerr")"
+fi
+
 # STOP <code> sets the process exit status (CHECK-style CI gating): capture
 # both stdout and the exit code so the whole contract is pinned.
 out="$TESTROOT/stopcode"
@@ -3477,6 +3493,222 @@ SQREOF
   fi
 else
   echo "  (sqlite test skipped — driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# LANGUAGE TRANSACTIONS (mvx#247).
+#
+# mvx#244 proved that ONE mapped write is atomic -- the record, its parent
+# columns and its child rows land together or not at all.  This is the wider
+# claim: a program can bracket SEVERAL writes and they commit or roll back as
+# one unit.  The tests are built on their own account rather than reusing the
+# sqlite block's, so what they assert does not depend on records an earlier
+# test left behind.
+#
+# The shape being served is the one Gentrack used on UniData: the transaction
+# is started in a pre-save, the writes happen in subroutines called later, and
+# the commit is somewhere else again -- an explicit ABORT is never written at
+# all, because the abort path IS abnormal termination.  So START/GOSUB/COMMIT
+# and the rollback-on-STOP both have to hold.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== language transactions"
+  TXA="$TESTROOT/txacct"; mkdir -p "$TXA"
+  printf '# MVX account descriptor\nname=txacct\nversion=1\n' > "$TXA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$TXA" > "$TXA/BINDINGS"
+  "$TCL" -a "$TXA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  # A mapped file, so every write touches the record, the parent columns AND a
+  # child table -- the case where a partial commit does the most damage.
+  cat > "$TESTROOT/txd.b" <<'TXDEOF'
+OPEN "DICT", "ORD" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Cust":@AM:"10L" ON D, "CUST"
+WRITE "D":@AM:"2":@AM:"":@AM:"Qty":@AM:"6R":@AM:"LINES" ON D, "QTY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Price":@AM:"8R":@AM:"LINES" ON D, "PRICE"
+TXDEOF
+  "$MVX" "$TESTROOT/txd.b" -o "$TESTROOT/txd" >/dev/null 2>&1
+  (cd "$TXA" && MVXACCOUNT=. "$TESTROOT/txd" >/dev/null 2>&1)
+  "$TCL" -a "$TXA" -c 'CREATE-MAP ORD CUST QTY PRICE' >/dev/null 2>&1
+
+  # TWO writes in one bracket, ended three ways.  Distinct ids per mode: the
+  # same id rewritten with the same content would look identical whether it
+  # rolled back or not, and would prove nothing (the trap mvx#244 fell into).
+  cat > "$TESTROOT/txw.b" <<'TXWEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+M = ENV("TXNMODE")
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "CA":@AM:"5":@VM:"6":@AM:"10":@VM:"20" ON F, M:"A"
+WRITE "CB":@AM:"7":@VM:"8":@AM:"30":@VM:"40" ON F, M:"B"
+BEGIN CASE
+   CASE M = "CM" ; TRANSACTION COMMIT ELSE PRINT "commit failed"
+   CASE M = "AB" ; TRANSACTION ABORT
+   CASE M = "ST" ; STOP
+END CASE
+TXWEOF
+  if "$MVX" "$TESTROOT/txw.b" -o "$TESTROOT/txw" 2>"$TESTROOT/cerr"; then
+    for m in CM AB ST; do
+      (cd "$TXA" && MVXACCOUNT=. TXNMODE=$m "$TESTROOT/txw" >/dev/null 2>&1)
+    done
+    kept="$(sqlite3 "$TXA/acct.sqlite" \
+      "SELECT group_concat(id) FROM (SELECT id FROM \"ORD\" ORDER BY id);" 2>/dev/null)"
+    keptc="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES";' 2>/dev/null)"
+    # COMMIT keeps both records and all four child rows; ABORT keeps neither;
+    # STOP without a commit keeps neither, which is the atexit rollback --
+    # mvx_stop is exit(0) and never reaches the store's shutdown.
+    if [ "$kept" = "CMA,CMB" ] && [ "$keptc" = 4 ]; then
+      PASS=$((PASS+1))
+      echo "  two writes commit as one unit; abort and STOP discard both"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL txn multi-write: kept='$kept' (want CMA,CMB) rows='$keptc' (want 4)"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL txn multi-write: did not compile"
+  fi
+
+  # THE CUEBIC SHAPE: started in one place, written in a subroutine called
+  # later, committed somewhere else again -- and @TRANSACTION readable at every
+  # step, because that is how the code decided whether it was already inside
+  # one.
+  cat > "$TESTROOT/txc.b" <<'TXCEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+GOSUB 100
+PRINT "after the gosub=":@TRANSACTION
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+PRINT "after the commit=":@TRANSACTION
+STOP
+100 PRINT "inside the gosub=":@TRANSACTION
+WRITE "CQ":@AM:"1":@VM:"2":@AM:"3":@VM:"4" ON F, "QA"
+RETURN
+TXCEOF
+  if "$MVX" "$TESTROOT/txc.b" -o "$TESTROOT/txc" 2>"$TESTROOT/cerr"; then
+    cout="$(cd "$TXA" && MVXACCOUNT=. "$TESTROOT/txc" 2>&1)"
+    qa="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'QA'"'"';' 2>/dev/null)"
+    qac="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES" WHERE id = '"'"'QA'"'"';' 2>/dev/null)"
+    want="inside the gosub=1
+after the gosub=1
+after the commit=0"
+    if [ "$cout" = "$want" ] && [ "$qa" = 1 ] && [ "$qac" = 2 ]; then
+      PASS=$((PASS+1))
+      echo "  a transaction spans a GOSUB and commits outside it"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL txn cuebic: rec=$qa/$qac (want 1/2), out=[$cout]"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL txn cuebic: did not compile"
+  fi
+
+  # ONE TRANSACTION, ONE CONNECTION.  Two sqlite files are two connections, so
+  # a bracket cannot cover both: committing each separately would be atomic per
+  # backend and not overall, which is worse than refusing, because nothing
+  # afterwards can tell.
+  #
+  # AND THE REFUSAL POISONS THE TRANSACTION, which is the point of this test.
+  # The first write is on the enrolled connection and would otherwise commit
+  # ALONE -- the half a unit of work the whole feature exists to prevent.  The
+  # program here handles the refusal by printing it and carrying on, which is
+  # exactly what real code does, so the guarantee cannot depend on the program
+  # reacting: COMMIT fails and rolls back, and NEITHER record survives.
+  TXB="$TESTROOT/txspan"; mkdir -p "$TXB"
+  printf '# MVX account descriptor\nname=txspan\nversion=1\n' > "$TXB/.mvx"
+  printf '* sqlite %s/a.sqlite\nOTHER sqlite %s/b.sqlite\n' "$TXB" "$TXB" \
+    > "$TXB/BINDINGS"
+  "$TCL" -a "$TXB" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  "$TCL" -a "$TXB" -c 'CREATE-FILE OTHER' >/dev/null 2>&1
+  cat > "$TESTROOT/txs.b" <<'TXSEOF'
+OPEN "ORD" TO F1 ELSE PRINT "no ORD" ; STOP
+OPEN "OTHER" TO F2 ELSE PRINT "no OTHER" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "one" ON F1, "R1" ON ERROR PRINT "first write refused"
+WRITE "two" ON F2, "R2" ON ERROR PRINT "second write refused"
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+READ A FROM F1, "R1" THEN PRINT "R1 present" ELSE PRINT "R1 absent"
+READ B FROM F2, "R2" THEN PRINT "R2 present" ELSE PRINT "R2 absent"
+TXSEOF
+  if "$MVX" "$TESTROOT/txs.b" -o "$TESTROOT/txs" 2>"$TESTROOT/cerr"; then
+    sout="$(cd "$TXB" && MVXACCOUNT=. "$TESTROOT/txs" 2>/dev/null)"
+    serr="$(cd "$TXB" && MVXACCOUNT=. "$TESTROOT/txs" 2>&1 >/dev/null)"
+    want="second write refused
+commit failed
+R1 absent
+R2 absent"
+    case "$serr" in
+      *"different connection"*) spanmsg=1 ;;
+      *) spanmsg=0 ;;
+    esac
+    if [ "$sout" = "$want" ] && [ "$spanmsg" = 1 ]; then
+      PASS=$((PASS+1))
+      echo "  a refused second connection poisons the commit; neither lands"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL txn span: out=[$sout] msg=$spanmsg err=[$serr]"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL txn span: did not compile"
+  fi
+else
+  echo "  (language transaction tests skipped — sqlite driver not built)"
+fi
+
+# A BACKEND WITH NO BRACKET MUST SAY SO, not silently write (mvx#247).  This is
+# the requirement that a transaction cannot be quietly downgraded: the dir
+# driver has no bulk_begin/bulk_commit/rollback, so a write inside one is
+# refused and diagnosed rather than committed on its own.  Soft with ON ERROR,
+# fatal without -- a program that did not ask for the error must not continue
+# past a write it believes is in a transaction.
+echo "== a backend with no transaction support refuses one"
+TXN="$TESTROOT/txnone"; mkdir -p "$TXN/data"
+printf '# MVX account descriptor\nname=txnone\nversion=1\n' > "$TXN/.mvx"
+printf '* dir %s/data\n' "$TXN" > "$TXN/BINDINGS"
+"$TCL" -a "$TXN" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+cat > "$TESTROOT/txn1.b" <<'TXN1EOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "CA":@AM:"5" ON F, "NA" ON ERROR PRINT "the write was refused"
+PRINT "depth=":@TRANSACTION
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+READ R FROM F, "NA" THEN PRINT "NA was written" ELSE PRINT "NA is absent"
+TXN1EOF
+cat > "$TESTROOT/txn2.b" <<'TXN2EOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "CA":@AM:"5" ON F, "FA"
+PRINT "this line must not be reached"
+TXN2EOF
+if "$MVX" "$TESTROOT/txn1.b" -o "$TESTROOT/txn1" 2>"$TESTROOT/cerr" \
+   && "$MVX" "$TESTROOT/txn2.b" -o "$TESTROOT/txn2" 2>>"$TESTROOT/cerr"; then
+  nout="$(cd "$TXN" && MVXACCOUNT=. "$TESTROOT/txn1" 2>/dev/null)"
+  nerr="$(cd "$TXN" && MVXACCOUNT=. "$TESTROOT/txn1" 2>&1 >/dev/null)"
+  fout="$(cd "$TXN" && MVXACCOUNT=. "$TESTROOT/txn2" 2>/dev/null)"; frc=$?
+  nwant="the write was refused
+depth=1
+commit failed
+NA is absent"
+  # EVERY message is one whole line.  The spec is "<location>\n<file>", so a
+  # message that prints it raw splits in half, and an operator greps for the
+  # driver's complaint and finds a bare file name on the line below it.  So
+  # assert that every line carries the prefix: a continuation line would not.
+  nlines="$(printf '%s\n' "$nerr" | wc -l | tr -d ' ')"
+  npre="$(printf '%s\n' "$nerr" | grep -c '^TRANSACTION: ')"
+  case "$nerr" in
+    *"the dir driver has no transaction support"*) nmsg=1 ;;
+    *) nmsg=0 ;;
+  esac
+  if [ "$nout" = "$nwant" ] && [ "$nmsg" = 1 ] && [ "$nlines" = "$npre" ] \
+     && [ -z "$fout" ] && [ "$frc" != 0 ]; then
+    PASS=$((PASS+1))
+    echo "  the dir driver refuses a transactional write, each message whole,"
+    echo "  and a program without ON ERROR does not run past it"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL txn unsupported: out=[$nout] msg=$nmsg lines=$nlines/$npre" \
+         "fatal-out=[$fout] fatal-rc=$frc err=[$nerr]"
+  fi
+else
+  FAIL=$((FAIL+1)); echo "FAIL txn unsupported: did not compile"
 fi
 
 # ---------------------------------------------------------------------------
