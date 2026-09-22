@@ -396,7 +396,13 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
                          const mv_value *src, const mv_value *out,
                          const mv_value *opts); /* developer */
 int64_t mvx_execute(mvx_ctx *ctx, const mv_value *sentence,
-                    mv_value *capture, mv_value *rc);   /* any tier */
+                    mv_value *capture, mv_value *rc);
+/* EXECUTE ... ON ERROR (mvx#256): the same, but an ABORT or a fault in the
+   program it runs is CAUGHT here rather than taking this program too.  A
+   shell written in BASIC needs it -- an option that gives up must not log the
+   operator out -- and nothing else should use it. */
+int64_t mvx_execute_trapping(mvx_ctx *ctx, const mv_value *sentence,
+                             mv_value *capture, mv_value *rc, int *aborted);   /* any tier */
 int64_t mvx_editfile(mvx_ctx *ctx, const mv_value *path); /* unrestricted */
 void    mvx_tmpnam(mv_value *dst);
 

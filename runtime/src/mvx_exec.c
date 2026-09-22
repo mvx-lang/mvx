@@ -598,14 +598,17 @@ static mvx_program_fn exec_load(const char *path) {
    pipe deadlocks the moment the program writes more than its buffer holds --
    which for a report verb is the ordinary case, not the edge. */
 static int64_t exec_capture(mvx_ctx *ctx, mvx_program_fn fn, const char *sent,
-                            mv_value *capture) {
+                            mv_value *capture, int *aborted) {
     FILE *tmp = tmpfile();
-    if (!tmp) return mvx_level_run(ctx, fn, sent);   /* capture nothing */
+    if (!tmp)                                        /* capture nothing */
+        return aborted ? mvx_level_run_at_prompt(ctx, fn, sent, aborted)
+                       : mvx_level_run(ctx, fn, sent);
     fflush(stdout);
     int saved = dup(1);
     dup2(fileno(tmp), 1);
 
-    int64_t st = mvx_level_run(ctx, fn, sent);
+    int64_t st = aborted ? mvx_level_run_at_prompt(ctx, fn, sent, aborted)
+                         : mvx_level_run(ctx, fn, sent);
 
     fflush(stdout);
     dup2(saved, 1);
@@ -624,8 +627,39 @@ static int64_t exec_capture(mvx_ctx *ctx, mvx_program_fn fn, const char *sent,
     return st;
 }
 
+/* EXECUTE ... ON ERROR (mvx#256).
+ *
+ * An ABORT or a runtime fault in a program reached by EXECUTE takes its
+ * caller with it.  That is UniData's behaviour and it is right for ordinary
+ * code -- a program whose work has just failed half way through should not
+ * carry on as though it had not.
+ *
+ * A SHELL is the exception.  A login and menu written in BASIC, which is what
+ * a site replaces TCL with, has to survive the option it just ran: an abort
+ * there means "that screen gave up", not "log the operator out".  On UniData
+ * the abort is caught by TCL, so a site that removes TCL loses the only thing
+ * that was catching one.
+ *
+ * So a caller can say it will handle it, and only then does the abort stop.
+ * Everything without the clause is unchanged. */
+static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
+                            mv_value *capture, mv_value *rc, int *aborted);
+
 int64_t mvx_execute(mvx_ctx *ctx, const mv_value *sentence,
                     mv_value *capture, mv_value *rc) {
+    return execute_core(ctx, sentence, capture, rc, NULL);
+}
+
+/* The same, but an abort in the program it runs comes back here instead of
+   passing through: *aborted says so, and the caller's ON ERROR body runs. */
+int64_t mvx_execute_trapping(mvx_ctx *ctx, const mv_value *sentence,
+                             mv_value *capture, mv_value *rc, int *aborted) {
+    if (aborted) *aborted = 0;
+    return execute_core(ctx, sentence, capture, rc, aborted);
+}
+
+static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
+                            mv_value *capture, mv_value *rc, int *aborted) {
     char nb[40];
     const char *sp;
     int64_t sl = mv_val_chars(sentence, nb, sizeof nb, &sp);
@@ -656,10 +690,12 @@ int64_t mvx_execute(mvx_ctx *ctx, const mv_value *sentence,
         fn = exec_load(path);
 
     if (fn) {
-        int64_t st = capture ? exec_capture(ctx, fn, sent, capture)
-                             : mvx_level_run(ctx, fn, sent);
+        int64_t st = capture ? exec_capture(ctx, fn, sent, capture, aborted)
+                             : (aborted ? mvx_level_run_at_prompt(ctx, fn, sent,
+                                                                  aborted)
+                                        : mvx_level_run(ctx, fn, sent));
         if (rc) mv_set_int(rc, st);
-        return st == 0;
+        return st == 0 && !(aborted && *aborted);
     }
 
     /* Nothing loadable: the old way, unchanged. */

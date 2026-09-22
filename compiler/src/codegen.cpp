@@ -1633,9 +1633,31 @@ private:
             Value *ret = s.name2.empty()
                              ? (Value *)ConstantPointerNull::get(ptrTy_)
                              : getScalar(s.name2, s.line);
-            callRt("mvx_execute", i64Ty_,
-                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_},
-                   {ctxArg_, evalPtr(*s.value), cap, ret});
+            if (!s.hasError) {
+                callRt("mvx_execute", i64Ty_,
+                       {ptrTy_, ptrTy_, ptrTy_, ptrTy_},
+                       {ctxArg_, evalPtr(*s.value), cap, ret});
+                break;
+            }
+            /* ON ERROR: the program it runs gave up (mvx#256).  An abort in
+               it would otherwise take THIS program too, which is what should
+               happen to ordinary code and must not happen to a shell.  The
+               flag says which way it ended; a plain non-zero STOP is not an
+               error and does not come here. */
+            AllocaInst *ab = eb_.CreateAlloca(i32Ty_, nullptr, "exec.aborted");
+            b_.CreateStore(ConstantInt::get(i32Ty_, 0), ab);
+            callRt("mvx_execute_trapping", i64Ty_,
+                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_, ptrTy_},
+                   {ctxArg_, evalPtr(*s.value), cap, ret, ab});
+            Value *abv = b_.CreateLoad(i32Ty_, ab, "aborted");
+            Value *bad = b_.CreateICmpNE(abv, ConstantInt::get(i32Ty_, 0));
+            BasicBlock *errBB  = newBB("exec.err");
+            BasicBlock *doneBB = newBB("exec.done");
+            b_.CreateCondBr(bad, errBB, doneBB);
+            b_.SetInsertPoint(errBB);
+            emitBlock(s.errorBody);
+            if (!b_.GetInsertBlock()->getTerminator()) b_.CreateBr(doneBB);
+            b_.SetInsertPoint(doneBB);
             break;
         }
 

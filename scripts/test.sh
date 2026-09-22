@@ -4678,6 +4678,78 @@ else
   echo "  (prompt-in-process tests skipped — sqlite driver not built)"
 fi
 
+# ---------------------------------------------------------------------------
+# EXECUTE ... ON ERROR (mvx#256).
+#
+# An ABORT or a fault in a program reached by EXECUTE takes its caller with
+# it, which is UniData's behaviour and right for ordinary code.  A SHELL is
+# the exception: a login and menu written in BASIC -- what a site replaces TCL
+# with -- has to survive the option it just ran.  On UniData the abort is
+# caught by TCL, so removing TCL removes the only thing catching one.
+#
+# The two properties that make this safe are asserted as carefully as the
+# feature itself: WITHOUT the clause nothing changes, and a non-zero STOP is
+# not an error.
+echo "== a BASIC shell can survive an option that gives up"
+OEA="$TESTROOT/on-error"
+"$ROOT/scripts/mkaccount.sh" "$OEA" >/dev/null 2>&1
+mkdir -p "$OEA/BP"
+printf 'PRINT "  v: aborting"\nABORT\n'      > "$OEA/BP/OEAB"
+printf 'PRINT "  v: fine"\n'                  > "$OEA/BP/OEOK"
+printf 'PRINT "  v: stopping 3"\nSTOP 3\n'   > "$OEA/BP/OE3"
+cat > "$OEA/BP/OESHELL" <<'OEEOF'
+EXECUTE "OEAB" ON ERROR
+   PRINT "shell: that option gave up -- still here"
+END
+PRINT "shell: the menu carries on"
+EXECUTE "OEOK"
+PRINT "shell: logged off normally"
+OEEOF
+# No clause: the abort must still take this program with it.
+printf 'PRINT "bare: running it"\nEXECUTE "OEAB"\nPRINT "bare: MUST NOT REACH"\n' \
+  > "$OEA/BP/OEBARE"
+# A non-zero STOP is an exit status, not a failure.
+cat > "$OEA/BP/OESTOP" <<'OEEOF'
+EXECUTE "OE3" RETURNING RC ON ERROR
+   PRINT "MUST NOT REACH: a STOP is not an error"
+END
+PRINT "stop: rc=":RC
+OEEOF
+for v in OEAB OEOK OE3 OESHELL OEBARE OESTOP; do
+  MVXPRIV=developer "$TCL" -a "$OEA" -c "CATALOG BP $v" >/dev/null 2>&1
+done
+
+shout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OESHELL 2>&1)"
+shrc=$?
+shwant="  v: aborting
+shell: that option gave up -- still here
+shell: the menu carries on
+  v: fine
+shell: logged off normally"
+if [ "$shout" = "$shwant" ] && [ "$shrc" = 0 ]; then
+  PASS=$((PASS + 1)); echo "  ON ERROR catches the abort and the menu runs on"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL on-error shell: rc=$shrc"
+  printf '%s\n' "$shout" | sed 's/^/    | /' | head -8
+fi
+
+bareout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OEBARE 2>&1)"
+barerc=$?
+case "$bareout" in *"MUST NOT REACH"*) bareok=0 ;; *) bareok=1 ;; esac
+if [ "$bareok" = 1 ] && [ "$barerc" != 0 ]; then
+  PASS=$((PASS + 1)); echo "  without the clause an abort still takes the caller"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL on-error bare: rc=$barerc out=[$bareout]"
+fi
+
+stopout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OESTOP 2>&1)"
+if [ "$stopout" = "  v: stopping 3
+stop: rc=3" ]; then
+  PASS=$((PASS + 1)); echo "  a non-zero STOP is a status, not an error"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL on-error stop: [$stopout]"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
