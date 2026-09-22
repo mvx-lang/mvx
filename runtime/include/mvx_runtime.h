@@ -60,6 +60,14 @@ typedef struct mvx_ctx  mvx_ctx;
 /* --- context ----------------------------------------------------------- */
 mvx_ctx *mvx_ctx_create(void);
 void     mvx_ctx_destroy(mvx_ctx *ctx);
+/* ENVIRONMENT LEVELS (mvx#248).  A level is one running program.  It shares
+   the session -- open files, locks, the select list, the transaction, and the
+   terminal's print column -- with the program that started it, and has its
+   own unnamed COMMON, STATUS and sentence.  COMMON /NAME/ spans levels;
+   COMMON with no name does not.  This is what an in-process EXECUTE pushes;
+   a CALL pushes nothing, because a subroutine runs inside its caller. */
+mvx_ctx *mvx_level_push(mvx_ctx *parent, const char *sentence);
+void     mvx_level_pop(mvx_ctx *level);
 
 /* Directory of the loaded libmvxrt; the anchor for relocatable installs
    (drivers beside it, ../bin, ../share/mvx/system).  "" if unknown. */

@@ -4360,6 +4360,78 @@ else
   sed 's/^/    /' "$TESTROOT/clerr" | head -10
 fi
 
+# ---------------------------------------------------------------------------
+# ENVIRONMENT LEVELS (mvx#248).
+#
+# A level is one running program.  Until a program reached by EXECUTE runs in
+# this process, the operating system does the separating and none of this is
+# written down -- in one process every piece of state is either deliberately
+# shared or deliberately fresh, and the failure when one is wrong is SILENT:
+# the caller reads a value it never wrote, or fails to read one it did.
+#
+# The expected answers are jBASE 6.2.1.1's, measured by running the same shape
+# there: a program reached by EXECUTE read the caller's NAMED common and found
+# its UNNAMED common uninitialised.
+#
+# The transaction is the exception, and the reason for the whole exercise.
+# jBASE and UniData both leave an EXECUTE'd program OUTSIDE the caller's
+# transaction, looking at a stale view; here it is inside one, so its write is
+# part of what the caller commits.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a program at a new level shares the session and keeps the rest"
+  LVA="$TESTROOT/levels"; mkdir -p "$LVA"
+  printf '# MVX account descriptor\nname=levels\nversion=1\n' > "$LVA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$LVA" > "$LVA/BINDINGS"
+  "$TCL" -a "$LVA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  cat > "$TESTROOT/lvchild.b" <<'LVEOF'
+COMMON UNC
+COMMON /NM/ NMC
+PRINT "  child sentence=[":SENTENCE():"]"
+PRINT "  child sees named=[":NMC:"]"
+PRINT "  child @TRANSACTION=":@TRANSACTION
+OPEN "ORD" TO F ELSE PRINT "  child: no ORD" ; STOP
+WRITE "written by the child" ON F, "FROMCHILD"
+NMC = "child-named"
+UNC = "child-unnamed"
+LVEOF
+  "$MVX" --catalog "$TESTROOT/lvchild.b" -o "$LVA/lvchild" >/dev/null 2>&1
+  if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/levels.c" \
+        -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/levels-test" \
+        2>"$TESTROOT/lverr"; then
+    # MVX_SENTENCE is set to something the child must NOT see: SENTENCE() used
+    # to read it from the environment on every call, which one process makes
+    # wrong -- the caller's sentence would change underneath it.
+    lvout="$(cd "$LVA" && MVXACCOUNT=. MVX_SENTENCE="THE PARENT SENTENCE" \
+      DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+      "$TESTROOT/levels-test" "$LVA/lvchild" 2>&1)"
+    lvrc=$?
+    lvwrote="$(sqlite3 "$LVA/acct.sqlite" \
+      'SELECT id FROM "ORD" WHERE id = '"'"'FROMCHILD'"'"';' 2>/dev/null)"
+    lvwant="  child sentence=[CHILD ITS OWN SENTENCE]
+  child sees named=[parent-named]
+  child @TRANSACTION=1
+levels:   a named COMMON block crosses into the level and back
+levels:   the unnamed COMMON block is the caller's own
+levels: a level shares the session and keeps the rest"
+    if [ "$lvrc" = 0 ] && [ "$lvout" = "$lvwant" ] \
+       && [ "$lvwrote" = FROMCHILD ]; then
+      PASS=$((PASS + 1))
+      echo "  its own sentence, its own unnamed COMMON, the caller's named one"
+      PASS=$((PASS + 1))
+      echo "  and it writes inside the caller's transaction, which commits it"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL levels: rc=$lvrc wrote=[$lvwrote]"
+      printf '%s\n' "$lvout" | sed 's/^/    | /' | head -12
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL levels: did not compile"
+    sed 's/^/    /' "$TESTROOT/lverr" | head -10
+  fi
+else
+  echo "  (level tests skipped — sqlite driver not built)"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
