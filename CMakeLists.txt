@@ -402,6 +402,16 @@ target_link_libraries(mvx-doc-migrate PRIVATE mvxrt ${CMAKE_DL_LIBS})
 set_target_properties(mvx-doc-migrate PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# --- mvx-launch: the executable half of a cataloged program (mvx#248) --
+# Holds no program code.  A copy of it is published as CATALOG/<name>, and it
+# loads CATALOG/<name>.so beside itself -- so a program is compiled once and
+# exists on disk once, instead of being built both as an executable and as a
+# library.
+add_executable(mvx-launch tools/mvx_launch.c)
+target_link_libraries(mvx-launch PRIVATE mvxrt ${CMAKE_DL_LIBS})
+set_target_properties(mvx-launch PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # --- classic TCL shell -------------------------------------------------
 add_executable(mvx tcl/mvx_tcl.c)
 target_link_libraries(mvx PRIVATE mvxrt ${CMAKE_DL_LIBS})
@@ -420,12 +430,24 @@ set_target_properties(mvx PROPERTIES
 set(MVX_SYS_DIR ${CMAKE_BINARY_DIR}/system)
 file(GLOB MVX_VERB_SOURCES ${CMAKE_SOURCE_DIR}/verbs/*.b)
 set(MVX_SYS_VERBS "")
+# --catalog, the same way the CATALOG verb publishes anything (mvx#248): a
+# main program has to be loadable, so the runtime can run it in an existing
+# process instead of forking, and the driver decides what that takes -- one
+# file on macOS, where an executable is also loadable, and two where it is
+# not.  The verbs need it as much as anything a user catalogs: they are ALL
+# main programs, so leaving them out would make a standard verb the one kind
+# of EXECUTE that still has to spawn.
+#
+# BYPRODUCTS rather than a second OUTPUT, because whether there IS a second
+# file is the driver's decision and not one CMake can see.
 foreach(vsrc ${MVX_VERB_SOURCES})
   get_filename_component(vname ${vsrc} NAME_WE)
   add_custom_command(OUTPUT ${MVX_SYS_DIR}/CATALOG/${vname}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MVX_SYS_DIR}/CATALOG
-    COMMAND $<TARGET_FILE:mvx-basic> ${vsrc} -o ${MVX_SYS_DIR}/CATALOG/${vname}
-    DEPENDS mvx-basic mvxrt mvx_crt mvxdrv_dir mvxdrv_lmdb ${vsrc}
+    COMMAND $<TARGET_FILE:mvx-basic> --catalog ${vsrc}
+            -o ${MVX_SYS_DIR}/CATALOG/${vname}
+    BYPRODUCTS ${MVX_SYS_DIR}/CATALOG/${vname}${CMAKE_SHARED_LIBRARY_SUFFIX}
+    DEPENDS mvx-basic mvx-launch mvxrt mvx_crt mvxdrv_dir mvxdrv_lmdb ${vsrc}
     COMMENT "Cataloging ${vname}")
   list(APPEND MVX_SYS_VERBS ${MVX_SYS_DIR}/CATALOG/${vname})
 endforeach()
@@ -507,7 +529,10 @@ endif()
 set_target_properties(mvx mvx-basic mvx-git-adopt PROPERTIES
   INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 
-set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd)
+# mvx-launch is installed even though nothing invokes it by name: --catalog
+# copies it beside a cataloged program, so a tree without it cannot catalog
+# on a platform that needs the loader (mvx#248).
+set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd mvx-launch)
 if(MVX_WITH_DAEMON)
   list(APPEND MVX_INSTALL_BINS mvx-lmdbd mvx-lmdbd-admin)
 endif()

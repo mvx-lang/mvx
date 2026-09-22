@@ -66,7 +66,10 @@
             IF ISSUB THEN
                RC = COMPILE("shared", BPDIR:"/":IT, PDIR:"/LIB/":IT)
             END ELSE
-               RC = COMPILE("exe", BPDIR:"/":IT, PDIR:"/CATALOG/":IT)
+               * Published the way CATALOG publishes one (mvx#248): loadable,
+               * so the runtime can run it in an existing process, in
+               * whatever number of files this platform needs.
+               RC = COMPILE("catalog", BPDIR:"/":IT, PDIR:"/CATALOG/":IT)
             END
             IF RC = 0 THEN
                NBUILT = NBUILT + 1

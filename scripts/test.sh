@@ -1172,6 +1172,37 @@ check tcl-pkgfunction "$( \
   echo '--- and a DEFFUN call resolves across the boundary'; \
   (cd "$FNACC" && MVXACCOUNT=. ./CATALOG/USEFN) 2>&1 | normalise)"
 
+# THE SAME CLASSIFICATION, THE OTHER BUILDER.  The check above runs BUILD-PKG,
+# the verb; mkpkg.sh builds the same package shape from the shell, and it kept
+# the #101 bug for both of them -- it tested only SUBROUTINE, so a FUNCTION was
+# treated as a main program and the link failed on a missing _mvx_main.  One
+# path being tested is what let the other stay broken.
+MKPKG="$TESTROOT/mkfnpkg"; mkdir -p "$MKPKG/BP"
+printf '# MVX account descriptor\nname=mkfnpkg\nversion=1\n' > "$MKPKG/.mvx"
+printf 'mkfnpkg\n1.0.0\nclassification under mkpkg\n' > "$MKPKG/PKG"
+printf 'FUNCTION TRIPLE(X)\nRETURN(X * 3)\n' > "$MKPKG/BP/TRIPLE"
+printf 'SUBROUTINE NOTE(S)\nS = "noted"\nRETURN\n' > "$MKPKG/BP/NOTE"
+printf 'PRINT "a program"\n' > "$MKPKG/BP/APROG"
+if MVXPRIV=developer "$ROOT/scripts/mkpkg.sh" "$MKPKG" >"$TESTROOT/mkpkgout" 2>&1
+then
+  mkcat="$(ls "$MKPKG/CATALOG" 2>/dev/null | grep -v dSYM | grep -v '\.so$' \
+           | grep -v '\.dylib$' | sort | tr '\n' ' ')"
+  mklib="$(ls "$MKPKG/LIB" 2>/dev/null | grep -v dSYM | wc -l | tr -d ' ')"
+  # Only the PROGRAM is cataloged; the FUNCTION and the SUBROUTINE bundle
+  # into the package library and get none of the program treatment.
+  if [ "$mkcat" = "APROG " ] && [ "$mklib" -ge 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  mkpkg catalogs only the program, not the FUNCTION or SUBROUTINE"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL mkpkg classification: CATALOG=[$mkcat] LIB entries=$mklib"
+    sed 's/^/    | /' "$TESTROOT/mkpkgout" | tail -6
+  fi
+else
+  FAIL=$((FAIL + 1)); echo "FAIL mkpkg classification: build failed"
+  sed 's/^/    | /' "$TESTROOT/mkpkgout" | tail -8
+fi
+
 # Fetched and built once here, reused by every package test below.
 PKG_GETOPT="$(pkg_dir getopt)"
 PKG_CMD="$(pkg_dir cmd)"
@@ -4272,6 +4303,63 @@ fi
 # only moment that change is provably behaviour-neutral.  This is what keeps
 # them in: a rule nothing checks is a rule that decays, and this one has to hold
 # across six files that have no other reason to agree with each other.
+# ---------------------------------------------------------------------------
+# A CATALOGED PROGRAM CAN BE LOADED AND CALLED IN THIS PROCESS (mvx#248).
+#
+# A main program compiles to mvx_main(ctx) whichever way it is linked, so the
+# same source can be published in a form the runtime loads instead of forking.
+# How many FILES that takes differs: on macOS an executable is also loadable
+# and there is one, elsewhere there is a library plus a small loader.  The
+# test resolves a base path the way the runtime will have to -- suffix first,
+# then plain -- so the rule is what is under test, not one platform's shape.
+#
+# Nothing consumes this yet, which is exactly why it needs a test: an
+# artifact nobody loads is an artifact nobody notices has stopped working.
+#
+# It loads TWO programs, because every main exports the same symbol and a
+# one-program test would pass whatever the loader did with the second.
+echo "== a cataloged program can be loaded and called in-process"
+CLA="$TESTROOT/catload-acct"
+"$ROOT/scripts/mkaccount.sh" "$CLA" >/dev/null 2>&1
+mkdir -p "$CLA/BP"
+printf 'PRINT "this is program ONE"\n' > "$CLA/BP/PONE"
+printf 'PRINT "this is program TWO"\n' > "$CLA/BP/PTWO"
+MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP PONE' >"$TESTROOT/clc" 2>&1
+MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP PTWO' >>"$TESTROOT/clc" 2>&1
+if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/catalog-load.c" \
+      -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/catalog-load" \
+      2>"$TESTROOT/clerr"; then
+  clout="$(DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+    "$TESTROOT/catalog-load" "$CLA/CATALOG/PONE" "$CLA/CATALOG/PTWO" 2>&1)"
+  clwant="this is program ONE
+this is program TWO
+catalog-load: both cataloged programs ran in this process"
+  if [ "$clout" = "$clwant" ]; then
+    PASS=$((PASS + 1))
+    echo "  two cataloged programs load and each runs its own code"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL catalog-load: got [$clout]"
+    sed 's/^/    | /' "$TESTROOT/clc" | head -6
+  fi
+
+  # The standard verbs are cataloged by the BUILD rather than by the verb, so
+  # they are a second path to the same thing and drift if only one is checked.
+  # Probed, not run: a verb wants a sentence and an account.
+  vprobe="$(DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+    "$TESTROOT/catalog-load" --probe "$ROOT/build/system/CATALOG/LIST" \
+                                     "$ROOT/build/system/CATALOG/SORT" 2>&1)"
+  case "$vprobe" in
+    *"2 cataloged program(s) are loadable here")
+      PASS=$((PASS + 1)); echo "  and so do the standard verbs the build catalogs" ;;
+    *)
+      FAIL=$((FAIL + 1)); echo "FAIL verb loadable: $vprobe" ;;
+  esac
+else
+  FAIL=$((FAIL + 1)); echo "FAIL catalog-load: did not compile"
+  sed 's/^/    /' "$TESTROOT/clerr" | head -10
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
@@ -4641,6 +4729,17 @@ sd_is() {        # sd_is <label> <got> <want>
 sd_syms() {      # sd_syms <file> -> symbol count, 0 when stripped bare
   nm -a "$1" 2>/dev/null | wc -l | tr -d ' '
 }
+# WHICH FILE HOLDS THE PROGRAM (mvx#248).  A cataloged program is not always
+# the file the VOC record names: where an executable cannot also be loaded,
+# that file is a small loader with no program in it and the program is the
+# library beside it.  Counting symbols in the loader measures the loader --
+# which is a fixed prebuilt copy, identical whether STRIP was asked for or
+# not, so a strip test against it compares a file with itself.  Resolve the
+# same way the runtime does: the library suffix first, then the plain path.
+sd_prog() {      # sd_prog <base> -> the artifact carrying the program
+  case "$(uname -s)" in Darwin) _sfx=.dylib ;; *) _sfx=.so ;; esac
+  if [ -f "$1$_sfx" ]; then printf '%s' "$1$_sfx"; else printf '%s' "$1"; fi
+}
 cat > "$SD/hello.b" <<'EOF'
 PRINT "hello ":2 + 2
 EOF
@@ -4704,9 +4803,9 @@ mkdir -p "$SDA/BP" "$SDA/BP.DICT"
 printf 'FILE\375dir\n' > "$SDA/BP.DICT/%FILE%"
 cp "$SD/hello.b" "$SDA/BP/HELLO"
 MVXPRIV=developer "$TCL" -a "$SDA" -c 'CATALOG BP HELLO' >/dev/null 2>&1
-SDPLAIN="$(sd_syms "$SDA/CATALOG/HELLO")"
+SDPLAIN="$(sd_syms "$(sd_prog "$SDA/CATALOG/HELLO")")"
 MVXPRIV=developer "$TCL" -a "$SDA" -c 'CATALOG BP HELLO NODEBUG STRIP' >/dev/null 2>&1
-SDTHIN="$(sd_syms "$SDA/CATALOG/HELLO")"
+SDTHIN="$(sd_syms "$(sd_prog "$SDA/CATALOG/HELLO")")"
 sd_is "a verb cataloged with NODEBUG STRIP still runs" \
   "$(MVXPRIV=developer "$TCL" -a "$SDA" -c 'HELLO' 2>&1)" "hello 4"
 if [ "$SDTHIN" -lt "$SDPLAIN" ]; then

@@ -95,7 +95,17 @@ IF ISLIB THEN
    END
    STOP
 END
-RC = COMPILE("exe", FN:"/":IT, "CATALOG/":IT, OPTS)
+* PUBLISH IT (mvx#248).  A cataloged main program has to be LOADABLE, so the
+* runtime can run it inside an existing process instead of forking one -- an
+* EXECUTE'd program then shares the caller's open files, locks, select list
+* and transaction, rather than reopening everything and seeing a stale view.
+*
+* How many files that takes is the platform's business, not this verb's, so
+* the driver decides: one on macOS, where an executable can also be loaded,
+* and two where it cannot -- the program as CATALOG/<item>.so plus a small
+* loader published as CATALOG/<item>.  Either way the program itself is
+* compiled once and exists on disk once.
+RC = COMPILE("catalog", FN:"/":IT, "CATALOG/":IT, OPTS)
 IF RC = 0 ELSE
    PRINT "[247] compilation of ":IT:" failed"
    STOP
