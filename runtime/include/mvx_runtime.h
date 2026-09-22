@@ -77,6 +77,12 @@ typedef void (*mvx_program_fn)(mvx_ctx *);
    ABORT takes the caller with it. */
 int64_t  mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
                        const char *sentence);
+/* The same, but an ABORT stops HERE rather than passing through.  An abort
+   takes a calling PROGRAM with it and does not pass the prompt: on UniData
+   an ABORT in a verb returns you to TCL, it does not log you out.  *aborted
+   says which way it ended. */
+int64_t  mvx_level_run_at_prompt(mvx_ctx *parent, mvx_program_fn entry,
+                                 const char *sentence, int *aborted);
 /* End the running program from anywhere: STOP, ABORT and the fatal path all
    come through here.  aborting = 0 stops at the level that ran this program,
    1 passes through it. */

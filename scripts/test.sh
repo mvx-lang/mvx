@@ -4601,6 +4601,83 @@ else
   FAIL=$((FAIL + 1)); echo "FAIL execute fallback: [$fbout]"
 fi
 
+# ---------------------------------------------------------------------------
+# THE PROMPT RUNS VERBS IN THIS PROCESS (mvx#248).
+#
+# Three things follow that could not be done while each verb was its own
+# process, and one that must still be true.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a verb typed at the prompt runs in the session"
+  TPA="$TESTROOT/tcl-inproc"
+  "$ROOT/scripts/mkaccount.sh" "$TPA" >/dev/null 2>&1
+  printf 'ORD sqlite %s/acct.sqlite\n' "$TPA" >> "$TPA/BINDINGS"
+  "$TCL" -a "$TPA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  mkdir -p "$TPA/BP"
+  # Two verbs, one transaction: impossible when the second was a new process
+  # with a new store.
+  cat > "$TPA/BP/TPA1" <<'TPEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "no transaction" ; STOP
+WRITE "from the first verb" ON F, "V1"
+PRINT "A: wrote V1, @TRANSACTION=":@TRANSACTION
+TPEOF
+  cat > "$TPA/BP/TPA2" <<'TPEOF'
+PRINT "B: @TRANSACTION=":@TRANSACTION
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+WRITE "from the second verb" ON F, "V2"
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+PRINT "B: committed"
+TPEOF
+  # Open the file once, use it in a later verb -- how MV sites are laid out.
+  printf 'COMMON /FILES/ F.ORD\nOPEN "ORD" TO F.ORD ELSE PRINT "no ORD" ; STOP\nPRINT "LOGIN: opened"\n' \
+    > "$TPA/BP/TPLOG"
+  printf 'COMMON /FILES/ F.ORD\nREAD R FROM F.ORD, "V1" THEN PRINT "USE: ":R ELSE PRINT "USE: could not read"\n' \
+    > "$TPA/BP/TPUSE"
+  # And an abort must land back at the prompt, not end the session.
+  printf 'PRINT "V: aborting"\nABORT\n'   > "$TPA/BP/TPAB"
+  printf 'PRINT "V: still here"\n'         > "$TPA/BP/TPOK"
+  for v in TPA1 TPA2 TPLOG TPUSE TPAB TPOK; do
+    MVXPRIV=developer "$TCL" -a "$TPA" -c "CATALOG BP $v" >/dev/null 2>&1
+  done
+
+  txout="$(printf 'TPA1\nTPA2\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^[AB]:')"
+  txids="$(sqlite3 "$TPA/acct.sqlite" 'SELECT group_concat(id) FROM (SELECT id FROM "ORD" ORDER BY id);' 2>/dev/null)"
+  txwant="A: wrote V1, @TRANSACTION=1
+B: @TRANSACTION=1
+B: committed"
+  if [ "$txout" = "$txwant" ] && [ "$txids" = "V1,V2" ]; then
+    PASS=$((PASS + 1)); echo "  one transaction spans two verbs, and commits both"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl txn: ids=[$txids]"
+    printf '%s\n' "$txout" | sed 's/^/    | /' | head -6
+  fi
+
+  opout="$(printf 'TPLOG\nTPUSE\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^(LOGIN|USE):')"
+  if [ "$opout" = "LOGIN: opened
+USE: from the first verb" ]; then
+    PASS=$((PASS + 1)); echo "  a file opened by one verb is still open for the next"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl common files: [$opout]"
+  fi
+
+  # THE ABORT STOPS HERE.  It takes a calling PROGRAM with it, but the prompt
+  # is where it settles -- on UniData the command after an aborted verb runs
+  # and the session is still there.  Without that boundary every ABORT and
+  # every runtime fault would end the session.
+  about="$(printf 'TPAB\nTPOK\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^V:')"
+  if [ "$about" = "V: aborting
+V: still here" ]; then
+    PASS=$((PASS + 1)); echo "  an aborting verb returns to the prompt, session intact"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl abort: [$about]"
+  fi
+else
+  echo "  (prompt-in-process tests skipped — sqlite driver not built)"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.

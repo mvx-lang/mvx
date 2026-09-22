@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef __APPLE__
 #define LIB_SUFFIX ".dylib"
@@ -63,6 +64,32 @@ static void register_ext(const mvx_ext *e) {
     }
 }
 
+/* WHAT HAS ALREADY BEEN LOADED (mvx#248).  The scan can now run more than
+   once -- see mvx_ext_load_libs -- and a library loaded twice would register
+   its extension functions twice.  dlopen itself is refcounted and would not
+   mind, but the registry would grow a duplicate for every rescan. */
+typedef struct loaded_lib {
+    struct loaded_lib *next;
+    char path[1];
+} loaded_lib;
+static loaded_lib *g_libs;
+
+static int already_loaded(const char *path) {
+    for (loaded_lib *l = g_libs; l; l = l->next)
+        if (strcmp(l->path, path) == 0) return 1;
+    return 0;
+}
+
+static void remember_loaded(const char *path) {
+    size_t n = strlen(path);
+    loaded_lib *l = malloc(sizeof *l + n);
+    if (!l) return;                     /* forgetting costs a duplicate, not
+                                           correctness */
+    memcpy(l->path, path, n + 1);
+    l->next = g_libs;
+    g_libs = l;
+}
+
 static void load_dir(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) return;
@@ -74,6 +101,8 @@ static void load_dir(const char *dir) {
             continue;
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        if (already_loaded(path)) continue;
+        remember_loaded(path);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */
         if (!h) {
             /* SAY WHY (#117).  This used to fail silently, so a library built
@@ -122,8 +151,37 @@ static void register_builtins(void) {
     register_ext(mvx_msg_builtin());
 }
 
+/* A PACKAGE CAN BE LINKED WHILE THE SESSION IS RUNNING (mvx#248).
+ *
+ * This used to load once and never again, which was right while every verb
+ * was a forked process that did its own loading in its own account.  With
+ * verbs running in the session, a LINK-PKG during that session would never
+ * take effect: the subroutines in the package just linked stayed invisible,
+ * and a CALL to one failed with "subroutine is not cataloged" -- which is
+ * what CI caught, and it names the subroutine rather than the cause.
+ *
+ * So the PACKAGES file is stamped and the scan repeats when it changes.
+ * Nothing is UNloaded: a library already open may have pointers into it, and
+ * the cost of leaving it is an open handle rather than a wrong answer.  The
+ * account's own LIB/ is rescanned too, because BUILD-PKG can add to it. */
+static long long packages_stamp(void) {
+    struct stat sb;
+    if (stat("PACKAGES", &sb) != 0) return 0;
+#ifdef __APPLE__
+    return (long long)sb.st_mtimespec.tv_sec * 1000000000LL +
+           sb.st_mtimespec.tv_nsec + sb.st_size;
+#else
+    return (long long)sb.st_mtim.tv_sec * 1000000000LL +
+           sb.st_mtim.tv_nsec + sb.st_size;
+#endif
+}
+
+static long long g_pkgstamp = -1;
+
 void mvx_ext_load_libs(void) {
-    if (g_loaded) return;
+    long long stamp = packages_stamp();
+    if (g_loaded && stamp == g_pkgstamp) return;
+    g_pkgstamp = stamp;
     g_loaded = 1;
 
     register_builtins();                        /* before any dlopen */
