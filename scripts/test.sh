@@ -4432,6 +4432,98 @@ else
   echo "  (level tests skipped — sqlite driver not built)"
 fi
 
+# ---------------------------------------------------------------------------
+# STOP RETURNS TO THE CALLER, ABORT DOES NOT (mvx#248).
+#
+# UniData's split, measured there rather than chosen.  It matters because a
+# program run inside another is about to become ordinary: without it, an
+# in-process EXECUTE would end the caller every time the program it ran
+# reached its last line, and a verb run at the prompt would end the shell.
+#
+# Nothing runs a level yet, so with no catcher every path still ends the
+# process exactly as before -- which the rest of this suite is the check on.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a program that STOPs returns to whoever ran it"
+  UWA="$TESTROOT/unwind"; mkdir -p "$UWA"
+  printf '# MVX account descriptor\nname=unwind\nversion=1\n' > "$UWA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$UWA" > "$UWA/BINDINGS"
+  "$TCL" -a "$UWA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  printf 'PRINT "  child: plain STOP"\nSTOP\nPRINT "  NOT REACHED"\n' \
+    > "$TESTROOT/uwA.b"
+  printf 'PRINT "  child: STOP 7"\nSTOP 7\n'          > "$TESTROOT/uwB.b"
+  printf 'PRINT "  child: falls off the end"\n'        > "$TESTROOT/uwC.b"
+  printf 'PRINT "  child: ABORT"\nABORT\n'            > "$TESTROOT/uwD.b"
+  cat > "$TESTROOT/uwW.b" <<'UWEOF'
+OPEN "ORD" TO F ELSE PRINT "  child: no ORD" ; STOP
+WRITE "written then STOPped" ON F, "SURVIVE"
+PRINT "  child: wrote, now STOP without committing"
+STOP
+UWEOF
+  for u in A B C D W; do
+    "$MVX" --catalog "$TESTROOT/uw$u.b" -o "$UWA/uw$u" >/dev/null 2>&1
+  done
+  if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/unwind.c" \
+        -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/unwind-test" \
+        2>"$TESTROOT/uwerr"; then
+    uwrun() { DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+              "$TESTROOT/unwind-test" "$@" 2>&1; }
+
+    # Three ways of ending that all come back, each carrying its own code.
+    sout="$(cd "$UWA" && MVXACCOUNT=. uwrun stop "$UWA/uwA" "$UWA/uwB" "$UWA/uwC")"
+    swant="  child: plain STOP
+caller: uwA came back, rc=0
+  child: STOP 7
+caller: uwB came back, rc=7
+  child: falls off the end
+caller: uwC came back, rc=0
+unwind: the caller ran on"
+    if [ "$sout" = "$swant" ]; then
+      PASS=$((PASS + 1)); echo "  STOP, STOP <code> and the last line all return, with the code"
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL unwind stop:"
+      printf '%s\n' "$sout" | sed 's/^/    | /' | head -10
+    fi
+
+    # And one that must NOT: the caller is never resumed, so neither the
+    # second program nor the closing line can appear.
+    aout="$(cd "$UWA" && MVXACCOUNT=. uwrun stop "$UWA/uwD" "$UWA/uwC")"; arc=$?
+    case "$aout" in
+      *"came back"*|*"ran on"*) aok=0 ;;
+      *) aok=1 ;;
+    esac
+    if [ "$aok" = 1 ] && [ "$arc" != 0 ]; then
+      PASS=$((PASS + 1)); echo "  ABORT passes through and takes the caller with it"
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL unwind abort: rc=$arc out=[$aout]"
+    fi
+
+    # AND THE TRANSACTION SURVIVES A STOP (mvx#247).  A STOP that unwinds
+    # never reaches exit(), so the rollback registered there does not run --
+    # which is what lets a transaction be started in one program, written by
+    # another that ends, and committed by a third.
+    tout="$(cd "$UWA" && MVXACCOUNT=. uwrun txn "$UWA/uwW")"
+    twrote="$(sqlite3 "$UWA/acct.sqlite" \
+      'SELECT id FROM "ORD" WHERE id = '"'"'SURVIVE'"'"';' 2>/dev/null)"
+    twant="  child: wrote, now STOP without committing
+caller: uwW came back, rc=0
+caller: @TRANSACTION is still 1 after it ended
+caller: commit -> 1
+unwind: the caller ran on"
+    if [ "$tout" = "$twant" ] && [ "$twrote" = SURVIVE ]; then
+      PASS=$((PASS + 1))
+      echo "  a transaction outlives the program that STOPped inside it"
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL unwind txn: wrote=[$twrote]"
+      printf '%s\n' "$tout" | sed 's/^/    | /' | head -8
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL unwind: did not compile"
+    sed 's/^/    /' "$TESTROOT/uwerr" | head -10
+  fi
+else
+  echo "  (unwind tests skipped — sqlite driver not built)"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.

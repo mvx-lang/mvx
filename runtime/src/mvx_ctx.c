@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include <libgen.h>
 #include <stdio.h>
+#include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -167,6 +168,10 @@ typedef struct mvx_session {
 
 struct mvx_ctx {
     mvx_session *session;   /* shared with every other level */
+    jmp_buf unwind;         /* where mvx_level_run resumes; see level_unwind */
+    int catching;           /* 1 while a caller is prepared to catch */
+    int64_t stop_code;      /* what the STOP asked for */
+    int aborting;           /* ABORT or a fault: do not stop at this level */
     common_block *unnamed;  /* COMMON with no name: THIS program's own */
     int64_t status;         /* STATUS(): this program's last conversion, so a
                                program called by another cannot change what
@@ -179,6 +184,47 @@ struct mvx_ctx {
                                change the caller's sentence underneath it, and
                                leave it changed after the call returned. */
 };
+
+/* THE INNERMOST RUNNING LEVEL (mvx#248).
+ *
+ * STOP, ABORT and the runtime's own fatal path take no context -- they are
+ * called from anywhere, including deep inside the runtime -- so the level
+ * they are ending has to be findable without one.  One session per process
+ * and no threads, so a file-scope pointer is the whole mechanism, as it is
+ * for the transaction's exit handler in mvx_store.c.
+ *
+ * NULL until something runs a program at a level, which is what makes this
+ * behaviour-neutral for now: with no catcher, every path below ends the
+ * process exactly as it did before. */
+static mvx_ctx *g_level;
+
+/* End the running program: return to whoever ran this level if there is one,
+ * end the process if there is not.
+ *
+ * STOP RETURNS TO THE CALLER; ABORT AND A FAULT DO NOT.  Measured on UniData:
+ * a STOP in a program reached by EXECUTE comes back to its caller and the
+ * caller keeps running, while an ABORT or a runtime fault takes the caller
+ * with it.  So an abort passes THROUGH a level instead of stopping at it, and
+ * settles wherever something is prepared to catch it -- which is why it
+ * carries a flag rather than being a different unwind.
+ *
+ * A STOP that unwinds never reaches exit(), so the transaction's exit handler
+ * does not run and an open transaction SURVIVES into the caller (mvx#247).
+ * That is deliberate rather than incidental: the pattern this serves starts a
+ * transaction in one program and commits it in another, and a STOP in between
+ * is ordinary control flow, not a reason to discard the work. */
+static void level_unwind(int64_t code, int aborting) __attribute__((noreturn));
+static void level_unwind(int64_t code, int aborting) {
+    mvx_ctx *lv = g_level;
+    if (lv && lv->catching) {
+        lv->stop_code = code;
+        lv->aborting = aborting;
+        longjmp(lv->unwind, 1);
+    }
+    exit((int)(code & 0xFF));
+}
+
+void mvx_level_end(int64_t code, int aborting) { level_unwind(code, aborting); }
 
 void *mvx_ctx_store_get(mvx_ctx *ctx) { return ctx->session->store; }
 void  mvx_ctx_store_set(mvx_ctx *ctx, void *p) { ctx->session->store = p; }
@@ -255,6 +301,44 @@ mvx_ctx *mvx_level_push(mvx_ctx *parent, const char *sentence) {
     ctx->sentence = strdup(sentence ? sentence : "");
     if (!ctx->sentence) mvx_fatal("out of memory creating a program level");
     return ctx;
+}
+
+/* RUN A PROGRAM AT A NEW LEVEL, and catch what it ends with (mvx#248).
+ *
+ * This is what an in-process EXECUTE calls, and it is where the setjmp lives,
+ * because the level that CATCHES is the one that ran the program -- not the
+ * one that stopped.
+ *
+ * Returns the code the program ended with: 0 for falling off the end, and
+ * whatever STOP asked for otherwise.  An ABORT or a runtime fault does not
+ * come back here at all; it is re-raised so it passes through this level and
+ * settles at the next catcher, ending the process if there is none, which is
+ * what UniData does when nothing is left to return to.
+ *
+ * `volatile` on rc because it is written after the setjmp and read after the
+ * longjmp, which is the one thing setjmp does not promise to preserve. */
+int64_t mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
+                      const char *sentence) {
+    mvx_ctx *lv = mvx_level_push(parent, sentence);
+    mvx_ctx *prev = g_level;
+    volatile int64_t rc = 0;
+    g_level = lv;
+    lv->catching = 1;
+
+    if (setjmp(lv->unwind) == 0) {
+        entry(lv);                      /* fell off the end: an ordinary end */
+    } else if (lv->aborting) {
+        int64_t code = lv->stop_code;
+        g_level = prev;
+        mvx_level_pop(lv);
+        level_unwind(code, 1);          /* keep going up; never returns here */
+    } else {
+        rc = lv->stop_code;             /* a STOP: this is where it lands */
+    }
+
+    g_level = prev;
+    mvx_level_pop(lv);
+    return rc;
 }
 
 /* Drop a level.  The session stays: it belongs to whoever is still running,
