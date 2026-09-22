@@ -156,9 +156,12 @@ static void register_builtins(void) {
  * This used to load once and never again, which was right while every verb
  * was a forked process that did its own loading in its own account.  With
  * verbs running in the session, a LINK-PKG during that session would never
- * take effect: the subroutines in the package just linked stayed invisible,
- * and a CALL to one failed with "subroutine is not cataloged" -- which is
- * what CI caught, and it names the subroutine rather than the cause.
+ * take effect: the subroutines in the package just linked stay invisible, and
+ * a CALL to one fails with "subroutine is not cataloged" -- a message that
+ * names the subroutine and says nothing about the cause.
+ *
+ * Shown by restoring the one-shot and running LINK-PKG between two calls:
+ * both fail, where with the rescan the second succeeds.
  *
  * So the PACKAGES file is stamped and the scan repeats when it changes.
  * Nothing is UNloaded: a library already open may have pointers into it, and

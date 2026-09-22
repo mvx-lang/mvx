@@ -4273,6 +4273,11 @@ if [ "$QUICK" = 0 ]; then
         *)
           FAIL=$((FAIL + 1))
           echo "FAIL install: the bundled MVPKG does not run (${itrip:-?}):"
+          echo "    and in the CATALOG executables?"
+          for L in "$ISYS/CATALOG"/*; do
+            case "$L" in *.so|*.dSYM) continue ;; esac
+            nm -D "$L" 2>/dev/null | grep -q "mvx_sub_GETOPT" && echo "      $L"
+          done | head -5
           printf '%s\n' "$mout" | head -5 | sed 's/^/    | /' ;;
       esac
     else
@@ -4676,6 +4681,37 @@ V: still here" ]; then
   fi
 else
   echo "  (prompt-in-process tests skipped — sqlite driver not built)"
+fi
+
+# A PACKAGE LINKED MID-SESSION TAKES EFFECT (mvx#248).
+#
+# Subroutine libraries used to load once per process, which was right while
+# every verb was a forked process that did its own loading.  With verbs
+# running in the session, a LINK-PKG during that session would never be seen:
+# the subroutines in the package just linked stay invisible and a CALL to one
+# fails with "subroutine is not cataloged" -- a message that names the
+# subroutine and says nothing about the cause.
+#
+# Restoring the one-shot makes the second CALL below fail too, which is how
+# this was confirmed to be testing something.
+echo "== a package linked during a session is usable in it"
+LPP="$TESTROOT/linkpkg-pkg"; mkdir -p "$LPP/BP"
+printf '# MVX account descriptor\nname=lpp\nversion=1\n' > "$LPP/.mvx"
+printf 'lpp\n1.0.0\na package with a subroutine\n' > "$LPP/PKG"
+printf 'SUBROUTINE LPP.HELLO(R)\nR = "from the linked package"\nRETURN\n' \
+  > "$LPP/BP/LPP.HELLO"
+MVXPRIV=developer "$ROOT/scripts/mkpkg.sh" "$LPP" >/dev/null 2>&1
+LPA="$TESTROOT/linkpkg-acct"
+"$ROOT/scripts/mkaccount.sh" "$LPA" >/dev/null 2>&1
+mkdir -p "$LPA/BP"
+printf 'CALL LPP.HELLO(R)\nPRINT "got: ":R\n' > "$LPA/BP/LPUSE"
+MVXPRIV=developer "$TCL" -a "$LPA" -c 'CATALOG BP LPUSE' >/dev/null 2>&1
+lpout="$(printf 'LPUSE\nLINK-PKG %s\nLPUSE\nOFF\n' "$LPP" \
+         | MVXPRIV=developer "$TCL" -a "$LPA" 2>&1 | grep -c 'got: from the linked package')"
+if [ "$lpout" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  a LINK-PKG is visible to the next CALL in the same session"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL link-pkg mid-session: $lpout successful call(s), want 1"
 fi
 
 echo "== records as documents"
