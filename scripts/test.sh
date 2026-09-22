@@ -3335,6 +3335,54 @@ SQW2EOF
   # connection; the sqlite3 CLI above IS a second connection, so the counts
   # having been readable at all is the evidence that it committed.
 
+  # THE TORN WRITE, INJECTED (mvx#244).  A mapped write is the record, the
+  # parent columns, then a DELETE and N INSERTs per association.  The store
+  # brackets the lot in one transaction so half of it can never survive -- a
+  # guarantee that had no test, because the only way to break it is to fail
+  # between two statements no caller can see.  MVX_FAULT does that:
+  #
+  #   mapcrash  the process dies with the transaction open, so what is
+  #             asserted is that SQLITE discards it -- not merely that the
+  #             store remembered to call rollback
+  #   mapchild  the projection fails and the store must roll back itself
+  #
+  # Distinct ids matter: rewriting the SAME id with the same content would
+  # look identical whether it rolled back or not, and would prove nothing.
+  cat > "$TESTROOT/sqtorn.b" <<'SQTEOF'
+OPEN "ORD" TO F ELSE STOP
+ID = ENV("TORNID")
+WRITE "C":ID:@AM:"5":@VM:"6":@VM:"7":@AM:"10":@VM:"20":@VM:"30" ON F, ID
+SQTEOF
+  if "$MVX" "$TESTROOT/sqtorn.b" -o "$TESTROOT/sqtorn" 2>/dev/null; then
+    before="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD";' 2>/dev/null)"
+    (cd "$SQA" && MVXACCOUNT=. TORNID=T1 "$TESTROOT/sqtorn" >/dev/null 2>&1)
+    (cd "$SQA" && MVXACCOUNT=. TORNID=T2 MVX_FAULT=mapcrash \
+       "$TESTROOT/sqtorn" >/dev/null 2>&1)
+    crashrc=$?
+    (cd "$SQA" && MVXACCOUNT=. TORNID=T3 MVX_FAULT=mapchild \
+       "$TESTROOT/sqtorn" >/dev/null 2>&1)
+    good="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'T1'"'"';' 2>/dev/null)"
+    goodc="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES" WHERE id = '"'"'T1'"'"';' 2>/dev/null)"
+    torn="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id IN ('"'"'T2'"'"','"'"'T3'"'"');' 2>/dev/null)"
+    tornc="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES" WHERE id IN ('"'"'T2'"'"','"'"'T3'"'"');' 2>/dev/null)"
+    if [ "$crashrc" = 97 ] && [ "$good" = 1 ] && [ "$goodc" = 3 ] \
+       && [ "$torn" = 0 ] && [ "$tornc" = 0 ]; then
+      PASS=$((PASS+1))
+      echo "  a mapped write torn part way leaves neither record nor rows"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL sqlite torn write: crash-rc='$crashrc' clean=$good/$goodc(want 1/3)" \
+           "torn=$torn/$tornc(want 0/0), before=$before"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL sqlite torn write: did not compile"
+  fi
+
+
   # TWO FIELDS ON ONE ATTRIBUTE (#158).  Two dictionary items may name the same
   # attribute -- PRICE with MD2 and PRICE.RAW with no conversion are one stored
   # value read two ways.  Mirroring both is the point of mirror mode: every

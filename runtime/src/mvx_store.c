@@ -2015,6 +2015,39 @@ static int map_child_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
    SQL is columns and rows, so re-emitting every column and re-DELETE/INSERTing
    every child row on each write is wasteful — we diff against `old` and touch
    only what moved.  With `old` NULL (a new record) the full projection runs. */
+/* FAULT INJECTION FOR THE TORN MAPPED WRITE (mvx#244).
+ *
+ * A mapped write is the record, then the parent columns, then a DELETE and N
+ * INSERTs per association -- several statements across several tables, which
+ * the store brackets in one transaction so half of it can never survive.
+ * That guarantee had no test: the suite checked the projection was correct,
+ * never that a failure part way through took the record with it.
+ *
+ * It cannot be tested from outside, because the only way in is to fail
+ * between two statements the caller cannot see.  So there is a switch, read
+ * once and off unless it is set:
+ *
+ *   MVX_FAULT=mapchild   the projection fails after the parent columns land,
+ *                        which is the path where the store must roll back
+ *   MVX_FAULT=mapcrash   the process dies there instead, leaving the
+ *                        transaction open -- which tests that the DATABASE
+ *                        discards it, not merely that we remembered to call
+ *                        rollback
+ *
+ * An untestable guarantee rots.  A getenv on the first mapped write is
+ * cheaper than finding out from a customer that the two disagree. */
+static int map_fault(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *v = getenv("MVX_FAULT");
+        mode = !v ? 0
+             : strcmp(v, "mapchild") == 0 ? 1
+             : strcmp(v, "mapcrash") == 0 ? 2
+             : 0;
+    }
+    return mode;
+}
+
 static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
                        int64_t idlen, const mv_value *rec,
                        const mv_value *old) {
@@ -2048,6 +2081,13 @@ static int map_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m, const char *id,
     }
     if (nchg > 0 && !b->driver->map_apply(f, id, idlen, pcol, vals, vlens, nchg))
         ok = 0;
+
+    /* The record and the parent columns are in; the child tables are not.
+       This is the exact moment the transaction exists for (mvx#244). */
+    if (ok && map_fault()) {
+        if (map_fault() == 2) _exit(97);   /* die with the transaction open */
+        ok = 0;                            /* or fail, and let it roll back */
+    }
 
     /* association child tables — skip any association left untouched */
     if (ok && b->driver->map_child_apply) {
