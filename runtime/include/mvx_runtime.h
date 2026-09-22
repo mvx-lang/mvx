@@ -417,6 +417,18 @@ int64_t mvx_id_encode(const char *id, int64_t idlen, int cs, char *out,
                       size_t cap);
 int64_t mvx_id_decode(const char *txt, int64_t txtlen, char *out, size_t cap);
 
+/* --- Language transactions (see mvx_store.c, mvx#247) ------------------
+   Several writes bracketed so they commit or roll back as one unit.  Start
+   and commit answer whether they worked, so the statement's THEN/ELSE has
+   something to test; abort has no answer, which is why UniData and UniVerse
+   both refuse a clause on it.  The transaction is scoped to a CONNECTION,
+   not to a program: the first write inside one enrols a (driver, location)
+   and a write to any other is refused. */
+int64_t     mvx_txn_start(mvx_ctx *ctx);
+int64_t     mvx_txn_commit(mvx_ctx *ctx);
+void        mvx_txn_abort(mvx_ctx *ctx);
+int64_t     mvx_txn_depth(mvx_ctx *ctx);   /* @TRANSACTION */
+
 /* --- Sessions and messaging (see mvx_msg.c, mvx#226) -------------------
    The session registry lives in mvx-msgd; every call here degrades to a
    harmless value when there is no daemon, and none of them blocks for more

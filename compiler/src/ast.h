@@ -90,6 +90,9 @@ struct Stmt {
         Readnext,   // name: id var; THEN/ELSE
         Execute,    // value: sentence; name: CAPTURING var; name2: RETURNING
         Formlist,   // value: dynamic array -> active select list
+        TxnStart,   // TRANSACTION START  — THEN/ELSE on whether it started
+        TxnCommit,  // TRANSACTION COMMIT — THEN/ELSE on whether it committed
+        TxnAbort,   // TRANSACTION ABORT  — no clause: nothing to branch on
     };
     enum class LoopCond { None, While, Until };
 
