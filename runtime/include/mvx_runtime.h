@@ -68,6 +68,19 @@ void     mvx_ctx_destroy(mvx_ctx *ctx);
    a CALL pushes nothing, because a subroutine runs inside its caller. */
 mvx_ctx *mvx_level_push(mvx_ctx *parent, const char *sentence);
 void     mvx_level_pop(mvx_ctx *level);
+/* The entry point every compiled main program exports. */
+typedef void (*mvx_program_fn)(mvx_ctx *);
+/* Run one at a new level and catch how it ended: 0 for falling off the end,
+   else what STOP asked for.  An ABORT or a runtime fault is NOT caught here
+   -- it passes through and settles at the next catcher, ending the process if
+   there is none, which is what UniData does.  STOP returns to the caller;
+   ABORT takes the caller with it. */
+int64_t  mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
+                       const char *sentence);
+/* End the running program from anywhere: STOP, ABORT and the fatal path all
+   come through here.  aborting = 0 stops at the level that ran this program,
+   1 passes through it. */
+void     mvx_level_end(int64_t code, int aborting) __attribute__((noreturn));
 
 /* Directory of the loaded libmvxrt; the anchor for relocatable installs
    (drivers beside it, ../bin, ../share/mvx/system).  "" if unknown. */
