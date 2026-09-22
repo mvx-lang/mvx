@@ -215,15 +215,24 @@ for src in "$PKG"/BP/* "$PKG"/*.BP/*; do
     line ~ /^[ \t]*$/ { next }
     { n = split(line, a, /[ \t]/); print a[1]; exit }
   ' "$src")"
-  if [ "$first" = "SUBROUTINE" ]; then
+  # A FUNCTION bundles into the library exactly as a SUBROUTINE does: it
+  # shares the subroutine ABI, with argv[0] reserved for the result.  Without
+  # it here a FUNCTION was treated as a main program and the link failed on a
+  # missing _mvx_main -- the same mvx#101 the CATALOG and BUILD-PKG verbs both
+  # fixed, which this script never did.  Only PROGRAMS are cataloged.
+  if [ "$first" = "SUBROUTINE" ] || [ "$first" = "FUNCTION" ]; then
     SUBS="$SUBS $src"
     echo "  bundling $name"
   else
     # MVXSYSTEM=$PKG so the compiler sees this package's own EXPORTS — a verb
     # may call the package's extension functions as expressions; MVXACCOUNT
     # (when set) adds the dependencies' EXPORTS resolved above.
+    # --catalog, as CATALOG and the standard verbs publish one (mvx#248): a
+    # main program has to be loadable so the runtime can run it inside an
+    # existing process rather than forking.  One file or two, whichever this
+    # platform needs -- the driver decides, not this script.
     MVXSYSTEM="$PKG" MVXACCOUNT="$DEPACCT" \
-      "$MVXBASIC" "$src" -o "$PKG/CATALOG/$name"
+      "$MVXBASIC" --catalog "$src" -o "$PKG/CATALOG/$name"
     echo "  cataloged $name"
   fi
 done

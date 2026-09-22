@@ -446,7 +446,8 @@ void mvx_tmpnam(mv_value *dst) {
 /* --- compile — the narrow primitive (developer+) -----------------------
    Takes structured arguments and builds the argv itself: there is
    nothing to inject (8.2). mode: "c" object, "exe" executable,
-   "shared" subroutine library. */
+   "shared" subroutine library, "catalog" publish a cataloged main
+   program. */
 
 int64_t mvx_compile(mvx_ctx *ctx, const mv_value *mode,
                     const mv_value *src, const mv_value *out) {
@@ -464,7 +465,7 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
     }
     char mb[40], sb[40], ob[40];
     const char *mp, *sp, *op;
-    mv_val_chars(mode, mb, sizeof mb, &mp);
+    int64_t ml = mv_val_chars(mode, mb, sizeof mb, &mp);
     int64_t sl = mv_val_chars(src, sb, sizeof sb, &sp);
     int64_t ol = mv_val_chars(out, ob, sizeof ob, &op);
     if (sl == 0 || ol == 0) return -1;
@@ -528,7 +529,15 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
     char *argv[10];
     int n = 0;
     argv[n++] = mvx;
-    if (mp[0] == 'c' || mp[0] == 'C') argv[n++] = "-c";
+    /* "catalog" is tested before "c", because the modes are otherwise
+       matched on their first letter and it would answer to that one.  It
+       publishes a main program the way the platform needs it -- one file, or
+       a library plus a loader -- and the driver owns that rule so the four
+       things that catalog a program do not each carry a copy of it
+       (mvx#248). */
+    if (ml == 7 && strncasecmp(mp, "catalog", 7) == 0)
+        argv[n++] = "--catalog";
+    else if (mp[0] == 'c' || mp[0] == 'C') argv[n++] = "-c";
     else if (mp[0] == 's' || mp[0] == 'S') argv[n++] = "-shared";
     if (want_g0) argv[n++] = "-g0";
     if (want_strip) argv[n++] = "-s";

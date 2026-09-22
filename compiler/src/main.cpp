@@ -11,11 +11,19 @@
  */
 
 // mvx driver: compile MVX BASIC to objects, executables, or shared
-// subroutine libraries.
+// libraries.  One invocation, one artifact, the way a C driver works --
+// deciding that a program wants MORE than one is the catalog's job, not
+// this one's (see verbs/CATALOG.b, mvx#248).
 //
 //   mvx -c prog.b -o prog.o          compile only
 //   mvx prog.b sub.b -o prog         compile and link an executable
 //   mvx -shared subs.b -o libsubs    compile and link a shared library
+//
+// -shared takes its meaning from the SOURCE, not the flag: SUBROUTINE and
+// FUNCTION sources export mvx_sub_<NAME> and make a library the CALL
+// resolver loads, while a main program exports mvx_main and makes one the
+// runtime can load and run in an existing process.  Both are shared objects
+// and neither is a special case of the other.
 //
 // Errors go to stderr as "item:line: message" — parseable; the BASIC verb
 // will consume this later, so treat the format as an interface.
@@ -81,7 +89,10 @@ int usage() {
         "  --version    print the toolchain version and exit\n"
         "  -c           compile to object only (no link)\n"
         "  -o <path>    output path\n"
-        "  -shared      produce a shared subroutine library\n"
+        "  -shared      produce a shared library (subroutines, or a\n"
+        "               loadable main program)\n"
+        "  --catalog    publish a main program for cataloging: one file or\n"
+        "               two, whichever this platform needs\n"
         "  -D NAME[=v]  define a preprocessor symbol ($IFDEF NAME)\n"
         "  -O0|-O1|-O2  optimisation level (default -O2)\n"
         "  -g | -g0     emit debug information (default), or none\n"
@@ -174,6 +185,7 @@ int main(int argc, char **argv) {
             return 0;
         }
     bool compileOnly = false, shared = false;
+    bool catalogMode = false;           // --catalog: publish, see below
     mvx::CodegenOptions cg;
     std::string outPath;
     std::vector<std::string> sources, objects;
@@ -202,6 +214,7 @@ int main(int argc, char **argv) {
         if (a == "-h" || a == "--help") { usage(); return 0; }
         if (a == "-c") compileOnly = true;
         else if (a == "-shared") shared = true;
+        else if (a == "--catalog") catalogMode = true;
         else if (a == "-o") {
             if (++i >= argc) return usage();
             outPath = argv[i];
@@ -305,6 +318,35 @@ int main(int argc, char **argv) {
     if (outPath.empty())
         outPath = shared ? "libmvxsubs" : "a.out";
 
+    /* --catalog: PUBLISH a main program the way THIS PLATFORM needs it
+       (mvx#248), which is not the same number of files everywhere.
+       Everything else here produces one artifact per invocation, the way a C
+       driver does; this mode is the exception, and it exists so that the four
+       things that catalog a program -- the CATALOG verb, BUILD-PKG, mkpkg and
+       the build itself -- do not each carry their own copy of the rule.
+
+       macOS needs ONE file.  A Mach-O executable can also be dlopen'd and
+       called, so the executable IS the loadable form and nothing else is
+       published.
+
+       glibc needs TWO, and it is a hard requirement rather than a
+       preference: it refuses to dlopen a position-independent executable
+       ("cannot dynamically load position-independent executable"), and a
+       shared object cannot be exec'd instead, because nothing initialises
+       libc or TLS on that path -- exec'ing one segfaults before reaching
+       even a raw write(2).  So the PROGRAM is compiled once, as <out>.so,
+       and <out> is a copy of mvx-launch, which holds no program code and
+       finds the library beside itself.  One copy of the program either way;
+       what differs is whether a loader has to be published with it. */
+    std::string catalogExe;
+    if (catalogMode) {
+#ifndef __APPLE__
+        catalogExe = outPath;           // the loader goes here, after linking
+        outPath += ".so";               // and the program here
+        shared = true;
+#endif
+    }
+
     fs::path lib = runtimeLibDir();
     std::string cmd = "cc";
     if (shared) {
@@ -361,6 +403,28 @@ int main(int argc, char **argv) {
         std::system(("dsymutil " + shellQuote(outPath) +
                      " >/dev/null 2>&1").c_str());
 #endif
+
+    /* The loader half, where the platform needs one: a copy of mvx-launch
+       from beside this driver.  A copy rather than a link, so that an account
+       survives being moved, copied into an image, or committed and checked
+       out somewhere else. */
+    if (rc == 0 && !catalogExe.empty()) {
+        fs::path launcher = exeDir() / "mvx-launch";
+        std::error_code ec;
+        fs::copy_file(launcher, catalogExe,
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            std::cerr << "mvx-basic: cannot publish " << catalogExe << " from "
+                      << launcher << ": " << ec.message() << "\n";
+            rc = 1;
+        } else {
+            fs::permissions(catalogExe,
+                            fs::perms::owner_all | fs::perms::group_read |
+                            fs::perms::group_exec | fs::perms::others_read |
+                            fs::perms::others_exec,
+                            fs::perm_options::replace, ec);
+        }
+    }
 
     if (!tmpDir.empty()) {
         std::error_code ec;
