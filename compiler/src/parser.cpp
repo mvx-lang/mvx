@@ -412,6 +412,13 @@ private:
                     s->name2 = expect(Tok::Ident, "RETURNING variable").text;
                 } else break;
             }
+            /* ON ERROR -- the program it runs gave up (mvx#256).  An ABORT or
+               a runtime fault in a program reached by EXECUTE takes its
+               caller with it, which is UniData's behaviour and right for
+               ordinary code; a program that means to be a SHELL needs to
+               survive its menu options, and this is how it says so.  Opt-in,
+               so anything without the clause behaves exactly as before. */
+            onErrorClause(*s);
             endStatementSoft();
             break;
         }
