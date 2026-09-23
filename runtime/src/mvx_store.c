@@ -283,9 +283,15 @@ typedef struct store_state {
  * that SAYS it is stale instead of crashing on it.  A counter rather than a
  * scan of the open files, because this is the read and write path.
  *
- * Unlike UniData, where a handle survives a LOGTO: there a handle names a
- * FILE, and here it names a place in a store that belongs to the account's
- * BINDINGS.  Different thing, different lifetime. */
+ * Unlike UniData AND UniVerse, where a handle survives a LOGTO -- measured on
+ * both against a file that exists only in the account being left, so it is
+ * the handle surviving and not a file of the same name in the new one.  There
+ * a handle is a path to a physical file.  Here it names a place in a store
+ * that belongs to the account's BINDINGS, and for a directory or an unbound
+ * LMDB file the driver re-reads $MVXACCOUNT on every call -- so a surviving
+ * handle would not dangle, it would FOLLOW the session into the new account
+ * and silently read that account's file of the same name.  Different thing,
+ * different lifetime; mvx#267 has what matching them would take. */
 static int64_t g_file_gen = 1;
 
 /* The open transaction, for the exit handler -- see txn_atexit below.  STOP is

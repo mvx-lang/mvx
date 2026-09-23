@@ -321,14 +321,27 @@ a menu is exactly this, and CueBic did it.
   Here it used to find no VOC entry, fall back to spawning `mvx -c`, move a
   *child* that immediately exited, and leave the caller where it was without a
   word — the worst kind of failure, a silent no-op.
-- **Deliberate divergence: the old account's files are CLOSED.** On UniData a
-  handle opened before the `LOGTO` still reads afterwards — measured — because
-  a handle there names a file, not a store. MVX cannot follow: a handle holds
-  a connection that mvx#251 has to give back, or a session that walks ten
-  accounts runs out at the ninth. A handle kept across the move says it is
-  stale rather than reading somewhere the operator no longer is, so the
-  Gentrack pattern of opening everything at login and keeping it in `COMMON`
-  re-opens after a `LOGTO` instead of silently reading the wrong account.
+- **Deliberate divergence: the old account's files are CLOSED.** On UniData
+  **and UniVerse** a handle opened before the `LOGTO` still reads afterwards —
+  measured on both against a file that exists only in the account being left,
+  so it is the handle surviving and not a file of the same name in the new
+  account. There a handle is a path to a physical file, which exists whatever
+  account you are in.
+
+  MVX cannot follow, for a reason those systems do not have: **a handle here
+  does not name a file.** `spec` is `"<location>\n<file>"`, and for a
+  directory or an unbound LMDB file the location is empty and the driver
+  re-reads `$MVXACCOUNT` on every call. A handle that survived would not
+  dangle — it would *follow the session into the new account* and silently
+  read that account's file of the same name, which is worse than either
+  alternative. That is what the `g_file_gen` generation counter prevents.
+  Keeping one also costs a database connection rather than a file descriptor,
+  and mvx#251 measured where that ends: a session walking ten accounts could
+  open nothing from the ninth onward.
+
+  Matching them would mean the handle capturing an absolute,
+  account-independent location at OPEN time — a change to what a spec is, not
+  to `LOGTO`. mvx#267 holds the evidence and the two levers.
 - **An open transaction refuses the move**, with `STATUS()` = 2. Committing it
   after the account changed would commit into somewhere the program no longer
   is, and discarding it silently is worse. Same answer mvx#247 gives when one
