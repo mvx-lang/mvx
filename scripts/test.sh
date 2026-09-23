@@ -3684,6 +3684,52 @@ else
   echo "  (language transaction tests skipped — sqlite driver not built)"
 fi
 
+  # A TRANSACTION WHOSE CONNECTION WENT AWAY CANNOT COMMIT (mvx#253).
+  #
+  # A transaction lives on a connection, and the backend can take that
+  # connection away without telling anybody.  MySQL reconnects SILENTLY when
+  # an idle session outlives wait_timeout: the server rolls the open
+  # transaction back, later writes autocommit one at a time, and COMMIT
+  # succeeds against a connection that has no transaction on it -- so the
+  # program is told its work landed when half of it was discarded.  An MV
+  # session idles across user think-time for far longer than wait_timeout,
+  # and the transaction shape this serves is the one that stays open longest.
+  #
+  # WHAT IS TESTED HERE IS THE DECISION, not the detection: the arrival is
+  # injected, because the real one needs a server and an idle timeout.  The
+  # drivers' own conn_epoch -- mysql_thread_id, PQbackendPID -- is what has to
+  # be right for the real event, and that wants a live server (MVX_MYSQL /
+  # MVX_PG) to exercise.  Testing the decision is still worth it: the decision
+  # is where the silence was.
+  cat > "$TESTROOT/txconn.b" <<'TXCEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "no transaction" ; STOP
+WRITE "A":@AM:"1":@VM:"2" ON F, "CL1"
+PRINT "wrote CL1"
+TRANSACTION COMMIT THEN PRINT "COMMIT SUCCEEDED" ELSE PRINT "commit refused"
+TXCEOF
+  if "$MVX" "$TESTROOT/txconn.b" -o "$TESTROOT/txconn" 2>"$TESTROOT/cerr"; then
+    tcbad="$(cd "$TXA" && MVXACCOUNT=. MVX_FAULT=connlost "$TESTROOT/txconn" \
+             2>/dev/null)"
+    tcrows="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'CL1'"'"';' 2>/dev/null)"
+    # And the same program with no fault must still commit, or this would
+    # pass by refusing everything.
+    tcok="$(cd "$TXA" && MVXACCOUNT=. "$TESTROOT/txconn" 2>/dev/null)"
+    if [ "$tcbad" = "wrote CL1
+commit refused" ] && [ "$tcrows" = 0 ] \
+       && [ "$tcok" = "wrote CL1
+COMMIT SUCCEEDED" ]; then
+      PASS=$((PASS + 1))
+      echo "  a transaction whose connection changed refuses to commit"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL txn conn lost: rows=$tcrows lost=[$tcbad] normal=[$tcok]"
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL txn conn lost: did not compile"
+  fi
+
   # A FAILURE INSIDE A TRANSACTION MAKES IT UNCOMMITTABLE (mvx#253).
   #
   # mvx#247 refuses to commit a transaction whose write was refused at

@@ -1945,6 +1945,17 @@ static int my_migrate_docs(const char *loc, char *err, size_t errlen) {
 
 /* InnoDB's index key limit on a DYNAMIC row, which is how wide my_sqltype
    makes a mapped text column.  A longer value cannot round-trip through it. */
+/* WHICH CONNECTION THIS IS (mvx#253).  mysql_thread_id is the server's id for
+   the session, and a reconnect gets a new one -- which is exactly the event
+   that silently threw the open transaction away.  MYSQL_OPT_RECONNECT is on
+   deliberately (an MV session idles past wait_timeout as a matter of course),
+   so the reconnect itself is wanted; what was missing was anything noticing
+   it had happened. */
+static uint64_t my_conn_epoch(mvx_file *fh) {
+    MYSQL *db = ((my_file *)fh)->db;
+    return db ? (uint64_t)mysql_thread_id(db) : 0;
+}
+
 static int64_t my_map_text_cap(mvx_file *fh) { (void)fh; return 3072; }
 
 static const mvx_driver mvx_driver_mysql = {
@@ -1980,6 +1991,7 @@ static const mvx_driver mvx_driver_mysql = {
     my_rollback,                          /* abort a failed logical write */
     my_migrate_docs,                      /* pre-#157 blob -> document */
     my_map_text_cap,                      /* mapped columns are bounded here */
+    my_conn_epoch,                        /* which connection, for mvx#253 */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

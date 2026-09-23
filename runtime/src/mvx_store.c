@@ -265,7 +265,8 @@ typedef struct store_state {
      * transactions" is reported at that first write rather than at START. */
     int txn_open;                       /* START seen, COMMIT/ABORT not yet */
     int txn_enrolled;                   /* a connection is bound to it */
-    int txn_poisoned;                   /* a write inside it was refused */
+    int txn_poisoned;                   /* something inside it failed */
+    uint64_t txn_epoch;                 /* which connection it began on */
     const mvx_driver *txn_drv;          /* the connection: driver ... */
     char txn_loc[1024];                 /* ... and the location half of a spec */
     mvx_file *txn_file;                 /* whose bracket we opened */
@@ -1538,6 +1539,12 @@ static int txn_enrol(mvx_ctx *ctx, mvx_file *f) {
         st->txn_enrolled = 1;
         st->txn_drv = b->driver;
         st->txn_file = f;
+        /* WHICH CONNECTION IT BEGAN ON (mvx#253).  A transaction lives on a
+           connection, and the backend can take that connection away without
+           telling anybody -- MySQL reconnects silently when an idle session
+           outlives wait_timeout, throwing the transaction away with it.
+           Sampled here and checked again before the commit. */
+        st->txn_epoch = b->driver->conn_epoch ? b->driver->conn_epoch(f) : 0;
         snprintf(st->txn_loc, sizeof st->txn_loc, "%s", loc);
         return 1;
     }
@@ -1592,6 +1599,7 @@ int64_t mvx_txn_start(mvx_ctx *ctx) {
     st->txn_open = 1;
     st->txn_enrolled = 0;
     st->txn_poisoned = 0;
+    st->txn_epoch = 0;
     st->txn_drv = NULL;
     st->txn_file = NULL;
     st->txn_loc[0] = '\0';
@@ -1620,6 +1628,29 @@ int64_t mvx_txn_commit(mvx_ctx *ctx) {
         txn_log("COMMIT with none open");
         return 0;
     }
+    /* IS IT STILL THE SAME CONNECTION (mvx#253)?  If it is not, the
+       transaction that was open went with the old one: the backend rolled it
+       back, and anything written since has been committing on its own.  A
+       COMMIT would find nothing to commit and succeed, telling the program
+       its work landed when half of it was discarded -- so the change has to
+       be noticed here, where it can still be reported. */
+    if (st->txn_enrolled) {
+        /* A backend with no connection to lose reports none, and then this
+           can only ever agree with itself. */
+        uint64_t now = st->txn_drv->conn_epoch
+                           ? st->txn_drv->conn_epoch(st->txn_file)
+                           : st->txn_epoch;
+        /* The real event wants a server and an idle timeout to arrive; this
+           is the same arrival on demand, and deliberately outside the check
+           above so the DECISION can be tested on any backend (MVX_FAULT). */
+        const char *fv = getenv("MVX_FAULT");
+        if (fv && strcmp(fv, "connlost") == 0) now = st->txn_epoch + 1;
+        if (now != st->txn_epoch)
+            txn_poison(ctx, now == 0
+                       ? "the connection this transaction was on has gone"
+                       : "this transaction's connection was replaced under it");
+    }
+
     int ok = 1;
     if (st->txn_poisoned) {
         txn_log("something inside this transaction failed, so there is "
@@ -2314,6 +2345,11 @@ static int map_child_project(mvx_ctx *ctx, mvx_file *f, mapmeta *m,
  *                        transaction open -- which tests that the DATABASE
  *                        discards it, not merely that we remembered to call
  *                        rollback
+ *   MVX_FAULT=connlost   the connection a transaction enrolled reads as a
+ *                        DIFFERENT one at commit, as it does after a silent
+ *                        reconnect (mvx#253).  The real event needs a server
+ *                        and an idle timeout to reproduce; what it tests here
+ *                        is the part that decides what to do about it
  *
  * An untestable guarantee rots.  A getenv on the first mapped write is
  * cheaper than finding out from a customer that the two disagree. */
