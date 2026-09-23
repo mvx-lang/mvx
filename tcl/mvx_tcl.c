@@ -980,7 +980,7 @@ static int command(char *line) {
            go before entering the new one, and forgetting everything resolved
            per account.  What is left is the shell's own: its VOC handle for
            macros, and telling the operator where they now are. */
-        if (!mvx_logto(g_ctx, arg)) return 2;
+        if (!mvx_logto(g_ctx, arg)) return 2;   /* which runs its LOGIN */
         account_refresh();
         g_voc_state = 0;                /* the shell's own VOC, for .C macros */
         printf("now in account %s (%s)\n", g_acct_base, g_acct_path);
@@ -1148,6 +1148,12 @@ int main(int argc, char **argv) {
     if (!has_descriptor() && has_markers())
         write_descriptor(g_acct_base);
     voc_backend_settle();     /* and say which backend holds its VOC (#187) */
+
+    /* THE ACCOUNT SETS ITSELF UP (mvx#264).  Entering an account runs its own
+       VOC LOGIN, which is what UniData and UniVerse both do -- here and in
+       mvx_logto, the two places a session enters one. Before the stack loads
+       and before any -c command, so a LOGIN can prepare what they use. */
+    mvx_login_run(g_ctx);
 
     /* Resolve and load the stack before anything runs.  Not gated on a
        terminal: .L and .X have to work down a pipe too, or the feature is

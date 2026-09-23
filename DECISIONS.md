@@ -350,11 +350,45 @@ a menu is exactly this, and CueBic did it.
   `mvx` builtin all reach `mvx_logto`. The hard part is letting the old
   account go *before* entering the new one, and a second copy of that would
   drift.
-- **No `LOGIN` hook, for now.** Both systems run the target account's VOC
-  `LOGIN` on the way in — on a fresh login, on a `LOGTO` from TCL, and on a
-  `LOGTO` from inside a program. MVX runs nothing. Whether it should is
-  mvx#264, deliberately not settled here: it would make every cataloged
-  program run straight from Unix pay for it.
+- **A `LOGIN` hook, on entering an account** (mvx#264, settled after this).
+  Both systems run the target account's VOC `LOGIN` on the way in — a fresh
+  login, a `LOGTO` from TCL, and a `LOGTO` from inside a program — and *not*
+  around each `BASIC` or `RUN`. MVX matches that: `mvx` startup and
+  `mvx_logto`, so a cataloged program run straight from Unix still pays
+  nothing and `docs/replacing-tcl.md` stays true.
+
+## The account's own setup: LOGIN (mvx#264)
+
+- **One spelling, `LOGIN`.** The two systems disagree and one prefers a name
+  the other ignores. Measured with `PA` paragraphs printing distinct banners:
+  UniData 8.3 keys on `LOGIN` and nothing else — neither the account name in
+  either case, nor the Unix user name, runs anything. UniVerse 14.2.1 honours
+  `LOGIN` *and* a record named after the account, and **the account-named one
+  wins**: with both present only `bench` ran. `LOGIN` is the only spelling
+  that works on both, and adopting UniVerse's precedence would mean an
+  operator's new `LOGIN` losing silently to a record they cannot see.
+- **An account-named login is not portable anyway.** It cannot survive a
+  rename, which is exactly what the open account format does when the same
+  tree is checked out under another name.
+- **It is a `V` record naming a program**, because MVX has neither paragraphs
+  nor PROCs. On UniData a cataloged program cannot be a `LOGIN` at all —
+  `CATALOG` there writes to `CTLG`, not `VOC`, and creates no VOC record — so
+  the portable idiom on those systems is a paragraph whose body runs a
+  program. The hook itself does not care: it executes the *sentence* `LOGIN`,
+  and both systems invoke paragraphs and PROCs the same way (measured:
+  `EXECUTE "MYPARA"` and `EXECUTE "MYPROC"` both run from BASIC). So if MVX
+  grows paragraphs or PROCs, `LOGIN` gets them with no change.
+- **The account's own, never inherited.** Not from a linked package, not from
+  the system account every account sits behind — one there would run in every
+  account on the machine, silently, with nothing naming its origin. An account
+  sets itself up; it does not set up its neighbours.
+- **A failing `LOGIN` does not fail the move.** By the time it runs the
+  session IS in the new account, so reporting failure would leave the program
+  believing it is somewhere it is not. An abort is caught rather than taking
+  the caller with it — a menu must not die because an account it moved to has
+  a broken setup.
+- **A `LOGIN` that `LOGTO`s does not start another one.** It is itself a
+  program and may move; two pointing at each other would otherwise never stop.
 
 ## Decision A — value representation
 

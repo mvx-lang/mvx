@@ -98,6 +98,13 @@ int      mvx_voc_lookup(mvx_ctx *ctx, const char *verb, char *path,
 /* Forget the cached resolution chain: anything that changes account must,
    or verbs keep resolving against the one just left. */
 void     mvx_voc_reset(void);
+/* The account's own VOC only, with nothing behind it -- for LOGIN (mvx#264),
+   which must not be inherited from a package or the system account. */
+int      mvx_voc_lookup_local(mvx_ctx *ctx, const char *verb, char *path,
+                              size_t cap);
+/* Run the account's VOC LOGIN, if it has one.  Called on entering an
+   account: `mvx` startup, and every LOGTO. */
+void     mvx_login_run(mvx_ctx *ctx);
 /* Leave the current account: close its files, drop its locks, and release the
    connections they were on, so a session that moves between accounts stops
    accumulating them (mvx#251).  Refused, returning 0, while a transaction is
