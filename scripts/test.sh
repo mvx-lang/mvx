@@ -5297,6 +5297,57 @@ else
   FAIL=$((FAIL + 1)); echo "FAIL para/login: [$p5]"
 fi
 
+# ---------------------------------------------------------------------------
+# @LEVEL -- HOW MANY PROGRAMS ARE ABOVE ME (mvx#270).
+#
+# A program could not tell.  SYSTEM(2)/SYSTEM(3) answer whether there is a
+# terminal, which a program three EXECUTEs deep still has, and @USER.TYPE
+# answers the same question -- so a shared routine that prompts had no way to
+# decline when it did not come from the operator.  mvx#264 made that urgent:
+# an account's LOGIN now runs from a LOGTO inside a running program, whose
+# screen and keyboard it would otherwise take over.
+#
+# The numbering is UniData 8.3's and UniVerse 14.2.1's, which agree exactly:
+# from TCL 0, through an EXECUTE 1.  MVX's shell runs every verb as a level,
+# so the prompt marks itself not-a-program or the first verb typed would
+# answer 1 where they answer 0.
+echo "== @LEVEL"
+LVA="$TESTROOT/lvlacct"
+"$ROOT/scripts/mkaccount.sh" "$LVA" >/dev/null 2>&1
+"$ROOT/scripts/mkaccount.sh" "$LVA.b" >/dev/null 2>&1
+mkdir -p "$LVA/BP" "$LVA.b/BP"
+printf 'PRINT "inner=":@LEVEL\n' > "$LVA/BP/LVL"
+printf 'PRINT "outer=":@LEVEL\nEXECUTE "LVL"\n' > "$LVA/BP/LVLOUT"
+MVXPRIV=developer "$TCL" -a "$LVA" -c 'CATALOG BP LVL'    >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$LVA" -c 'CATALOG BP LVLOUT' >/dev/null 2>&1
+
+lv1="$(MVXPRIV=developer "$TCL" -a "$LVA" -c 'LVLOUT' 2>/dev/null)"
+lv2="$(cd "$LVA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/LVLOUT 2>/dev/null)"
+if [ "$lv1" = "outer=0
+inner=1" ] && [ "$lv2" = "outer=0
+inner=1" ]; then
+  PASS=$((PASS + 1))
+  echo "  0 from the prompt and from Unix, 1 through an EXECUTE"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL level: prompt=[$lv1] unix=[$lv2]"
+fi
+
+# AND THE CASE IT EXISTS FOR: a LOGIN can tell whether it owns the screen.
+printf 'PRINT "login=":@LEVEL\n' > "$LVA/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LVA" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+cat > "$LVA.b/BP/MENU" <<LVEOF
+IF LOGTO("$LVA") THEN NULL ELSE PRINT "refused"
+LVEOF
+MVXPRIV=developer "$TCL" -a "$LVA.b" -c 'CATALOG BP MENU' >/dev/null 2>&1
+lv3="$(MVXPRIV=developer "$TCL" -a "$LVA" -c 'WHO' 2>/dev/null | head -1)"
+lv4="$(cd "$LVA.b" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MENU 2>/dev/null | head -1)"
+if [ "$lv3" = "login=0" ] && [ "$lv4" = "login=1" ]; then
+  PASS=$((PASS + 1))
+  echo "  a LOGIN sees 0 at startup and 1 when a running program moved here"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL level/login: startup=[$lv3] logto=[$lv4]"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.

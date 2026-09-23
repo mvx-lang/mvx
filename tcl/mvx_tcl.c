@@ -1130,6 +1130,11 @@ int main(int argc, char **argv) {
     }
 
     g_ctx = mvx_ctx_create();
+    /* THE PROMPT IS NOT A PROGRAM (mvx#270).  Every verb the shell runs is
+       pushed as a level, so without this the first one typed would answer
+       @LEVEL = 1 where UniData and UniVerse both answer 0 -- and every
+       `IF @LEVEL THEN' ported from them would fire when it must not. */
+    mvx_ctx_set_base_level(g_ctx, -1);
     account_refresh();
 
     /* Register with the session registry, if one is running (mvx#226).  This

@@ -1027,7 +1027,8 @@ private:
         }
         if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0 &&
             e.sval != "@USER.TYPE" && e.sval != "@SENTENCE" &&
-            e.sval != "@USERNO" && e.sval != "@TRANSACTION")
+            e.sval != "@USERNO" && e.sval != "@TRANSACTION" &&
+            e.sval != "@LEVEL")
             return getScalar(e.sval, e.line);
         if (e.kind == Expr::K::Paren && arrayNames_.count(e.sval))
             return arrayElemPtr(e);
@@ -1092,6 +1093,21 @@ private:
                  * UniData.  Nothing should depend on the number. */
                 Value *n = callRt("mvx_txn_depth", i64Ty_, {ptrTy_},
                                   {ctxArg_});
+                callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_}, {dest, n});
+                return;
+            }
+            if (e.sval == "@LEVEL") {
+                /* HOW MANY PROGRAMS ARE ABOVE ME (mvx#270).  Measured on
+                 * UniData 8.3 and UniVerse 14.2.1, which agree exactly: a
+                 * program run from TCL answers 0, and the same program
+                 * reached through an EXECUTE answers 1.
+                 *
+                 * The use is a routine that must not talk to a terminal it
+                 * does not own -- `IF @LEVEL THEN' means something is above
+                 * me, so ask nobody.  @USER.TYPE does NOT answer this: it
+                 * says whether there is a terminal, and a program three
+                 * EXECUTEs deep still has one. */
+                Value *n = callRt("mvx_level", i64Ty_, {ptrTy_}, {ctxArg_});
                 callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_}, {dest, n});
                 return;
             }

@@ -420,6 +420,28 @@ so a cataloged program cannot be a `LOGIN` at all.
   different language (two buffers, a pointer, an opcode set) and legacy even
   on the systems that have it.
 
+## @LEVEL (mvx#270)
+
+How many programs are above this one. A program could not previously tell:
+`SYSTEM(2)`/`SYSTEM(3)` and `@USER.TYPE` all answer whether there is a
+*terminal*, which a program three `EXECUTE`s deep still has.
+
+- **The numbering is theirs, measured.** UniData 8.3 and UniVerse 14.2.1 agree
+  exactly: run from TCL a program answers `0`, and the same program reached
+  through an `EXECUTE` answers `1`.
+- **The prompt is not a program.** MVX's shell runs every verb by pushing a
+  level, so without saying so the first verb typed would answer `1` where both
+  systems answer `0` — and every `IF @LEVEL THEN` ported from them would fire
+  exactly when it must not. The shell marks its own context `-1` at startup;
+  a program run straight from Unix starts at `0` with no shell involved.
+- **It is the missing half of mvx#264.** An account's `LOGIN` runs from a
+  `LOGTO` inside a running program, sharing that program's screen and
+  keyboard. `@LEVEL` is how it declines to prompt: 0 when entered directly, 1
+  when a running program moved here.
+- **Not the same question as `@USER.TYPE`**, which stays the right guard for
+  "is there a terminal at all" — a phantom, a pipe, a web session. A routine
+  that prompts wants both.
+
 ## Decision A — value representation
 
 **Chosen: boxed value with numeric tags (option 1), plus compiler numeric
