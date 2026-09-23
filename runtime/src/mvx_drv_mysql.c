@@ -1958,6 +1958,16 @@ static uint64_t my_conn_epoch(mvx_file *fh) {
 
 static int64_t my_map_text_cap(mvx_file *fh) { (void)fh; return 3072; }
 
+/* Release the connection held for this location (mvx#251). */
+static void my_release_conn(const char *loc) {
+    for (int i = 0; i < g_nconns; i++) {
+        if (strcmp(g_conns[i].loc, loc) != 0) continue;
+        if (g_conns[i].db) mysql_close(g_conns[i].db);
+        g_conns[i] = g_conns[--g_nconns];
+        return;
+    }
+}
+
 static const mvx_driver mvx_driver_mysql = {
     "mysql",
     my_open, my_close,
@@ -1992,6 +2002,7 @@ static const mvx_driver mvx_driver_mysql = {
     my_migrate_docs,                      /* pre-#157 blob -> document */
     my_map_text_cap,                      /* mapped columns are bounded here */
     my_conn_epoch,                        /* which connection, for mvx#253 */
+    my_release_conn,                      /* let a left account go (mvx#251) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

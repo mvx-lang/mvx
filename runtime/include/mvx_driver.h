@@ -367,6 +367,19 @@ typedef struct mvx_driver {
        identity, the runtime owns what to do about it.  Return 0 for "no
        usable connection", which differs from any live one. */
     uint64_t (*conn_epoch)(mvx_file *f);
+
+    /* Release any connection held for `loc` (may be NULL: nothing is held).
+       
+       A SESSION MOVES BETWEEN ACCOUNTS and nothing released what it left.
+       Every connection-holding driver caches by location with a small fixed
+       cap and no eviction, so a session that logged to nine accounts, each
+       with its own database, met "too many open databases" at the ninth and
+       could not open anything else for the rest of its life (mvx#251).
+       
+       Called when a session stops using a location -- a LOGTO away from the
+       account that named it, or the session ending.  The runtime closes that
+       location's files first, so a driver may assume none are open on it. */
+    void (*release_conn)(const char *loc);
 } mvx_driver;
 
 /* map_backfill sentinel: the transform is not expressible in this backend, so
@@ -409,7 +422,7 @@ typedef struct mvx_file_base {
  * has no note either. */
 #define MVX_FILE_FORMAT 3
 
-#define MVX_DRIVER_ABI 15
+#define MVX_DRIVER_ABI 16
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

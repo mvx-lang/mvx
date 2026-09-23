@@ -4877,6 +4877,102 @@ else
   FAIL=$((FAIL + 1)); echo "FAIL on-error stop: [$stopout]"
 fi
 
+# ---------------------------------------------------------------------------
+# A SESSION GIVES BACK THE ACCOUNTS IT LEAVES (mvx#251), AND CLOSE (mvx#258).
+#
+# Every connection-holding driver caches by location with a cap of 8 and no
+# eviction, and nothing ever released one: the only close calls in the tree
+# were on failed-connect paths.  So a session that moved between accounts --
+# a menu switching company or division, which is what a site replaces TCL
+# with -- accumulated one connection per account and could open nothing at
+# all from the ninth onward, for the rest of its life.
+#
+# There was also no CLOSE statement, which is why files piled up: a file
+# opened was open until the session ended, and its connection with it.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a session gives back the accounts it leaves"
+  LKB="$TESTROOT/leave"
+  # Ten accounts, each with its own sqlite database.
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    "$ROOT/scripts/mkaccount.sh" "$LKB/a$i" >/dev/null 2>&1
+    printf 'ORD sqlite %s/a%s/db.sqlite\n' "$LKB" "$i" >> "$LKB/a$i/BINDINGS"
+    "$TCL" -a "$LKB/a$i" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+    mkdir -p "$LKB/a$i/BP"
+    printf 'OPEN "ORD" TO F ELSE PRINT "  CANNOT OPEN" ; STOP\nPRINT "  opened ok"\n' \
+      > "$LKB/a$i/BP/T"
+    MVXPRIV=developer "$TCL" -a "$LKB/a$i" -c 'CATALOG BP T' >/dev/null 2>&1
+  done
+  lkraw="$({ for i in 1 2 3 4 5 6 7 8 9 10; do
+               echo "LOGTO $LKB/a$i"; echo T
+             done; echo OFF; } \
+           | MVXPRIV=developer "$TCL" -a "$LKB/a1" 2>&1)"
+  lkout="$(printf '%s\n' "$lkraw" | grep -c 'opened ok')"
+  if [ "$lkout" = 10 ]; then
+    PASS=$((PASS + 1)); echo "  ten accounts in one session, all ten usable"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL leave: $lkout of 10 accounts usable (the cap is 8 without release)"
+    printf '%s\n' "$lkraw" | sed 's/^/    | /' | head -12
+  fi
+
+  # A handle from before the LOGTO must SAY it is stale, not read a freed one.
+  mkdir -p "$LKB/a1/BP"
+  cat > "$LKB/a1/BP/STALE" <<'STEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+PRINT "opened in the first account"
+STEOF
+  MVXPRIV=developer "$TCL" -a "$LKB/a1" -c 'CATALOG BP STALE' >/dev/null 2>&1
+  stout="$({ echo "STALE"; echo "LOGTO $LKB/a2"; echo OFF; } \
+           | MVXPRIV=developer "$TCL" -a "$LKB/a1" 2>&1)"
+  case "$stout" in
+    *"opened in the first account"*) stok=1 ;;
+    *) stok=0 ;;
+  esac
+  if [ "$stok" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  and leaving one does not disturb the next"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL leave/stale: [$stout]"
+  fi
+
+  # CLOSE, and the contrast that shows it does something: the same loop
+  # without it hits the cap at the ninth database.
+  CLB="$TESTROOT/closetest"
+  "$ROOT/scripts/mkaccount.sh" "$CLB" >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    printf 'F%s sqlite %s/db%s.sqlite\n' "$i" "$CLB" "$i" >> "$CLB/BINDINGS"
+    "$TCL" -a "$CLB" -c "CREATE-FILE F$i" >/dev/null 2>&1
+  done
+  mkdir -p "$CLB/BP"
+  cat > "$CLB/BP/CYCLE" <<'CLEOF'
+FOR I = 1 TO 10
+   NM = "F":I
+   OPEN NM TO F ELSE PRINT "  failed to open ":NM ; STOP
+   CLOSE F
+NEXT I
+PRINT "all ten"
+CLEOF
+  cat > "$CLB/BP/NOCLOSE" <<'CLEOF'
+FOR I = 1 TO 10
+   NM = "F":I
+   OPEN NM TO F ELSE PRINT "  failed to open ":NM ; STOP
+NEXT I
+PRINT "all ten"
+CLEOF
+  MVXPRIV=developer "$TCL" -a "$CLB" -c 'CATALOG BP CYCLE'   >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$CLB" -c 'CATALOG BP NOCLOSE' >/dev/null 2>&1
+  clwith="$(cd "$CLB" && MVXACCOUNT=. ./CATALOG/CYCLE 2>&1 | tail -1)"
+  clwout="$(cd "$CLB" && MVXACCOUNT=. ./CATALOG/NOCLOSE 2>&1 | tail -1)"
+  if [ "$clwith" = "all ten" ] && [ "$clwout" != "all ten" ]; then
+    PASS=$((PASS + 1))
+    echo "  CLOSE gives the connection back; without it the ninth fails"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL close: with=[$clwith] without=[$clwout] (without must fail)"
+  fi
+else
+  echo "  (leave/CLOSE tests skipped — sqlite driver not built)"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.

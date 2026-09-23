@@ -31,6 +31,7 @@ static const std::unordered_map<std::string, Tok> kKeywords = {
     {"LOCATE", Tok::KwLocate}, {"INPUT", Tok::KwInput}, {"MAT", Tok::KwMat},
     {"COMMON", Tok::KwCommon}, {"COM", Tok::KwCommon},
     {"OPEN", Tok::KwOpen},     {"READ", Tok::KwRead},
+    {"CLOSE", Tok::KwClose},
     {"READU", Tok::KwReadu},   {"WRITE", Tok::KwWrite},
     {"WRITEU", Tok::KwWriteu}, {"DELETE", Tok::KwDelete},
     {"READV", Tok::KwReadv},   {"READVU", Tok::KwReadvu},

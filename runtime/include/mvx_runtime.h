@@ -98,6 +98,19 @@ int      mvx_voc_lookup(mvx_ctx *ctx, const char *verb, char *path,
 /* Forget the cached resolution chain: anything that changes account must,
    or verbs keep resolving against the one just left. */
 void     mvx_voc_reset(void);
+/* Leave the current account: close its files, drop its locks, and release the
+   connections they were on, so a session that moves between accounts stops
+   accumulating them (mvx#251).  Refused, returning 0, while a transaction is
+   open -- it belongs to a connection in the account being left, so the
+   program has to commit it or ABORT first.  Every file variable opened before
+   this says so rather than reading freed memory. */
+int64_t  mvx_store_leave(mvx_ctx *ctx);
+/* CLOSE fvar -- release one open file, and the connection under it when it
+   was the last one on that location.  Without this a file opened stays open
+   for the life of the session (mvx#251).  The variable stops being a file
+   variable, so using it afterwards says so rather than reading a gone
+   handle. */
+void     mvx_close(mvx_ctx *ctx, mv_value *fvar);
 
 /* Directory of the loaded libmvxrt; the anchor for relocatable installs
    (drivers beside it, ../bin, ../share/mvx/system).  "" if unknown. */

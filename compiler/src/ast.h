@@ -76,6 +76,7 @@ struct Stmt {
         Common,     // args: Var/Paren items; name2: block name ("" unnamed)
         Echo,       // name: "ON" or "OFF"
         Open,       // args: [dict,] spec; name: file var; THEN/ELSE
+        Close,      // name: file var
         ReadF,      // target: record var; args: file, id; name: "U" locks
         WriteF,     // value: record; args: file, id; name: "U" keeps lock
         ReadV,      // target: var; args: file, id, attr; name: "U" locks

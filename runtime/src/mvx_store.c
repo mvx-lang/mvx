@@ -272,6 +272,22 @@ typedef struct store_state {
     mvx_file *txn_file;                 /* whose bracket we opened */
 } store_state;
 
+/* WHICH ACCOUNT THE OPEN FILES BELONG TO (mvx#251).
+ *
+ * Leaving an account closes its files, and a file variable is a bare pointer
+ * -- MV_FILE with the mvx_file* in `i` -- so a handle left in COMMON /FILES/
+ * by the Gentrack layout would be a use-after-free the moment it was read.
+ *
+ * So every file variable carries the generation it was opened in, and leaving
+ * an account bumps it.  One int64 compare on a file operation buys a handle
+ * that SAYS it is stale instead of crashing on it.  A counter rather than a
+ * scan of the open files, because this is the read and write path.
+ *
+ * Unlike UniData, where a handle survives a LOGTO: there a handle names a
+ * FILE, and here it names a place in a store that belongs to the account's
+ * BINDINGS.  Different thing, different lifetime. */
+static int64_t g_file_gen = 1;
+
 /* The open transaction, for the exit handler -- see txn_atexit below.  STOP is
    exit(0) and never reaches the teardown, so the handler is the only thing
    that runs on that path, and it has no ctx to be given. */
@@ -364,6 +380,131 @@ static void clear_select(store_state *st) {
     st->sel_n = st->sel_pos = 0;
 }
 
+/* Close every open file and forget them.  Shared by leaving an account and
+   ending the session: both want the files shut, and a connection cannot be
+   released while one of its files is open. */
+static void clear_files(store_state *st) {
+    for (open_file *o = st->files; o;) {
+        open_file *n = o->next;
+        mvx_file_base *b = (mvx_file_base *)o->f;
+        b->driver->close(o->f);
+        free(o);
+        o = n;
+    }
+    st->files = NULL;
+}
+
+/* Defined with the transaction plumbing further down; wanted here. */
+static void txn_log(const char *fmt, ...);
+static void spec_loc(const char *spec, char *out, size_t cap);
+
+/* CLOSE fvar (mvx#251).
+ *
+ * The standard MV statement, which MVX did not have -- so a file opened was
+ * open for the life of the session, and so was the connection under it.  A
+ * program that walks a list of companies could not give one back.
+ *
+ * Releases the connection too, but only when this was the LAST open file on
+ * that location: OPEN makes a fresh handle every time, so the same file may
+ * be open through several variables, and closing one of them must not pull
+ * the connection out from under the others.
+ *
+ * The variable stops being a file variable.  It is the one place that can be
+ * done honestly -- the statement names it -- and it turns a use-after-close
+ * into a message instead of a crash. */
+void mvx_close(mvx_ctx *ctx, mv_value *fvar) {
+    if (fvar->tag != MV_FILE || fvar->i == 0)
+        mvx_fatal("CLOSE: variable is not an open file variable");
+    store_state *st = mvx_ctx_store_get(ctx);
+    if (!st) { mv_clear(fvar); return; }
+    mvx_file *f = (mvx_file *)(intptr_t)fvar->i;
+    mvx_file_base *b = (mvx_file_base *)f;
+
+    const mvx_driver *drv = b->driver;
+    char loc[1024];
+    spec_loc(b->spec, loc, sizeof loc);
+
+    open_file **pp = &st->files;
+    while (*pp && (*pp)->f != f) pp = &(*pp)->next;
+    if (*pp) {
+        open_file *dead = *pp;
+        *pp = dead->next;
+        free(dead);
+    }
+    drv->close(f);
+
+    int others = 0;
+    for (open_file *o = st->files; o && !others; o = o->next) {
+        mvx_file_base *ob = (mvx_file_base *)o->f;
+        char oloc[1024];
+        spec_loc(ob->spec, oloc, sizeof oloc);
+        if (ob->driver == drv && strcmp(oloc, loc) == 0) others = 1;
+    }
+    if (!others && drv->release_conn) drv->release_conn(loc);
+
+    mv_clear(fvar);
+}
+
+/* LEAVE THE ACCOUNT (mvx#251, mvx#258).
+ *
+ * A session that moves between accounts used to take everything with it: the
+ * old account's files stayed open, and with them its connections, which no
+ * driver ever released.  Eight accounts in and the ninth could not open
+ * anything -- "too many open databases" -- for the rest of the session.
+ *
+ * REFUSED WITH A TRANSACTION OPEN.  It belongs to a connection in the account
+ * being left: committing it afterwards would commit into somewhere the
+ * program no longer is, and discarding it silently is worse.  The program
+ * decides -- commit it, or ABORT -- which is the same answer mvx#247 gives
+ * when one transaction would reach two connections.
+ *
+ * Returns 1 when the session has left, 0 when it has not. */
+int64_t mvx_store_leave(mvx_ctx *ctx) {
+    store_state *st = mvx_ctx_store_get(ctx);
+    if (!st) return 1;                      /* nothing open, nothing to leave */
+    if (st->txn_open) {
+        txn_log("a transaction is open, so this account cannot be left; "
+                "commit it or ABORT first");
+        return 0;
+    }
+
+    /* Close every open file, remembering the locations they were on: a
+       connection cannot be released while a file on it is open, which is
+       why this happens first and in one pass. */
+    char locs[16][1024];
+    const mvx_driver *drvs[16];
+    int nloc = 0;
+    for (open_file *o = st->files; o; o = o->next) {
+        mvx_file_base *b = (mvx_file_base *)o->f;
+        char loc[1024];
+        spec_loc(b->spec, loc, sizeof loc);
+        int seen = 0;
+        for (int i = 0; i < nloc && !seen; i++)
+            if (drvs[i] == b->driver && strcmp(locs[i], loc) == 0) seen = 1;
+        if (!seen && nloc < 16) {
+            snprintf(locs[nloc], sizeof locs[0], "%s", loc);
+            drvs[nloc++] = b->driver;
+        }
+    }
+    clear_files(st);
+    for (lock_ent *l = st->locks; l;) {
+        lock_ent *n = l->next;
+        free(l->key);
+        free(l);
+        l = n;
+    }
+    st->locks = NULL;
+
+    for (int i = 0; i < nloc; i++)
+        if (drvs[i]->release_conn) drvs[i]->release_conn(locs[i]);
+
+    clear_select(st);
+    /* Every file variable still holding one of those handles is now stale,
+       and will say so rather than read freed memory. */
+    g_file_gen++;
+    return 1;
+}
+
 void mvx_store_shutdown(mvx_ctx *ctx) {
     store_state *st = mvx_ctx_store_get(ctx);
     if (!st) return;
@@ -384,13 +525,7 @@ void mvx_store_shutdown(mvx_ctx *ctx) {
         free(l);
         l = n;
     }
-    for (open_file *o = st->files; o;) {
-        open_file *n = o->next;
-        mvx_file_base *b = (mvx_file_base *)o->f;
-        b->driver->close(o->f);
-        free(o);
-        o = n;
-    }
+    clear_files(st);
     free(st);
     mvx_ctx_store_set(ctx, NULL);
 }
@@ -400,6 +535,11 @@ void mvx_store_shutdown(mvx_ctx *ctx) {
 static mvx_file *file_of(const mv_value *fvar, const char *what) {
     if (fvar->tag != MV_FILE || fvar->i == 0)
         mvx_fatal("%s: variable is not an open file variable", what);
+    /* Opened in an account this session has since left (mvx#251).  Saying so
+       is the whole point: the alternative is reading freed memory. */
+    if ((int64_t)fvar->d != g_file_gen)
+        mvx_fatal("%s: the file was opened before a LOGTO and is no longer "
+                  "open; open it again in this account", what);
     return (mvx_file *)(intptr_t)fvar->i;
 }
 
@@ -749,6 +889,7 @@ int64_t mvx_open(mvx_ctx *ctx, const mv_value *dict, const mv_value *spec,
     mv_clear(fvar);
     fvar->tag = MV_FILE;
     fvar->i = (int64_t)(intptr_t)f;
+    fvar->d = (double)g_file_gen;      /* the account this belongs to */
     return 1;
 }
 
