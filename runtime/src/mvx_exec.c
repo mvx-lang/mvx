@@ -708,7 +708,7 @@ static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
        only once the `V' lookup has failed, so a cataloged program still wins
        -- and before the spawn below, which would hand the sentence to a child
        that cannot resolve it either. */
-    if (!fn && vi > 0 && mvx_para_try(ctx, verb, 0)) {
+    if (!fn && vi > 0 && mvx_voc_exec(ctx, verb, sent, 0)) {
         if (rc) mv_set_int(rc, 0);
         return 1;
     }

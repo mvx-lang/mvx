@@ -442,6 +442,36 @@ How many programs are above this one. A program could not previously tell:
   "is there a terminal at all" — a phantom, a pipe, a web session. A routine
   that prompts wants both.
 
+## PROCs (mvx#271)
+
+The third executable VOC record type, after `V` and mvx#269's `PA`. A PROC
+builds a command in a buffer and executes it, where a paragraph simply *is*
+the sentences.
+
+- **Implemented rather than translated.** The issue raised converting simple
+  PROCs to paragraphs on import instead. Measuring killed that: a PROC's
+  arguments come from *moving a pointer over the invoking sentence* (`S2`,
+  then `A`), which a paragraph cannot express — paragraphs have no `%n`
+  parameters at all (measured for mvx#269). A translation would work only for
+  PROCs that take no arguments, which is not the interesting half.
+- **The opcode set is the measured intersection.** `O H A S P X RI RO GO IF`
+  and numeric labels, verified identical on UniData 8.3 **and** ScarletDME
+  2.6-6. `P` executes **and returns**, so a PROC may run several commands in
+  turn — a line after `P` still runs on both.
+- **Word 1 is the verb**, so the first argument is word 2. `S2` is the usual
+  opening line, on both systems.
+- **An unknown opcode is named, not skipped.** The secondary input buffer,
+  `T`, `STON`/`STOFF` and `[]` are not implemented — they exist because PROC
+  had no other way to do what MVX does directly. Skipping them silently would
+  run half a PROC and report success, which is the failure mode this project
+  spends most of its effort avoiding.
+- **jBASE has no PROCs** — and no paragraphs, and no login record. Three of
+  the four systems have them; jBASE's account model is a Unix directory and
+  its login is the Unix login.
+- **A `GO` lands ON the labelled line**, not after it: `10 Omatched` carries
+  the label *and* the opcode. Getting this wrong made the jump silently do
+  nothing, which is how it was caught.
+
 ## Decision A — value representation
 
 **Chosen: boxed value with numeric tags (option 1), plus compiler numeric

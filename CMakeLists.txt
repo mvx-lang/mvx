@@ -152,6 +152,7 @@ add_library(mvxrt SHARED
   runtime/src/mvx_voc.c
   runtime/src/mvx_logto.c
   runtime/src/mvx_para.c
+  runtime/src/mvx_proc.c
   runtime/src/mvx_store.c
   runtime/src/mvx_exec.c
   runtime/src/mvx_perm.c
