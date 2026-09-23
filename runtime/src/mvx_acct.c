@@ -274,6 +274,108 @@ static int ends_dict(const char *n, size_t len) {
 }
 
 /* ---- import: directory form -> hash files ----------------------------- */
+
+/* THE LOGIN A CHECKOUT BRINGS MAY NOT BE ONE HERE (mvx#272).
+ *
+ * UniVerse honours a VOC record named after the ACCOUNT as its login, and
+ * prefers it over `LOGIN' -- measured on 14.2.1, where with both present only
+ * the account-named one ran.  UniData, ScarletDME and MVX all key on `LOGIN'
+ * and ignore an account-named record entirely (measured on 8.3, 2.6-6, and
+ * here in mvx#264).
+ *
+ * So an account authored on UniVerse arrives with a login that MVX will never
+ * run, and nothing said so: the account simply stopped setting itself up.
+ * That is the silent failure this reports.
+ *
+ * It does NOT rewrite the record.  A checkout that quietly edits account
+ * content is worse than one that explains itself, and which record is the
+ * login is the author's to say, not ours to infer.
+ */
+static void descriptor_name(const char *acct, char *out, size_t cap) {
+    out[0] = '\0';
+    char p[4096];
+    snprintf(p, sizeof p, "%s/.mvx", acct);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    char ln[512];
+    while (fgets(ln, sizeof ln, f)) {
+        char *t = ln;
+        while (*t == ' ' || *t == '\t') t++;
+        if (strncmp(t, "name", 4) != 0) continue;
+        char *eq = strchr(t, '=');
+        if (!eq) continue;
+        eq++;
+        while (*eq == ' ' || *eq == '\t') eq++;
+        size_t n = strlen(eq);
+        while (n && (eq[n-1] == '\n' || eq[n-1] == '\r' || eq[n-1] == ' ')) n--;
+        if (n >= cap) n = cap - 1;
+        memcpy(out, eq, n);
+        out[n] = '\0';
+        break;
+    }
+    fclose(f);
+}
+
+/* Attribute 1 of a VOC record, or "" when there is no such record. */
+static void voc_type(mvx_ctx *ctx, mv_value *voc, const char *id,
+                     char *out, size_t cap) {
+    out[0] = '\0';
+    mv_value key, rec, a1;
+    mv_init(&key); mv_init(&rec); mv_init(&a1);
+    set(&key, id, (int64_t)strlen(id));
+    if (mvx_read(ctx, &rec, voc, &key, 0)) {
+        mv_extract_fn(&a1, &rec, 1, 0, 0);
+        char nb[40];
+        const char *p;
+        int64_t n = mv_val_chars(&a1, nb, sizeof nb, &p);
+        if (n > 0) snprintf(out, cap, "%.*s", (int)n, p);
+    }
+    mv_clear(&key); mv_clear(&rec); mv_clear(&a1);
+}
+
+static int is_runnable_type(const char *t) {   /* a login is a PA or a PQ */
+    return (t[0] == 'P' || t[0] == 'p') &&
+           (t[1] == 'A' || t[1] == 'a' || t[1] == 'Q' || t[1] == 'q');
+}
+
+static void login_check(mvx_ctx *ctx, const char *acct) {
+    mv_value voc;
+    if (!open_lit(ctx, "VOC", &voc)) return;      /* no VOC: nothing to say */
+
+    char nm[256];
+    descriptor_name(acct, nm, sizeof nm);
+    if (!nm[0]) {                                 /* fall back to the directory */
+        char cwd[4096];
+        const char *base = acct;
+        if (!strcmp(acct, ".") && getcwd(cwd, sizeof cwd)) base = cwd;
+        const char *slash = strrchr(base, '/');
+        if (slash && slash[1]) base = slash + 1;
+        snprintf(nm, sizeof nm, "%s", base);
+    }
+
+    char lt[64], at[64];
+    voc_type(ctx, &voc, "LOGIN", lt, sizeof lt);
+    voc_type(ctx, &voc, nm, at, sizeof at);
+    mv_clear(&voc);
+
+    if (!at[0] || !is_runnable_type(at)) return;  /* no account-named login */
+
+    if (!lt[0]) {
+        fprintf(stderr,
+            "mvx-convert-acct: this account's login is the record `%s', named\n"
+            "                  after the account -- which is how UniVerse names\n"
+            "                  one.  MVX runs only `LOGIN', so nothing will run\n"
+            "                  on entry here.  Copy it to `LOGIN' to keep it.\n",
+            nm);
+        return;
+    }
+    fprintf(stderr,
+        "mvx-convert-acct: this account has BOTH `LOGIN' and `%s'.  MVX runs\n"
+        "                  `LOGIN'; UniVerse would run `%s' and ignore LOGIN,\n"
+        "                  so the two systems do different things here.\n",
+        nm, nm);
+}
+
 int mvx_acct_import(mvx_ctx *ctx) {
     const char *acct = acct_dir();
     /* Collect the base names of every NAME.DICT in the account first;
@@ -364,6 +466,7 @@ int mvx_acct_import(mvx_ctx *ctx) {
     free(names);
 
     printf("converted %d file(s) to hash files\n", nmig);
+    login_check(ctx, acct);           /* say so if its login will not run here */
     /* BUILD provisions the rest: empty bulk files from lone dictionaries,
      * cataloged BP, linked packages, indexes, and the .mvx descriptor. */
     return run_verb("BUILD");
