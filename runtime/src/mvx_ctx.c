@@ -176,6 +176,16 @@ struct mvx_ctx {
     int64_t status;         /* STATUS(): this program's last conversion, so a
                                program called by another cannot change what
                                its caller is about to test */
+    int64_t depth;          /* @LEVEL: how many programs are above this one.
+                               0 for a program run from the prompt or straight
+                               from Unix, 1 for one an EXECUTE reached, and so
+                               on -- measured on UniData 8.3 and UniVerse
+                               14.2.1, which agree (mvx#270).  The SHELL sets
+                               its own to -1, because a prompt is not a
+                               program: without that the first verb typed
+                               would answer 1 where those systems answer 0,
+                               and every `IF @LEVEL THEN' ported from them
+                               would fire when it must not. */
     char *sentence;         /* SENTENCE(): what invoked THIS program.  It used
                                to be read from the environment on every call,
                                which was safe only while a program reached by
@@ -298,6 +308,7 @@ mvx_ctx *mvx_level_push(mvx_ctx *parent, const char *sentence) {
     if (!ctx) mvx_fatal("out of memory creating a program level");
     ctx->session = parent->session;
     ctx->session->refs++;
+    ctx->depth = parent->depth + 1;     /* @LEVEL (mvx#270) */
     ctx->sentence = strdup(sentence ? sentence : "");
     if (!ctx->sentence) mvx_fatal("out of memory creating a program level");
     return ctx;
@@ -394,6 +405,22 @@ void mvx_ctx_destroy(mvx_ctx *ctx) {
 void mvx_ctx_set_status(mvx_ctx *ctx, int64_t s) { ctx->status = s; }
 
 int64_t mvx_status(mvx_ctx *ctx) { return ctx->status; }
+
+/* @LEVEL -- how many programs are above this one (mvx#270).  A program can
+   otherwise not tell: SYSTEM(2)/SYSTEM(3) answer whether there is a terminal,
+   which a program three EXECUTEs deep still has.  The classic use is a shared
+   routine declining to prompt when it did not come from the operator:
+
+       IF @LEVEL THEN ... ;* something is above me, ask nobody
+
+   which is exactly what an account's LOGIN needs, since mvx#264 runs it from
+   a LOGTO inside a running program whose screen and keyboard it would
+   otherwise take over. */
+int64_t mvx_level(mvx_ctx *ctx) { return ctx->depth < 0 ? 0 : ctx->depth; }
+
+/* The prompt is not a program, so the shell says so once at startup and every
+   level beneath it counts from 0. */
+void mvx_ctx_set_base_level(mvx_ctx *ctx, int64_t d) { ctx->depth = d; }
 
 /* ------------------------------------------------------- COMMON blocks */
 

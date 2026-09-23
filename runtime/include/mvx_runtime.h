@@ -248,6 +248,12 @@ int64_t mvx_iso_time_intern(const char *in, int64_t len, char *out, size_t cap);
 void    mv_fmt(mv_value *dst, const mv_value *src, const mv_value *mask);
 int64_t mvx_status(mvx_ctx *ctx);
 void    mvx_ctx_set_status(mvx_ctx *ctx, int64_t s);
+/* @LEVEL: how many programs are above this one -- 0 from the prompt or
+   straight from Unix, 1 for one an EXECUTE reached (mvx#270). */
+int64_t mvx_level(mvx_ctx *ctx);
+/* The shell marks its own context as not-a-program (-1), so the first verb it
+   runs answers 0 the way UniData and UniVerse do. */
+void    mvx_ctx_set_base_level(mvx_ctx *ctx, int64_t d);
 
 /* --- COMMON blocks ------------------------------------------------------ */
 mv_value *mvx_common_scalar(mvx_ctx *ctx, const char *block, int64_t idx);
