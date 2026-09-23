@@ -27,7 +27,6 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
-void mvx_ctx_set_status(mvx_ctx *ctx, int64_t s);   /* in mvx_ctx.c */
 
 /* OSREAD(path) -> file contents, or "" (STATUS() 1) when unreadable. */
 void mv_osread(mvx_ctx *ctx, mv_value *dst, const mv_value *path) {
