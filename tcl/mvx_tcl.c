@@ -993,6 +993,12 @@ static int command(char *line) {
     if (r > 0)
         return run_verb(path, line);
 
+    /* A PARAGRAPH IS TYPED LIKE A VERB (mvx#269) -- a VOC record with no
+       program behind it, so the lookup above cannot see one.  After the verb,
+       so a cataloged program still wins; before the macro below, which is a
+       different record type and cannot collide. */
+    if (mvx_para_try(g_ctx, verb, 0)) return 0;
+
     /* Not a verb -- but the same VOC name may be a macro, which is how a
        macro is activated in D3: you type its name.  D3 additionally makes
        an M-type name need quotes; we accept the quoted form so that habit

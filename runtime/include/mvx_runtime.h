@@ -105,6 +105,13 @@ int      mvx_voc_lookup_local(mvx_ctx *ctx, const char *verb, char *path,
 /* Run the account's VOC LOGIN, if it has one.  Called on entering an
    account: `mvx` startup, and every LOGTO. */
 void     mvx_login_run(mvx_ctx *ctx);
+/* The raw VOC record for an id; `local_only' asks the account's own VOC and
+   nothing behind it.  1 found, 0 not (mvx#269). */
+int      mvx_voc_record(mvx_ctx *ctx, const char *id, mv_value *rec,
+                        int local_only);
+/* Is `verb' a paragraph -- a VOC record whose attribute 1 is PA -- and if so
+   run its sentences in order.  1 handled, 0 not a paragraph (mvx#269). */
+int      mvx_para_try(mvx_ctx *ctx, const char *verb, int local_only);
 /* Leave the current account: close its files, drop its locks, and release the
    connections they were on, so a session that moves between accounts stops
    accumulating them (mvx#251).  Refused, returning 0, while a transaction is

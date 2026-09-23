@@ -63,6 +63,19 @@ static int voc_read(mvx_ctx *ctx, mv_value *voc, const char *verb,
     return found;
 }
 
+/* THE WHOLE RECORD, not just a verb's path (mvx#269).  A paragraph is a VOC
+   record with no program behind it -- attribute 1 is "PA" and the rest are
+   sentences -- so voc_read above, which insists on "V", cannot see one.  This
+   hands back the record and lets the caller decide what it is. */
+static int voc_get(mvx_ctx *ctx, mv_value *voc, const char *id, mv_value *rec) {
+    mv_value key;
+    mv_init(&key);
+    mv_set_str(&key, id, (int64_t)strlen(id));
+    int found = mvx_read(ctx, rec, voc, &key, 0) ? 1 : 0;
+    mv_clear(&key);
+    return found;
+}
+
 static int voc_open(mvx_ctx *ctx, mv_value *voc, const char *spec) {
     mv_value s;
     mv_init(&s);
@@ -194,4 +207,34 @@ void mvx_voc_reset(void) {
     g_sysvoc_state = 0;
     g_npkgs = 0;
     g_pkg_stamp = -1;
+}
+
+/* The raw VOC record for an id (mvx#269).  `local_only' asks the account's own
+   VOC and nothing behind it, which is what LOGIN needs (mvx#264); otherwise it
+   walks the same three tiers a verb does, so a package may ship a paragraph
+   exactly as it ships a verb.
+
+   1 found -- `rec' holds the record -- 0 not found. */
+int mvx_voc_record(mvx_ctx *ctx, const char *id, mv_value *rec, int local_only) {
+    if (g_voc_state == 0) g_voc_state = voc_open(ctx, &g_voc, "VOC");
+    if (g_voc_state > 0 && voc_get(ctx, &g_voc, id, rec)) return 1;
+    if (local_only) return 0;
+
+    pkgs_reload();
+    for (int i = 0; i < g_npkgs; i++) {
+        if (g_pkgvoc_state[i] == 0) {
+            char pv[1152];
+            snprintf(pv, sizeof pv, "%s/VOC", g_pkgs[i]);
+            g_pkgvoc_state[i] = voc_open(ctx, &g_pkgvoc[i], pv);
+        }
+        if (g_pkgvoc_state[i] > 0 && voc_get(ctx, &g_pkgvoc[i], id, rec))
+            return 1;
+    }
+    if (g_sysvoc_state == 0) {
+        char sysvoc[4096];
+        snprintf(sysvoc, sizeof sysvoc, "%s/VOC", mvx_system_dir());
+        g_sysvoc_state = voc_open(ctx, &g_sysvoc, sysvoc);
+    }
+    if (g_sysvoc_state > 0 && voc_get(ctx, &g_sysvoc, id, rec)) return 1;
+    return 0;
 }
