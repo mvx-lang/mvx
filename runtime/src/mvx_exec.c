@@ -704,6 +704,15 @@ static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
     if (vi > 0 && mvx_voc_lookup(ctx, verb, path, sizeof path) == 1)
         fn = exec_load(path);
 
+    /* A PARAGRAPH IS A VERB WITH NO PROGRAM BEHIND IT (mvx#269).  Looked for
+       only once the `V' lookup has failed, so a cataloged program still wins
+       -- and before the spawn below, which would hand the sentence to a child
+       that cannot resolve it either. */
+    if (!fn && vi > 0 && mvx_para_try(ctx, verb, 0)) {
+        if (rc) mv_set_int(rc, 0);
+        return 1;
+    }
+
     if (fn) {
         int64_t st = capture ? exec_capture(ctx, fn, sent, capture, aborted)
                              : (aborted ? mvx_level_run_at_prompt(ctx, fn, sent,

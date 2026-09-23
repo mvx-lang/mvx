@@ -390,6 +390,36 @@ a menu is exactly this, and CueBic did it.
 - **A `LOGIN` that `LOGTO`s does not start another one.** It is itself a
   program and may move; two pointing at each other would otherwise never stop.
 
+## Paragraphs (mvx#269)
+
+A second executable VOC record type: attribute 1 `PA`, the rest sentences run
+in order. MVX had only `V`, naming a compiled program, and an account ported
+from UniData or UniVerse arrives carrying paragraphs — a `LOGIN` on UniData
+*is* one, because `CATALOG` there writes to `CTLG` and creates no VOC record,
+so a cataloged program cannot be a `LOGIN` at all.
+
+- **Not a new calling convention.** A paragraph is invoked as a sentence, like
+  a verb, on both systems — `EXECUTE "MYPARA"` runs one from BASIC there
+  (measured). So the prompt, `EXECUTE` and mvx#264's `LOGIN` all got them at
+  once, and `LOGIN` needed no change: it runs the *sentence* `LOGIN`.
+- **A `V` record wins.** The paragraph is looked for only when no program is
+  cataloged under the name, so nothing existing changes meaning.
+- **The rules are UniData's, measured.** Two contradicted what was about to be
+  built: sentences are **not** echoed (the `COUNT CLIENTS` echo that suggested
+  otherwise came from `COUNT` itself), and `<<%1>>` is **not** parameter
+  substitution — a paragraph containing it, invoked as `PARA HELLO`, prompted
+  with the literal text `%1` and consumed the next line of input. Paragraphs
+  have no `%n` parameters at all.
+- **`<<text>>` asks once.** `<<Say it>> and <<Say it>>` is one question whose
+  answer is substituted in both places.
+- **A failing sentence does not stop the paragraph**, and the message names
+  it. UniData prints `In Paragraph: X.`; MVX prints `In paragraph X: <line>`,
+  because the sentence that failed is the thing you need to see.
+- **Deferred, not forgotten:** labels, `GO`, and `IF` are classic paragraph
+  features left out of the first cut. PROCs are mvx#271 — a genuinely
+  different language (two buffers, a pointer, an opcode set) and legacy even
+  on the systems that have it.
+
 ## Decision A — value representation
 
 **Chosen: boxed value with numeric tags (option 1), plus compiler numeric

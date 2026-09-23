@@ -158,9 +158,18 @@ void mvx_login_run(mvx_ctx *ctx) {
     static int running;
     if (running) return;
 
+    /* A LOGIN MAY BE A PARAGRAPH (mvx#269), which is what it is on UniData --
+       there a cataloged program cannot be one at all.  Either way it is the
+       account's OWN: `local_only' on both lookups. */
     char path[2048];
-    if (mvx_voc_lookup_local(ctx, "LOGIN", path, sizeof path) != 1)
-        return;                         /* no LOGIN: the ordinary case */
+    int have = mvx_voc_lookup_local(ctx, "LOGIN", path, sizeof path) == 1;
+    if (!have) {
+        running = 1;
+        int did = mvx_para_try(ctx, "LOGIN", 1);
+        running = 0;
+        if (!did) return;               /* no LOGIN: the ordinary case */
+        return;
+    }
 
     running = 1;
     mv_value sent, rc;

@@ -5199,6 +5199,104 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# PARAGRAPHS (mvx#269).
+#
+# MVX had one executable VOC record type -- `V', naming a compiled program.
+# UniData and UniVerse also have paragraphs, and an account ported from either
+# arrives carrying them; a LOGIN on UniData IS one, because a cataloged
+# program cannot be a LOGIN there at all.
+#
+# Every rule below was MEASURED on UniData 8.3 rather than assumed, and two of
+# them contradicted what I was about to implement: sentences are not echoed,
+# and `<<%1>>' is not parameter substitution -- it prompts with the literal
+# text `%1'.  The same prompt twice is one question.
+echo "== paragraphs"
+PRA="$TESTROOT/paraacct"
+"$ROOT/scripts/mkaccount.sh" "$PRA" >/dev/null 2>&1
+mkdir -p "$PRA/BP"
+printf 'PRINT "hi"\n' > "$PRA/BP/SAYHI"
+printf 'PRINT "got: ":FIELD(SENTENCE(), " ", 2, 99)\n' > "$PRA/BP/ECHOARG"
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP SAYHI'   >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP ECHOARG' >/dev/null 2>&1
+cat > "$PRA/BP/MKP" <<'PREOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+A = "" ; A<1> = "PA" ; A<2> = "* comment" ; A<3> = "SAYHI" ; A<4> = ""
+A<5> = "SAYHI"
+WRITE A ON V, "PTWO"
+B = "" ; B<1> = "PA" ; B<2> = "SAYHI" ; B<3> = "NOSUCHVERBHERE" ; B<4> = "SAYHI"
+WRITE B ON V, "PERR"
+C = "" ; C<1> = "PA" ; C<2> = "ECHOARG <<Which one>> and <<Which one>>"
+WRITE C ON V, "PASK"
+PRINT "ok"
+PREOF
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP MKP' >/dev/null 2>&1
+(cd "$PRA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MKP >/dev/null 2>&1)
+
+# Sentences in order; comments and blank lines skipped; NOT echoed.
+p1="$(MVXPRIV=developer "$TCL" -a "$PRA" -c 'PTWO' 2>/dev/null)"
+if [ "$p1" = "hi
+hi" ]; then
+  PASS=$((PASS + 1)); echo "  a paragraph runs its sentences, and does not echo them"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/run: [$p1]"
+fi
+
+# A sentence that fails does not stop the paragraph, and the message names it.
+p2="$(MVXPRIV=developer "$TCL" -a "$PRA" -c 'PERR' 2>&1)"
+case "$p2" in
+  *"In paragraph PERR"*) p2named=1 ;;
+  *) p2named=0 ;;
+esac
+p2hi="$(printf '%s\n' "$p2" | grep -c '^hi$')"
+if [ "$p2named" = 1 ] && [ "$p2hi" = 2 ]; then
+  PASS=$((PASS + 1)); echo "  a failing sentence is named and the rest still runs"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/err: named=$p2named hi=$p2hi [$p2]"
+fi
+
+# <<prompt>> asks once and substitutes everywhere it appeared.
+p3="$(printf 'FRED\n' | MVXPRIV=developer "$TCL" -a "$PRA" -c 'PASK' 2>/dev/null)"
+case "$p3" in
+  *"got: FRED and FRED"*) p3ok=1 ;;
+  *) p3ok=0 ;;
+esac
+if [ "$p3ok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  <<prompt>> is asked once and substituted everywhere"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/ask: [$p3]"
+fi
+
+# EXECUTE reaches one, which is what makes a paragraph LOGIN work.
+printf 'PRINT "before"\nEXECUTE "PTWO"\nPRINT "after"\n' > "$PRA/BP/CALLP"
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP CALLP' >/dev/null 2>&1
+p4="$(cd "$PRA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CALLP 2>/dev/null)"
+if [ "$p4" = "before
+hi
+hi
+after" ]; then
+  PASS=$((PASS + 1)); echo "  EXECUTE runs a paragraph, and the caller carries on"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/execute: [$p4]"
+fi
+
+# AND A LOGIN MAY BE ONE (mvx#264 + mvx#269).  On UniData that is the only way
+# to have a LOGIN at all, so the hook had to be type-agnostic -- it executes
+# the SENTENCE `LOGIN', and this is the proof that buys.
+cat > "$PRA/BP/MKL" <<'PLEOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+L = "" ; L<1> = "PA" ; L<2> = "SAYHI"
+WRITE L ON V, "LOGIN"
+PLEOF
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP MKL' >/dev/null 2>&1
+(cd "$PRA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MKL >/dev/null 2>&1)
+p5="$(MVXPRIV=developer "$TCL" -a "$PRA" -c 'WHO' 2>/dev/null | head -1)"
+if [ "$p5" = "hi" ]; then
+  PASS=$((PASS + 1)); echo "  a LOGIN that is a paragraph runs on entering the account"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/login: [$p5]"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
