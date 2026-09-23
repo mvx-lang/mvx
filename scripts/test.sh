@@ -5441,6 +5441,55 @@ else
   FAIL=$((FAIL + 1)); echo "FAIL proc/execute: exec=[$q8] login=[$q9]"
 fi
 
+# ---------------------------------------------------------------------------
+# A LOGIN A CHECKOUT BRINGS MAY NOT BE ONE HERE (mvx#272).
+#
+# UniVerse honours a VOC record named after the ACCOUNT as its login and
+# prefers it over LOGIN -- measured on 14.2.1, where with both present only
+# the account-named one ran.  UniData, ScarletDME and MVX all key on LOGIN and
+# ignore an account-named record entirely (8.3, 2.6-6, and mvx#264 here).
+#
+# So an account authored on UniVerse arrives with a login MVX will never run,
+# and nothing said so: it simply stopped setting itself up.  The import says
+# so now.  It does NOT rewrite the record -- a checkout that quietly edits
+# account content is worse than one that explains itself.
+echo "== a login that will not run here"
+LGC="$TESTROOT/logincheck"
+mklgc() {                       # $1 = account name
+  rm -rf "$LGC/$1"; mkdir -p "$LGC/$1/VOC" "$LGC/$1/VOC.DICT"
+  printf '# MVX account descriptor\nname = %s\nversion = 1\nopenaccount = 1\n' \
+    "$1" > "$LGC/$1/.mv-account"
+  printf 'D\n' > "$LGC/$1/VOC.DICT/%FILE%"
+}
+mklgc uvstyle; printf 'PA\nDISPLAY setting up\n' > "$LGC/uvstyle/VOC/uvstyle"
+mklgc bothway; printf 'PA\nDISPLAY a\n' > "$LGC/bothway/VOC/bothway"
+               printf 'PA\nDISPLAY b\n' > "$LGC/bothway/VOC/LOGIN"
+mklgc plainlg; printf 'PA\nDISPLAY b\n' > "$LGC/plainlg/VOC/LOGIN"
+mklgc verbnam; printf 'V\nCATALOG/verbnam\n' > "$LGC/verbnam/VOC/verbnam"
+
+lc1="$(MVXPRIV=developer "$CONV" "$LGC/uvstyle" 2>&1 | grep -c "named")"
+lc2="$(MVXPRIV=developer "$CONV" "$LGC/bothway" 2>&1 | grep -c "BOTH")"
+lc3="$(MVXPRIV=developer "$CONV" "$LGC/plainlg" 2>&1 | grep -c "mvx-convert-acct:")"
+lc4="$(MVXPRIV=developer "$CONV" "$LGC/verbnam" 2>&1 | grep -c "mvx-convert-acct:")"
+
+if [ "$lc1" -ge 1 ]; then
+  PASS=$((PASS + 1)); echo "  a UniVerse-style account-named login is reported"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL logincheck/uv: said nothing about it"
+fi
+if [ "$lc2" -ge 1 ]; then
+  PASS=$((PASS + 1)); echo "  and so is an account carrying both, which differ per system"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL logincheck/both: said nothing"
+fi
+# AND IT DOES NOT CRY WOLF.  A plain LOGIN is right, and a `V' record that
+# happens to share the account's name is a VERB, not a login.
+if [ "$lc3" = 0 ] && [ "$lc4" = 0 ]; then
+  PASS=$((PASS + 1)); echo "  a plain LOGIN, or a verb sharing the name, says nothing"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL logincheck/quiet: login=$lc3 verb=$lc4 (both must be 0)"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
