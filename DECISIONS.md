@@ -472,6 +472,32 @@ the sentences.
   the label *and* the opcode. Getting this wrong made the jump silently do
   nothing, which is how it was caught.
 
+## An account's database is its own (mvx#278)
+
+The lmdb driver cached **one global env with no key** — `if (g_env) return
+g_env;` — so it belonged to whichever account opened a file first in the
+process, and every account after it silently used that one.
+
+- **It was data loss, not a cache inefficiency.** Measured: a program that
+  opened a file in account A, `LOGTO`'d to B and wrote there wrote into **A's**
+  database, and B never saw the record. Reads were wrong the same way.
+- **`MVXACCOUNT` is `"."`** under the shell and after `mvx_logto`, so the path
+  could not distinguish accounts even had it been keyed. The env is keyed on
+  the **resolved absolute path** now — the database, not the spelling.
+- **lmdb implemented no `release_conn`**, so mvx#251's `mvx_store_leave` — the
+  thing that exists to let an account go on `LOGTO` — could not clear it. It
+  does now, which is both the contract and a second line of defence.
+- **Still one env at a time.** An lmdb file always lives in its own account's
+  env (`lmdb_open` takes no location), and each open env costs a named
+  semaphore on macOS. Asking for a different one closes the current.
+- **Order is why it hid.** The corruption needs a file opened in the first
+  account *before* the `LOGTO`; move first and open after, and it behaves —
+  which is what most fixtures do. mvx#251's ten-account walk passed because
+  that fixture used sqlite, which keys on the path and does release.
+
+Found while examining mvx#267, which argues the same defect one layer up: a
+spec should carry an absolute location rather than one re-resolved per call.
+
 ## Decision A — value representation
 
 **Chosen: boxed value with numeric tags (option 1), plus compiler numeric

@@ -5490,6 +5490,72 @@ else
   FAIL=$((FAIL + 1)); echo "FAIL logincheck/quiet: login=$lc3 verb=$lc4 (both must be 0)"
 fi
 
+# ---------------------------------------------------------------------------
+# AN ACCOUNT'S DATABASE IS ITS OWN, ACROSS A LOGTO (mvx#278).
+#
+# The lmdb driver cached ONE global env with no key -- `if (g_env) return
+# g_env;' -- so it belonged to whichever account opened a file first in the
+# process, and every account after it silently used that one.  Measured before
+# the fix: a program that opened a file in A, LOGTO'd to B and wrote there
+# WROTE INTO A'S DATABASE, and B never saw the record:
+#
+#     *** A HOLDS B S WRITE: B WROTE THIS TOO
+#     *** B LOST ITS OWN WRITE
+#
+# That is the menu-switching-company case mvx#258 and mvx#264 exist to serve.
+# ORDER MATTERS, which is why it hid: a program that moves BEFORE opening
+# anything gets the right env, and that is what most fixtures do.  This one
+# opens first, deliberately.
+if ls "$ROOT"/build/lib/libmvxdrv_lmdb.* >/dev/null 2>&1; then
+  echo "== an account's database is its own, across a LOGTO"
+  XA="$TESTROOT/xacct"
+  "$ROOT/scripts/mkaccount.sh" "$XA/a" >/dev/null 2>&1
+  "$ROOT/scripts/mkaccount.sh" "$XA/b" >/dev/null 2>&1
+  for x in a b; do
+    echo "LM lmdb" >> "$XA/$x/BINDINGS"
+    MVXPRIV=developer "$TCL" -a "$XA/$x" -c 'CREATE-FILE LM' >/dev/null 2>&1
+    mkdir -p "$XA/$x/BP"
+    printf 'OPEN "LM" TO F ELSE STOP\nWRITE "in %s" ON F, "K"\n' "$x" \
+      > "$XA/$x/BP/SEED"
+    MVXPRIV=developer "$TCL" -a "$XA/$x" -c 'CATALOG BP SEED' >/dev/null 2>&1
+    (cd "$XA/$x" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/SEED >/dev/null 2>&1)
+  done
+  cat > "$XA/a/BP/CROSS" <<XAEOF
+OPEN "LM" TO F ELSE STOP "no LM in A"
+READ R FROM F, "K" THEN PRINT "A:":R ELSE PRINT "A:empty"
+IF LOGTO("$XA/b") THEN NULL ELSE STOP "no move"
+OPEN "LM" TO G ELSE STOP "no LM in B"
+READ R2 FROM G, "K" THEN PRINT "B:":R2 ELSE PRINT "B:empty"
+WRITE "from B" ON G, "BONLY"
+XAEOF
+  MVXPRIV=developer "$TCL" -a "$XA/a" -c 'CATALOG BP CROSS' >/dev/null 2>&1
+  xout="$(cd "$XA/a" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CROSS 2>/dev/null)"
+  if [ "$xout" = "A:in a
+B:in b" ]; then
+    PASS=$((PASS + 1)); echo "  a read after the move comes from the new account"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL xacct/read: [$xout] (B:in a means the env leaked)"
+  fi
+
+  # AND THE WRITE LANDED WHERE THE PROGRAM THOUGHT IT DID -- the half that
+  # destroys data rather than merely misreporting it.
+  printf 'OPEN "LM" TO F ELSE STOP\nREAD R FROM F, "BONLY" THEN PRINT "leaked" ELSE PRINT "clean"\n' \
+    > "$XA/a/BP/CHK"
+  printf 'OPEN "LM" TO F ELSE STOP\nREAD R FROM F, "BONLY" THEN PRINT "kept" ELSE PRINT "lost"\n' \
+    > "$XA/b/BP/CHK"
+  MVXPRIV=developer "$TCL" -a "$XA/a" -c 'CATALOG BP CHK' >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$XA/b" -c 'CATALOG BP CHK' >/dev/null 2>&1
+  xa="$(cd "$XA/a" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CHK 2>/dev/null)"
+  xb="$(cd "$XA/b" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CHK 2>/dev/null)"
+  if [ "$xa" = "clean" ] && [ "$xb" = "kept" ]; then
+    PASS=$((PASS + 1)); echo "  and the write landed in the new account, not the old one"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL xacct/write: old=[$xa] new=[$xb] (want clean/kept)"
+  fi
+else
+  echo "  (cross-account database test skipped — lmdb driver not built)"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
