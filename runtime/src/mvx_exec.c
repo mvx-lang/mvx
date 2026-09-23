@@ -684,6 +684,21 @@ static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
         verb[vi++] = *q++;
     verb[vi] = '\0';
 
+    /* LOGTO IS THE RUNTIME'S, NOT A VERB (mvx#258).  It changes the account
+       this process is in, so a separate program cannot do it -- and that is
+       exactly what used to happen: no VOC entry meant the fallback below
+       spawned `mvx -c "LOGTO ..."`, a CHILD moved and exited, and the caller
+       stayed where it was without a word.  UniData and UniVerse both move the
+       calling program (measured), and this is the spelling ported code uses,
+       so it goes to the same place the intrinsic does. */
+    if (vi > 0 && strcasecmp(verb, "LOGTO") == 0) {
+        const char *arg = q;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        int64_t ok = mvx_logto(ctx, arg);
+        if (rc) mv_set_int(rc, ok ? 0 : 2);
+        return ok;
+    }
+
     char path[2048];
     mvx_program_fn fn = NULL;
     if (vi > 0 && mvx_voc_lookup(ctx, verb, path, sizeof path) == 1)

@@ -304,6 +304,45 @@ than to a program level, so once `EXECUTE` runs in-process (mvx#248) the child
 sees the parent's writes and is covered by the same commit. This is the one
 place MVX deliberately improves on both.
 
+## Changing account from a program (mvx#258)
+
+`LOGTO` used to be a builtin of `mvx` and nothing else, so a site that replaces
+TCL with its own login and menu — the point of mvx#248 — was bound to the
+account its shell started in. An operator picking a company or a division from
+a menu is exactly this, and CueBic did it.
+
+- **`LOGTO` changes account and RETURNS; it does not end the program.**
+  Measured on UniData 8.3 and UniVerse 14.2.1: a program that prints, does
+  `EXECUTE "LOGTO <acct>"`, then prints again prints both lines, and an
+  `EXECUTE "WHERE"` afterwards reports the new account. So a shell can offer a
+  menu of divisions and stay in its loop.
+- **`EXECUTE "LOGTO ..."` is a caller too, not just the intrinsic.** It is the
+  spelling that already works on both those systems, so ported code uses it.
+  Here it used to find no VOC entry, fall back to spawning `mvx -c`, move a
+  *child* that immediately exited, and leave the caller where it was without a
+  word — the worst kind of failure, a silent no-op.
+- **Deliberate divergence: the old account's files are CLOSED.** On UniData a
+  handle opened before the `LOGTO` still reads afterwards — measured — because
+  a handle there names a file, not a store. MVX cannot follow: a handle holds
+  a connection that mvx#251 has to give back, or a session that walks ten
+  accounts runs out at the ninth. A handle kept across the move says it is
+  stale rather than reading somewhere the operator no longer is, so the
+  Gentrack pattern of opening everything at login and keeping it in `COMMON`
+  re-opens after a `LOGTO` instead of silently reading the wrong account.
+- **An open transaction refuses the move**, with `STATUS()` = 2. Committing it
+  after the account changed would commit into somewhere the program no longer
+  is, and discarding it silently is worse. Same answer mvx#247 gives when one
+  transaction would reach two connections.
+- **Three callers, one implementation** — the intrinsic, `EXECUTE`, and the
+  `mvx` builtin all reach `mvx_logto`. The hard part is letting the old
+  account go *before* entering the new one, and a second copy of that would
+  drift.
+- **No `LOGIN` hook, for now.** Both systems run the target account's VOC
+  `LOGIN` on the way in — on a fresh login, on a `LOGTO` from TCL, and on a
+  `LOGTO` from inside a program. MVX runs nothing. Whether it should is
+  mvx#264, deliberately not settled here: it would make every cataloged
+  program run straight from Unix pay for it.
+
 ## Decision A — value representation
 
 **Chosen: boxed value with numeric tags (option 1), plus compiler numeric

@@ -101,8 +101,15 @@ static void load_dir(const char *dir) {
             continue;
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-        if (already_loaded(path)) continue;
-        remember_loaded(path);
+        /* IDENTIFY IT BY THE FILE, NOT THE SPELLING (mvx#258).  The account's
+           own chain is searched relative to the working directory, so before
+           LOGTO existed every account's library was remembered as "LIB/x.so"
+           -- and after a LOGTO the new account's library matched the old
+           account's entry and was silently skipped. */
+        char real[4096];
+        const char *key = realpath(path, real) ? real : path;
+        if (already_loaded(key)) continue;
+        remember_loaded(key);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */
         if (!h) {
             /* SAY WHY (#117).  This used to fail silently, so a library built
@@ -149,6 +156,7 @@ static void register_builtins(void) {
     done = 1;
     register_ext(mvx_json_builtin());
     register_ext(mvx_msg_builtin());
+    register_ext(mvx_logto_builtin());
 }
 
 /* A PACKAGE CAN BE LINKED WHILE THE SESSION IS RUNNING (mvx#248).
@@ -210,6 +218,21 @@ void mvx_ext_load_libs(void) {
     char syslib[4096];
     snprintf(syslib, sizeof syslib, "%s/LIB", sys);
     load_dir(syslib);
+}
+
+/* THE CHAIN IS PER ACCOUNT, TOO (mvx#258).  The rescan above is triggered by
+ * PACKAGES changing, which catches a LINK-PKG but not a LOGTO: the new account
+ * may have no PACKAGES at all, and then the stamp is 0 in both -- unchanged --
+ * so its own LIB/ would never be scanned and a CALL into it would fail with
+ * "subroutine is not cataloged", naming the subroutine and not the cause.
+ *
+ * Nothing is unloaded.  A library already open may have pointers into it, and
+ * "first registration wins" in register_ext means the account left keeps any
+ * extension name it registered.  That is the same trade mvx_ext_load_libs
+ * already makes for LINK-PKG: an open handle rather than a wrong answer. */
+void mvx_ext_reset_libs(void) {
+    g_loaded = 0;
+    g_pkgstamp = -1;
 }
 
 int mvx_ext_has(const char *name) {

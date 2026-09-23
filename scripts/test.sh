@@ -4973,6 +4973,111 @@ else
   echo "  (leave/CLOSE tests skipped — sqlite driver not built)"
 fi
 
+# ---------------------------------------------------------------------------
+# A PROGRAM CAN CHANGE ACCOUNT (mvx#258).
+#
+# LOGTO was a builtin of `mvx` and nothing else, so a site that replaces TCL
+# with its own login and menu -- the whole point of mvx#248 -- was bound to
+# the account its shell started in.  An operator picking a company or a
+# division from a menu is exactly this.
+#
+# `EXECUTE "LOGTO ..."` is in here too, and it is the half that was actively
+# misleading: it found no VOC entry, fell back to spawning `mvx -c`, moved a
+# CHILD that immediately exited, and left the caller where it was without a
+# word.  On UniData 8.3 and UniVerse 14.2 the same line moves the calling
+# program and the program survives -- measured, both of them -- so ported
+# code uses that spelling and has to find it working.
+#
+# Each account gets its own sqlite database with a record saying which it is,
+# so "did the account change?" is answered by what the program READS, not by
+# where it thinks it is.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a program can change account"
+  LG="$TESTROOT/logto"
+  for i in 1 2; do
+    "$ROOT/scripts/mkaccount.sh" "$LG/a$i" >/dev/null 2>&1
+    printf 'ORD sqlite %s/a%s/db.sqlite\n' "$LG" "$i" >> "$LG/a$i/BINDINGS"
+    "$TCL" -a "$LG/a$i" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+    mkdir -p "$LG/a$i/BP"
+    printf 'OPEN "ORD" TO F ELSE STOP\nWRITE "account %s" ON F, "WHO"\n' "$i" \
+      > "$LG/a$i/BP/SEED"
+    MVXPRIV=developer "$TCL" -a "$LG/a$i" -c 'CATALOG BP SEED' >/dev/null 2>&1
+    (cd "$LG/a$i" && MVXACCOUNT=. ./CATALOG/SEED >/dev/null 2>&1)
+  done
+
+  # A subroutine that exists ONLY in the second account, to prove the library
+  # chain moves too: it is searched relative to the working directory, and the
+  # rescan is triggered by PACKAGES changing -- which a LOGTO does not do.
+  printf 'SUBROUTINE ONLY.IN.A2(X)\nPRINT "  a2 subroutine ran"\nRETURN\n' \
+    > "$LG/a2/BP/ONLY.IN.A2"
+  MVXPRIV=developer "$TCL" -a "$LG/a2" -c 'CATALOG BP ONLY.IN.A2' >/dev/null 2>&1
+
+  cat > "$LG/a1/BP/MOVE" <<LGEOF
+EXECUTE "LOGTO $LG/a2"
+OPEN "ORD" TO F ELSE PRINT "  no ORD" ; STOP
+READ R FROM F, "WHO" THEN PRINT "  execute: ":R ELSE PRINT "  no WHO"
+CLOSE F
+CALL ONLY.IN.A2(0)
+IF LOGTO("$LG/a1") THEN
+   OPEN "ORD" TO G ELSE PRINT "  no ORD" ; STOP
+   READ R2 FROM G, "WHO" THEN PRINT "  intrinsic: ":R2 ELSE PRINT "  no WHO"
+END ELSE
+   PRINT "  intrinsic refused, STATUS=":STATUS()
+END
+IF LOGTO("$LG/nosuch") THEN
+   PRINT "  moved to an account that is not there -- WRONG"
+END ELSE
+   PRINT "  bad account: STATUS=":STATUS()
+END
+PRINT "  the program is still running"
+LGEOF
+  MVXPRIV=developer "$TCL" -a "$LG/a1" -c 'CATALOG BP MOVE' >/dev/null 2>&1
+  lgout="$(cd "$LG/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MOVE 2>/dev/null)"
+  lgwant="  execute: account 2
+  a2 subroutine ran
+  intrinsic: account 1
+  bad account: STATUS=1
+  the program is still running"
+  if [ "$lgout" = "$lgwant" ]; then
+    PASS=$((PASS + 1))
+    echo "  EXECUTE and LOGTO() both move the calling program, and it goes on"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL logto: [$lgout]"
+    echo "  wanted: [$lgwant]"
+  fi
+
+  # AN OPEN TRANSACTION REFUSES THE MOVE (mvx#251's rule, reached from BASIC).
+  # Committing it after the account changed would commit into somewhere the
+  # program no longer is; discarding it silently is worse.
+  cat > "$LG/a1/BP/MOVETXN" <<LGEOF
+OPEN "ORD" TO F ELSE STOP
+TRANSACTION START ELSE PRINT "  no transaction" ; STOP
+WRITE "x" ON F, "TMP"
+IF LOGTO("$LG/a2") THEN
+   PRINT "  moved with a transaction open -- WRONG"
+END ELSE
+   PRINT "  refused, STATUS=":STATUS()
+END
+TRANSACTION ABORT
+IF LOGTO("$LG/a2") THEN
+   PRINT "  and allowed once it is settled"
+END ELSE
+   PRINT "  still refused after the abort -- WRONG"
+END
+LGEOF
+  MVXPRIV=developer "$TCL" -a "$LG/a1" -c 'CATALOG BP MOVETXN' >/dev/null 2>&1
+  txout="$(cd "$LG/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MOVETXN 2>/dev/null)"
+  if [ "$txout" = "  refused, STATUS=2
+  and allowed once it is settled" ]; then
+    PASS=$((PASS + 1)); echo "  an open transaction refuses the move, and says which refusal"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL logto/txn: [$txout]"
+  fi
+else
+  echo "  (LOGTO tests skipped — sqlite driver not built)"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.

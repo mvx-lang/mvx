@@ -145,7 +145,7 @@ static const char *const kBuiltinExtFuncs[] = {"JSONENCODE", "JSONDECODE",
                                                "MSGWHO", "MSGSTATUS",
                                                "MSGSEND", "MSGPENDING",
                                                "MSGREAD", "MSGMODE",
-                                               "MSGDROPPED"};
+                                               "MSGDROPPED", "LOGTO"};
 
 std::set<std::string> loadExtFuncs() {
     std::set<std::string> out;

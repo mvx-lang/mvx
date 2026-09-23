@@ -105,6 +105,13 @@ void     mvx_voc_reset(void);
    program has to commit it or ABORT first.  Every file variable opened before
    this says so rather than reading freed memory. */
 int64_t  mvx_store_leave(mvx_ctx *ctx);
+/* Change account (mvx#258): leave this one, enter `acct`, and forget
+   everything resolved per account.  Returns 1 when the session moved and 0
+   when it did not, with the reason in STATUS() -- 1 the account cannot be
+   entered, 2 a transaction is open.  The program CONTINUES either way, which
+   is what UniData and UniVerse both do; re-opening what it needs is its own
+   business, since the handles it held belonged to the account just left. */
+int64_t  mvx_logto(mvx_ctx *ctx, const char *acct);
 /* CLOSE fvar -- release one open file, and the connection under it when it
    was the last one on that location.  Without this a file opened stays open
    for the life of the session (mvx#251).  The variable stops being a file
@@ -226,6 +233,7 @@ int64_t mvx_iso_date_intern(const char *in, int64_t len, char *out, size_t cap);
 int64_t mvx_iso_time_intern(const char *in, int64_t len, char *out, size_t cap);
 void    mv_fmt(mv_value *dst, const mv_value *src, const mv_value *mask);
 int64_t mvx_status(mvx_ctx *ctx);
+void    mvx_ctx_set_status(mvx_ctx *ctx, int64_t s);
 
 /* --- COMMON blocks ------------------------------------------------------ */
 mv_value *mvx_common_scalar(mvx_ctx *ctx, const char *block, int64_t idx);

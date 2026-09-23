@@ -973,35 +973,16 @@ static int command(char *line) {
             fprintf(stderr, "usage: LOGTO account-directory\n");
             return 2;
         }
-        /* LOOK BEFORE LEAVING.  The old account has to be let go before the
-           move -- a default-backend connection is named relative to the
-           account, so releasing it afterwards would name the wrong one -- and
-           leaving an account only to find the new one unreachable would strand
-           the session between the two. */
-        struct stat lsb;
-        if (stat(arg, &lsb) != 0 || !S_ISDIR(lsb.st_mode)) {
-            fprintf(stderr, "LOGTO: cannot enter account %s\n", arg);
-            return 2;
-        }
-        /* Close its files, drop its locks and release the connections they
-           were on (mvx#251).  Refused while a transaction is open, which is
-           the program's to settle. */
-        if (!mvx_store_leave(g_ctx)) return 2;
-        if (chdir(arg) != 0) {
-            fprintf(stderr, "LOGTO: cannot enter account %s\n", arg);
-            return 2;
-        }
+        /* THE RUNTIME OWNS THE MOVE (mvx#258).  It has to: a BASIC shell that
+           replaces this one calls LOGTO() and an EXECUTE "LOGTO ..." from a
+           program reaches the same entry point, so a copy here would be a
+           second implementation of the hard part -- letting the old account
+           go before entering the new one, and forgetting everything resolved
+           per account.  What is left is the shell's own: its VOC handle for
+           macros, and telling the operator where they now are. */
+        if (!mvx_logto(g_ctx, arg)) return 2;
         account_refresh();
-        g_voc_state = 0;                /* re-resolve in the new account */
-        /* And the RUNTIME's caches, which now hold the resolution chain: a
-           LOGTO that left them would keep resolving verbs against the account
-           just left (mvx#248). */
-        mvx_voc_reset();
-        const char *sess = getenv("MVXSESSION");
-        if (sess && sess[0]) {          /* select lists don't cross LOGTO */
-            FILE *fp = fopen(sess, "wb");
-            if (fp) fclose(fp);
-        }
+        g_voc_state = 0;                /* the shell's own VOC, for .C macros */
         printf("now in account %s (%s)\n", g_acct_base, g_acct_path);
         fflush(stdout);
         return 0;
@@ -1258,6 +1239,7 @@ int main(int argc, char **argv) {
                prompt in turn so it can be edited before it goes, which is
                what the M type is for (#177). */
             drain_messages();
+            account_refresh();   /* a verb may have LOGTO'd (mvx#258) */
             int pushed = 0;
             if (g_mqi < g_mqn) { el_push(g_el, g_mqueue[g_mqi++]); pushed = 1; }
             else if (g_mqn) { for (int i = 0; i < g_mqn; i++) free(g_mqueue[i]);
@@ -1285,6 +1267,7 @@ int main(int argc, char **argv) {
 #else
         if (tty) {
             drain_messages();
+            account_refresh();   /* a verb may have LOGTO'd (mvx#258) */
             printf("%s> ", g_acct_base);
             fflush(stdout);
         }
