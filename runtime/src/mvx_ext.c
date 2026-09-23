@@ -101,8 +101,11 @@ static void load_dir(const char *dir) {
             continue;
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-        /* PROBE 2: realpath keying back in, now that the diagnostic works,
-           to see WHERE the deduplication loses GETOPT.SENTENCE. */
+        /* IDENTIFY IT BY THE FILE, NOT THE SPELLING (mvx#258).  The account's
+           own chain is searched relative to the working directory, so before
+           LOGTO existed every account's library was remembered as "LIB/x.so"
+           -- and after a LOGTO the new account's library matched the old
+           account's entry and was silently skipped. */
         char real[4096];
         const char *key = realpath(path, real) ? real : path;
         if (already_loaded(key)) continue;
