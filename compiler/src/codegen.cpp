@@ -330,6 +330,7 @@ private:
                     joinArr(s.target->sval, NK::NotNum, changed);
                 break;
             case Stmt::K::Open:
+            case Stmt::K::Close:
             case Stmt::K::Readnext:
                 joinVar(s.name, NK::NotNum, changed);
                 break;
@@ -1588,6 +1589,13 @@ private:
                     ConstantInt::get(i64Ty_, s.name == "ON" ? 1 : 0)});
             break;
         case Stmt::K::Open:     emitOpen(s);     break;
+        case Stmt::K::Close:
+            /* Hands the variable over so the runtime can clear it: a closed
+               file variable must stop being one, or the next READ through it
+               reads a handle that is gone (mvx#251). */
+            callRt("mvx_close", voidTy_, {ptrTy_, ptrTy_},
+                   {ctxArg_, getScalar(s.name, s.line)});
+            break;
         case Stmt::K::ReadF:    emitReadF(s);    break;
         case Stmt::K::WriteF:   emitWriteF(s);   break;
         case Stmt::K::ReadV:    emitReadV(s);    break;

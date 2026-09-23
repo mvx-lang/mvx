@@ -973,6 +973,20 @@ static int command(char *line) {
             fprintf(stderr, "usage: LOGTO account-directory\n");
             return 2;
         }
+        /* LOOK BEFORE LEAVING.  The old account has to be let go before the
+           move -- a default-backend connection is named relative to the
+           account, so releasing it afterwards would name the wrong one -- and
+           leaving an account only to find the new one unreachable would strand
+           the session between the two. */
+        struct stat lsb;
+        if (stat(arg, &lsb) != 0 || !S_ISDIR(lsb.st_mode)) {
+            fprintf(stderr, "LOGTO: cannot enter account %s\n", arg);
+            return 2;
+        }
+        /* Close its files, drop its locks and release the connections they
+           were on (mvx#251).  Refused while a transaction is open, which is
+           the program's to settle. */
+        if (!mvx_store_leave(g_ctx)) return 2;
         if (chdir(arg) != 0) {
             fprintf(stderr, "LOGTO: cannot enter account %s\n", arg);
             return 2;

@@ -1581,6 +1581,27 @@ static int sq_migrate_docs(const char *loc, char *err, size_t errlen) {
     return done;
 }
 
+/* Release the database held for this location (mvx#251).  The runtime has
+   closed its files first, so nothing here is in use.  The slot is reclaimed by
+   moving the last one into it -- order does not matter, only that the cap
+   stops being a ceiling a session can never get back under. */
+static void sq_release_conn(const char *loc) {
+    char dflt[4096];
+    const char *path = loc;
+    if (!path || !path[0]) {
+        const char *acct = getenv("MVXACCOUNT");
+        if (!acct || !acct[0]) acct = ".";
+        snprintf(dflt, sizeof dflt, "%s/mvxdata.sqlite", acct);
+        path = dflt;
+    }
+    for (int i = 0; i < g_nconns; i++) {
+        if (strcmp(g_conns[i].path, path) != 0) continue;
+        if (g_conns[i].db) sqlite3_close(g_conns[i].db);
+        g_conns[i] = g_conns[--g_nconns];
+        return;
+    }
+}
+
 static const mvx_driver mvx_driver_sqlite = {
     "sqlite",
     sq_open, sq_close,
@@ -1622,6 +1643,9 @@ static const mvx_driver mvx_driver_sqlite = {
                                              is correct and only slower */
     sq_rollback,                          /* abort a failed logical write */
     sq_migrate_docs,                      /* pre-#157 blob -> document */
+    NULL,                                 /* map_text_cap: no bound here */
+    NULL,                                 /* conn_epoch: a file, not a server */
+    sq_release_conn,                      /* let a left account go (mvx#251) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

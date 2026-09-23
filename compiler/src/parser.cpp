@@ -170,6 +170,16 @@ private:
             s->target = primaryRef();
             endStatementSoft();
             break;
+        /* CLOSE fvar -- the standard MV statement, which MVX did not have.
+           Without it a file opened stays open for the life of the session,
+           and so does the connection under it (mvx#251). */
+        case Tok::KwClose: {
+            advance();
+            s = mk(Stmt::K::Close);
+            s->name = expect(Tok::Ident, "file variable").text;
+            endStatementSoft();
+            break;
+        }
         case Tok::KwOpen: {
             advance();
             s = mk(Stmt::K::Open);

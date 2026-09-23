@@ -2111,6 +2111,16 @@ static uint64_t pg_conn_epoch(mvx_file *fh) {
     return (uint64_t)PQbackendPID(c);
 }
 
+/* Release the connection held for this location (mvx#251). */
+static void pg_release_conn(const char *loc) {
+    for (int i = 0; i < g_nconns; i++) {
+        if (strcmp(g_conns[i].loc, loc) != 0) continue;
+        if (g_conns[i].conn) PQfinish(g_conns[i].conn);
+        g_conns[i] = g_conns[--g_nconns];
+        return;
+    }
+}
+
 static const mvx_driver mvx_driver_postgres = {
     "postgres",
     pg_open, pg_close,
@@ -2142,6 +2152,7 @@ static const mvx_driver mvx_driver_postgres = {
     pg_migrate_docs,                      /* pre-#157 blob -> document */
     NULL,                                 /* map_text_cap: no bound here */
     pg_conn_epoch,                        /* which connection, for mvx#253 */
+    pg_release_conn,                      /* let a left account go (mvx#251) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {
