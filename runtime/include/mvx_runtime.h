@@ -109,9 +109,14 @@ void     mvx_login_run(mvx_ctx *ctx);
    nothing behind it.  1 found, 0 not (mvx#269). */
 int      mvx_voc_record(mvx_ctx *ctx, const char *id, mv_value *rec,
                         int local_only);
-/* Is `verb' a paragraph -- a VOC record whose attribute 1 is PA -- and if so
-   run its sentences in order.  1 handled, 0 not a paragraph (mvx#269). */
-int      mvx_para_try(mvx_ctx *ctx, const char *verb, int local_only);
+/* Run `verb' when its VOC record is one the runtime executes itself: a
+   paragraph (PA, mvx#269) or a PROC (PQ/PQN, mvx#271).  `sentence' is what
+   invoked it -- a PROC takes its arguments from it.  1 handled, 0 not ours. */
+int      mvx_voc_exec(mvx_ctx *ctx, const char *verb, const char *sentence,
+                      int local_only);
+/* The PROC interpreter (mvx_proc.c), called by the above. */
+void     mvx_proc_exec(mvx_ctx *ctx, const char *name, const mv_value *rec,
+                       const char *sentence);
 /* Leave the current account: close its files, drop its locks, and release the
    connections they were on, so a session that moves between accounts stops
    accumulating them (mvx#251).  Refused, returning 0, while a transaction is

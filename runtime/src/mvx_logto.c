@@ -165,7 +165,7 @@ void mvx_login_run(mvx_ctx *ctx) {
     int have = mvx_voc_lookup_local(ctx, "LOGIN", path, sizeof path) == 1;
     if (!have) {
         running = 1;
-        int did = mvx_para_try(ctx, "LOGIN", 1);
+        int did = mvx_voc_exec(ctx, "LOGIN", "LOGIN", 1);
         running = 0;
         if (!did) return;               /* no LOGIN: the ordinary case */
         return;

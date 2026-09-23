@@ -165,13 +165,19 @@ static void para_exec(mvx_ctx *ctx, const char *name, const mv_value *rec) {
     answers_free(&a);
 }
 
-/* Is `verb' a paragraph, and if so run it.  1 handled, 0 not a paragraph.
-   `local_only' restricts the search to the account's own VOC, which is what
-   LOGIN needs (mvx#264). */
-int mvx_para_try(mvx_ctx *ctx, const char *verb, int local_only) {
+/* Run `verb' if its VOC record is something the runtime executes itself --
+   a paragraph (`PA', mvx#269) or a PROC (`PQ'/`PQN', mvx#271).  One lookup
+   serves both: they are told apart by attribute 1 and nothing else.
+   1 handled, 0 not ours.
+
+   `sentence' is what invoked it, which a PROC needs for its arguments and a
+   paragraph ignores.  `local_only' restricts the search to the account's own
+   VOC, which is what LOGIN needs (mvx#264). */
+int mvx_voc_exec(mvx_ctx *ctx, const char *verb, const char *sentence,
+                 int local_only) {
     mv_value rec;
     mv_init(&rec);
-    int is_para = 0;
+    int kind = 0;                       /* 1 paragraph, 2 proc */
     if (mvx_voc_record(ctx, verb, &rec, local_only)) {
         mv_value a1;
         mv_init(&a1);
@@ -179,12 +185,15 @@ int mvx_para_try(mvx_ctx *ctx, const char *verb, int local_only) {
         char nb[40];
         const char *p;
         int64_t n = mv_val_chars(&a1, nb, sizeof nb, &p);
-        if (n >= 2 && toupper((unsigned char)p[0]) == 'P' &&
-            toupper((unsigned char)p[1]) == 'A')
-            is_para = 1;
+        if (n >= 2 && toupper((unsigned char)p[0]) == 'P') {
+            char c = (char)toupper((unsigned char)p[1]);
+            if (c == 'A') kind = 1;
+            else if (c == 'Q') kind = 2;   /* PQ, and PQN which behaves the same */
+        }
         mv_clear(&a1);
     }
-    if (is_para) para_exec(ctx, verb, &rec);
+    if (kind == 1) para_exec(ctx, verb, &rec);
+    else if (kind == 2) mvx_proc_exec(ctx, verb, &rec, sentence);
     mv_clear(&rec);
-    return is_para;
+    return kind != 0;
 }

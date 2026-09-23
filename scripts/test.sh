@@ -5348,6 +5348,99 @@ else
   FAIL=$((FAIL + 1)); echo "FAIL level/login: startup=[$lv3] logto=[$lv4]"
 fi
 
+# ---------------------------------------------------------------------------
+# PROCS (mvx#271).
+#
+# The companion to mvx#269.  Where a paragraph IS a list of sentences, a PROC
+# BUILDS a command and then runs it -- the older Pick mechanism, still carried
+# by accounts ported from UniData or OpenQM.
+#
+# Every opcode below was measured on UniData 8.3 AND ScarletDME 2.6-6, which
+# agree exactly, so this is the language rather than one system's reading.
+# Word 1 of the sentence is the VERB, so a PROC's first argument is word 2 --
+# `S2' is the common opening line.
+echo "== procs"
+PQA="$TESTROOT/procacct"
+"$ROOT/scripts/mkaccount.sh" "$PQA" >/dev/null 2>&1
+mkdir -p "$PQA/BP"
+printf 'PRINT "got: ":FIELD(SENTENCE(), " ", 2, 99)\n' > "$PQA/BP/ECHOARG"
+MVXPRIV=developer "$TCL" -a "$PQA" -c 'CATALOG BP ECHOARG' >/dev/null 2>&1
+cat > "$PQA/BP/MKPQ" <<'PQEOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+A = "" ; A<1> = "PQ" ; A<2> = "Oliteral" ; A<3> = "X"
+WRITE A ON V, "P1"
+B = "" ; B<1> = "PQ" ; B<2> = "HECHOARG built" ; B<3> = "P" ; B<4> = "Oafter" ; B<5> = "X"
+WRITE B ON V, "P2"
+C = "" ; C<1> = "PQ" ; C<2> = "S2" ; C<3> = "HECHOARG " ; C<4> = "A" ; C<5> = "P" ; C<6> = "X"
+WRITE C ON V, "P3"
+D = "" ; D<1> = "PQ" ; D<2> = "IF A2 = YES GO 10" ; D<3> = "Ono match" ; D<4> = "X"
+D<5> = "10 Omatched" ; D<6> = "X"
+WRITE D ON V, "P5"
+E = "" ; E<1> = "PQ" ; E<2> = "IF # A2 Ono argument" ; E<3> = "X"
+WRITE E ON V, "P7"
+F = "" ; F<1> = "PQ" ; F<2> = "Obefore" ; F<3> = "ZZNOSUCHOPCODE" ; F<4> = "Oafter" ; F<5> = "X"
+WRITE F ON V, "P8"
+G = "" ; G<1> = "PQ" ; G<2> = "Oproc-login" ; G<3> = "X"
+WRITE G ON V, "LOGIN"
+PQEOF
+MVXPRIV=developer "$TCL" -a "$PQA" -c 'CATALOG BP MKPQ' >/dev/null 2>&1
+(cd "$PQA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MKPQ >/dev/null 2>&1)
+
+# O outputs, H builds, P executes AND RETURNS, X stops.
+q1="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P1' 2>/dev/null | grep -v proc-login)"
+q2="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P2' 2>/dev/null | grep -v proc-login)"
+if [ "$q1" = "literal" ] && [ "$q2" = "got: built
+after" ]; then
+  PASS=$((PASS + 1)); echo "  O writes, H builds, P runs it and the proc carries on"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/core: p1=[$q1] p2=[$q2]"
+fi
+
+# S puts the pointer on a word, A copies it into the buffer.
+q3="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P3 HELLO' 2>/dev/null | grep -v proc-login)"
+if [ "$q3" = "got: HELLO" ]; then
+  PASS=$((PASS + 1)); echo "  S positions the input pointer and A copies the argument"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/args: [$q3]"
+fi
+
+# IF with a numeric label and GO, both ways, plus the absent-argument form.
+q4="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P5 YES' 2>/dev/null | grep -v proc-login)"
+q5="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P5 NO' 2>/dev/null | grep -v proc-login)"
+q6="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P7' 2>/dev/null | grep -v proc-login)"
+if [ "$q4" = "matched" ] && [ "$q5" = "no match" ] && [ "$q6" = "no argument" ]; then
+  PASS=$((PASS + 1)); echo "  IF branches, GO reaches its label, and # tests absence"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/if: yes=[$q4] no=[$q5] absent=[$q6]"
+fi
+
+# AN UNKNOWN OPCODE SAYS SO.  Skipping it silently would run half the proc and
+# report success, which is the failure this whole file exists to prevent.
+q7="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P8' 2>&1 | grep -v proc-login)"
+case "$q7" in
+  *"unknown opcode"*"ZZNOSUCHOPCODE"*) q7ok=1 ;;
+  *) q7ok=0 ;;
+esac
+if [ "$q7ok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  an opcode it does not know is named, not skipped"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/unknown: [$q7]"
+fi
+
+# EXECUTE reaches one, and a LOGIN may be a PROC -- the hook never cared what
+# the record was (mvx#264), and this is the second proof of that.
+printf 'PRINT "before"\nEXECUTE "P1"\nPRINT "after"\n' > "$PQA/BP/CALLQ"
+MVXPRIV=developer "$TCL" -a "$PQA" -c 'CATALOG BP CALLQ' >/dev/null 2>&1
+q8="$(cd "$PQA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CALLQ 2>/dev/null)"
+q9="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'WHO' 2>/dev/null | head -1)"
+if [ "$q8" = "before
+literal
+after" ] && [ "$q9" = "proc-login" ]; then
+  PASS=$((PASS + 1)); echo "  EXECUTE runs a proc, and a LOGIN may be one"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/execute: exec=[$q8] login=[$q9]"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
