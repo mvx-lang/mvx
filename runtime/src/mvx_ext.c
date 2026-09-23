@@ -101,9 +101,10 @@ static void load_dir(const char *dir) {
             continue;
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-        /* PROBE: the realpath keying is out while CI says whether it is what
-           broke the installed MVPKG's first CALL. */
-        const char *key = path;
+        /* PROBE 2: realpath keying back in, now that the diagnostic works,
+           to see WHERE the deduplication loses GETOPT.SENTENCE. */
+        char real[4096];
+        const char *key = realpath(path, real) ? real : path;
         if (already_loaded(key)) continue;
         remember_loaded(key);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */

@@ -4375,6 +4375,8 @@ if [ "$QUICK" = 0 ]; then
             case "$L" in *.dSYM) continue ;; esac
             nm -D "$L" 2>/dev/null | grep -q "mvx_sub_GETOPT" && echo "      $L"
           done | head -5
+          echo "    and the account the run used holds:"
+          ls -la "$IACCT" 2>/dev/null | head -8 | sed 's/^/      /'
           printf '%s\n' "$mout" | head -5 | sed 's/^/    | /' ;;
       esac
     else
