@@ -36,6 +36,7 @@
 #include "mvx_driver.h"
 
 #include <ctype.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -192,7 +193,44 @@ static int voc_lookup(const char *verb, char *path, size_t cap) {
  * Costs nothing when no registry is running: mvx_msg_pending() answers -1
  * without talking to anything. */
 
+/* RUN A VERB IN THIS PROCESS (mvx#248).
+ *
+ * The prompt used to fork and exec, which made every verb a stranger to the
+ * session it was typed into: it reopened every file, took its own locks, and
+ * could only be handed the select list sideways through a file.  A
+ * TRANSACTION typed at the prompt could not span two verbs at all, because
+ * the second one was a different process with a different store.
+ *
+ * Now the verb runs at a LEVEL on the session: its own unnamed COMMON, STATUS
+ * and sentence, sharing everything the session owns.  So a select list simply
+ * persists, a transaction spans as many verbs as it takes to finish, and a
+ * program that opened files into COMMON has them still open for the next verb
+ * -- which is how MV sites have always been laid out.
+ *
+ * THE ABORT STOPS HERE.  A fault takes a calling PROGRAM with it, but not the
+ * prompt: on UniData an ABORT in a verb returns you to TCL rather than
+ * logging you out, so this level catches one instead of passing it on.
+ * Without that, every ABORT and every runtime fault would end the session.
+ *
+ * A verb with no loadable form -- any account cataloged before mvx#248 --
+ * still forks and execs, exactly as before. */
 static int run_verb(const char *path, const char *line) {
+#ifdef __APPLE__
+    static const char *libsfx = ".dylib";
+#else
+    static const char *libsfx = ".so";
+#endif
+    char lp[4200];
+    snprintf(lp, sizeof lp, "%s%s", path, libsfx);
+    void *h = dlopen(lp, RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    mvx_program_fn fn = h ? (mvx_program_fn)dlsym(h, "mvx_main") : NULL;
+    if (fn) {
+        int aborted = 0;
+        int64_t rc = mvx_level_run_at_prompt(g_ctx, fn, line, &aborted);
+        return (int)rc;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         perror("mvx: fork");

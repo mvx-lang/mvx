@@ -317,28 +317,52 @@ mvx_ctx *mvx_level_push(mvx_ctx *parent, const char *sentence) {
  *
  * `volatile` on rc because it is written after the setjmp and read after the
  * longjmp, which is the one thing setjmp does not promise to preserve. */
-int64_t mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
-                      const char *sentence) {
+static int64_t level_run(mvx_ctx *parent, mvx_program_fn entry,
+                         const char *sentence, int stop_aborts,
+                         int *aborted) {
     mvx_ctx *lv = mvx_level_push(parent, sentence);
     mvx_ctx *prev = g_level;
     volatile int64_t rc = 0;
+    volatile int ab = 0;
     g_level = lv;
     lv->catching = 1;
 
     if (setjmp(lv->unwind) == 0) {
         entry(lv);                      /* fell off the end: an ordinary end */
-    } else if (lv->aborting) {
+    } else if (lv->aborting && !stop_aborts) {
         int64_t code = lv->stop_code;
         g_level = prev;
         mvx_level_pop(lv);
         level_unwind(code, 1);          /* keep going up; never returns here */
     } else {
-        rc = lv->stop_code;             /* a STOP: this is where it lands */
+        rc = lv->stop_code;             /* a STOP, or an abort we stop here */
+        ab = lv->aborting;
     }
 
     g_level = prev;
     mvx_level_pop(lv);
+    if (aborted) *aborted = ab;
     return rc;
+}
+
+int64_t mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
+                      const char *sentence) {
+    return level_run(parent, entry, sentence, 0, NULL);
+}
+
+/* THE PROMPT IS WHERE AN ABORT STOPS (mvx#248).
+ *
+ * An abort passes through a program that ran another -- measured on UniData,
+ * a fault in a program reached by EXECUTE takes its caller with it -- but it
+ * does NOT pass through the prompt.  ABORT in a verb returns you to TCL, it
+ * does not log you out: measured on UniData 8.3, the command after an aborted
+ * verb ran and the session was still there.  Which is the whole point of the
+ * statement -- an ABORT that ended the session would be of no use to anybody.
+ *
+ * So something has to be the boundary, and this is it. */
+int64_t mvx_level_run_at_prompt(mvx_ctx *parent, mvx_program_fn entry,
+                                const char *sentence, int *aborted) {
+    return level_run(parent, entry, sentence, 1, aborted);
 }
 
 /* Drop a level.  The session stays: it belongs to whoever is still running,

@@ -4273,6 +4273,11 @@ if [ "$QUICK" = 0 ]; then
         *)
           FAIL=$((FAIL + 1))
           echo "FAIL install: the bundled MVPKG does not run (${itrip:-?}):"
+          echo "    and in the CATALOG executables?"
+          for L in "$ISYS/CATALOG"/*; do
+            case "$L" in *.so|*.dSYM) continue ;; esac
+            nm -D "$L" 2>/dev/null | grep -q "mvx_sub_GETOPT" && echo "      $L"
+          done | head -5
           printf '%s\n' "$mout" | head -5 | sed 's/^/    | /' ;;
       esac
     else
@@ -4599,6 +4604,114 @@ if [ "$fbout" = "caller: captured [child: the old way]" ]; then
   echo "  a verb with no loadable form still runs, by the old route"
 else
   FAIL=$((FAIL + 1)); echo "FAIL execute fallback: [$fbout]"
+fi
+
+# ---------------------------------------------------------------------------
+# THE PROMPT RUNS VERBS IN THIS PROCESS (mvx#248).
+#
+# Three things follow that could not be done while each verb was its own
+# process, and one that must still be true.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a verb typed at the prompt runs in the session"
+  TPA="$TESTROOT/tcl-inproc"
+  "$ROOT/scripts/mkaccount.sh" "$TPA" >/dev/null 2>&1
+  printf 'ORD sqlite %s/acct.sqlite\n' "$TPA" >> "$TPA/BINDINGS"
+  "$TCL" -a "$TPA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  mkdir -p "$TPA/BP"
+  # Two verbs, one transaction: impossible when the second was a new process
+  # with a new store.
+  cat > "$TPA/BP/TPA1" <<'TPEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "no transaction" ; STOP
+WRITE "from the first verb" ON F, "V1"
+PRINT "A: wrote V1, @TRANSACTION=":@TRANSACTION
+TPEOF
+  cat > "$TPA/BP/TPA2" <<'TPEOF'
+PRINT "B: @TRANSACTION=":@TRANSACTION
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+WRITE "from the second verb" ON F, "V2"
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+PRINT "B: committed"
+TPEOF
+  # Open the file once, use it in a later verb -- how MV sites are laid out.
+  printf 'COMMON /FILES/ F.ORD\nOPEN "ORD" TO F.ORD ELSE PRINT "no ORD" ; STOP\nPRINT "LOGIN: opened"\n' \
+    > "$TPA/BP/TPLOG"
+  printf 'COMMON /FILES/ F.ORD\nREAD R FROM F.ORD, "V1" THEN PRINT "USE: ":R ELSE PRINT "USE: could not read"\n' \
+    > "$TPA/BP/TPUSE"
+  # And an abort must land back at the prompt, not end the session.
+  printf 'PRINT "V: aborting"\nABORT\n'   > "$TPA/BP/TPAB"
+  printf 'PRINT "V: still here"\n'         > "$TPA/BP/TPOK"
+  for v in TPA1 TPA2 TPLOG TPUSE TPAB TPOK; do
+    MVXPRIV=developer "$TCL" -a "$TPA" -c "CATALOG BP $v" >/dev/null 2>&1
+  done
+
+  txout="$(printf 'TPA1\nTPA2\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^[AB]:')"
+  txids="$(sqlite3 "$TPA/acct.sqlite" 'SELECT group_concat(id) FROM (SELECT id FROM "ORD" ORDER BY id);' 2>/dev/null)"
+  txwant="A: wrote V1, @TRANSACTION=1
+B: @TRANSACTION=1
+B: committed"
+  if [ "$txout" = "$txwant" ] && [ "$txids" = "V1,V2" ]; then
+    PASS=$((PASS + 1)); echo "  one transaction spans two verbs, and commits both"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl txn: ids=[$txids]"
+    printf '%s\n' "$txout" | sed 's/^/    | /' | head -6
+  fi
+
+  opout="$(printf 'TPLOG\nTPUSE\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^(LOGIN|USE):')"
+  if [ "$opout" = "LOGIN: opened
+USE: from the first verb" ]; then
+    PASS=$((PASS + 1)); echo "  a file opened by one verb is still open for the next"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl common files: [$opout]"
+  fi
+
+  # THE ABORT STOPS HERE.  It takes a calling PROGRAM with it, but the prompt
+  # is where it settles -- on UniData the command after an aborted verb runs
+  # and the session is still there.  Without that boundary every ABORT and
+  # every runtime fault would end the session.
+  about="$(printf 'TPAB\nTPOK\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^V:')"
+  if [ "$about" = "V: aborting
+V: still here" ]; then
+    PASS=$((PASS + 1)); echo "  an aborting verb returns to the prompt, session intact"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl abort: [$about]"
+  fi
+else
+  echo "  (prompt-in-process tests skipped — sqlite driver not built)"
+fi
+
+# A PACKAGE LINKED MID-SESSION TAKES EFFECT (mvx#248).
+#
+# Subroutine libraries used to load once per process, which was right while
+# every verb was a forked process that did its own loading.  With verbs
+# running in the session, a LINK-PKG during that session would never be seen:
+# the subroutines in the package just linked stay invisible and a CALL to one
+# fails with "subroutine is not cataloged" -- a message that names the
+# subroutine and says nothing about the cause.
+#
+# Restoring the one-shot makes the second CALL below fail too, which is how
+# this was confirmed to be testing something.
+echo "== a package linked during a session is usable in it"
+LPP="$TESTROOT/linkpkg-pkg"; mkdir -p "$LPP/BP"
+printf '# MVX account descriptor\nname=lpp\nversion=1\n' > "$LPP/.mvx"
+printf 'lpp\n1.0.0\na package with a subroutine\n' > "$LPP/PKG"
+printf 'SUBROUTINE LPP.HELLO(R)\nR = "from the linked package"\nRETURN\n' \
+  > "$LPP/BP/LPP.HELLO"
+MVXPRIV=developer "$ROOT/scripts/mkpkg.sh" "$LPP" >/dev/null 2>&1
+LPA="$TESTROOT/linkpkg-acct"
+"$ROOT/scripts/mkaccount.sh" "$LPA" >/dev/null 2>&1
+mkdir -p "$LPA/BP"
+printf 'CALL LPP.HELLO(R)\nPRINT "got: ":R\n' > "$LPA/BP/LPUSE"
+MVXPRIV=developer "$TCL" -a "$LPA" -c 'CATALOG BP LPUSE' >/dev/null 2>&1
+lpout="$(printf 'LPUSE\nLINK-PKG %s\nLPUSE\nOFF\n' "$LPP" \
+         | MVXPRIV=developer "$TCL" -a "$LPA" 2>&1 | grep -c 'got: from the linked package')"
+if [ "$lpout" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  a LINK-PKG is visible to the next CALL in the same session"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL link-pkg mid-session: $lpout successful call(s), want 1"
 fi
 
 echo "== records as documents"
