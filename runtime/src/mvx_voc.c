@@ -122,6 +122,25 @@ static void pkgs_reload(void) {
     fclose(fp);
 }
 
+/* THE ACCOUNT'S OWN VOC AND NOTHING BEHIND IT (mvx#264).
+ *
+ * The chain below is right for a verb: an account inherits what packages and
+ * the system provide, which is how a standard verb exists everywhere.  It is
+ * wrong for LOGIN.  A LOGIN is code that runs merely because a session
+ * entered an account, so one inherited from a package -- or from the system
+ * account, which every account sits behind -- would run in every account on
+ * the machine, silently, with nothing naming where it came from.  An account
+ * gets to set itself up; it does not get to set up its neighbours.
+ *
+ * 1 found, 0 no such record, -1 no VOC at all to ask. */
+int mvx_voc_lookup_local(mvx_ctx *ctx, const char *verb, char *path,
+                         size_t cap) {
+    if (g_voc_state == 0) g_voc_state = voc_open(ctx, &g_voc, "VOC");
+    if (g_voc_state > 0 && voc_read(ctx, &g_voc, verb, path, cap))
+        return 1;
+    return g_voc_state < 0 ? -1 : 0;
+}
+
 /* Account VOC (local overrides), then linked packages in listed order, then
    the system account's master VOC.  A foreign verb resolves to a path in its
    OWN account's CATALOG but runs in the user's account, which is the working
@@ -129,9 +148,7 @@ static void pkgs_reload(void) {
 
    1 found, 0 no such verb, -1 no VOC at all to ask. */
 int mvx_voc_lookup(mvx_ctx *ctx, const char *verb, char *path, size_t cap) {
-    if (g_voc_state == 0) g_voc_state = voc_open(ctx, &g_voc, "VOC");
-    if (g_voc_state > 0 && voc_read(ctx, &g_voc, verb, path, cap))
-        return 1;
+    if (mvx_voc_lookup_local(ctx, verb, path, cap) == 1) return 1;
 
     pkgs_reload();
     for (int i = 0; i < g_npkgs; i++) {

@@ -116,7 +116,65 @@ int64_t mvx_logto(mvx_ctx *ctx, const char *acct) {
     }
 
     mvx_ctx_set_status(ctx, LOGTO_OK);
+    /* Last, and only once everything above has settled: LOGIN runs IN the new
+       account, and resolving it needs the chains already forgotten. */
+    mvx_login_run(ctx);
+    mvx_ctx_set_status(ctx, LOGTO_OK);  /* LOGIN may have moved STATUS */
     return 1;
+}
+
+/* THE ACCOUNT'S OWN SETUP, ON THE WAY IN (mvx#264).
+ *
+ * Both UniData and UniVerse run something when a session enters an account --
+ * on a fresh login, on a LOGTO typed at TCL, and on a LOGTO from inside a
+ * program (measured on 8.3 and 14.2.1).  MVX ran nothing, so an account that
+ * needed setting up could only be entered by a program that knew to do it.
+ *
+ * ON ENTERING AN ACCOUNT, NOT PER PROGRAM.  That is what both systems do: the
+ * banner appeared at login and again at the LOGTO, and not around BASIC or
+ * RUN.  So this is called from mvx_logto and from `mvx` at startup, and a
+ * cataloged program run straight from Unix pays nothing -- which keeps
+ * docs/replacing-tcl.md true, where the login IS your program.
+ *
+ * THE NAME IS `LOGIN', one spelling only.  UniData keys on LOGIN and nothing
+ * else; UniVerse honours LOGIN *and* a record named after the account, and
+ * prefers the account-named one -- so a LOGIN added beside it there is
+ * silently dead.  Importing that precedence would mean an operator's new
+ * LOGIN losing to a record they cannot see, which is the kind of surprise
+ * this project keeps out.  LOGIN is also the only spelling that works on both
+ * systems, so it is what portable accounts already use.
+ *
+ * IT IS THE ACCOUNT'S OWN, never inherited -- see mvx_voc_lookup_local.
+ *
+ * A FAILING LOGIN DOES NOT FAIL THE MOVE.  The session IS in the new account
+ * by the time this runs; reporting otherwise would leave the program thinking
+ * it is somewhere it is not.  So an abort in LOGIN is caught here rather than
+ * taking the caller with it -- a menu must not die because an account it
+ * moved to has a broken setup -- and it is reported and carried on from. */
+void mvx_login_run(mvx_ctx *ctx) {
+    /* LOGIN is itself a program, and it may LOGTO.  Without this a LOGIN that
+       moves account runs the next account's LOGIN, and a pair that point at
+       each other never stops. */
+    static int running;
+    if (running) return;
+
+    char path[2048];
+    if (mvx_voc_lookup_local(ctx, "LOGIN", path, sizeof path) != 1)
+        return;                         /* no LOGIN: the ordinary case */
+
+    running = 1;
+    mv_value sent, rc;
+    mv_init(&sent);
+    mv_init(&rc);
+    mv_set_str(&sent, "LOGIN", 5);
+    int aborted = 0;
+    mvx_execute_trapping(ctx, &sent, NULL, &rc, &aborted);
+    if (aborted)
+        fprintf(stderr, "LOGIN: this account's LOGIN gave up; it is set up as "
+                        "far as that got\n");
+    mv_clear(&sent);
+    mv_clear(&rc);
+    running = 0;
 }
 
 /* LOGTO(acct) -- 1 when the session moved, 0 when it did not, with the reason

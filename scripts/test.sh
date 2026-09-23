@@ -5093,6 +5093,112 @@ else
   echo "  (LOGTO tests skipped — sqlite driver not built)"
 fi
 
+# ---------------------------------------------------------------------------
+# AN ACCOUNT SETS ITSELF UP ON THE WAY IN (mvx#264).
+#
+# UniData and UniVerse both run something when a session ENTERS an account --
+# a fresh login, a LOGTO from TCL, and a LOGTO from inside a program (measured
+# on 8.3 and 14.2.1).  MVX ran nothing, so an account that needed setting up
+# could only be entered by a program that knew to do it.
+#
+# Entering, not per program: a cataloged program run straight from Unix pays
+# nothing, which is what keeps docs/replacing-tcl.md true.
+echo "== an account sets itself up on the way in"
+LGI="$TESTROOT/loginacct"
+for a in a1 a2 a3; do "$ROOT/scripts/mkaccount.sh" "$LGI/$a" >/dev/null 2>&1; done
+mkdir -p "$LGI/a2/BP" "$LGI/a1/BP"
+printf 'PRINT "a2-login"\n' > "$LGI/a2/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+
+# 1. entering it with `mvx' runs it; an account without one runs nothing.
+li1="$(MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'WHO' 2>/dev/null | head -1)"
+li2="$(MVXPRIV=developer "$TCL" -a "$LGI/a3" -c 'WHO' 2>/dev/null | head -1)"
+case "$li2" in a2-login|a3-login) li2bad=1 ;; *) li2bad=0 ;; esac
+if [ "$li1" = "a2-login" ] && [ "$li2bad" = 0 ]; then
+  PASS=$((PASS + 1)); echo "  entering an account runs its LOGIN, and only its own"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL login/enter: with=[$li1] without=[$li2]"
+fi
+
+# 2. a LOGTO runs the TARGET's LOGIN, and the program carries on after it.
+cat > "$LGI/a1/BP/MENU" <<LIEOF
+PRINT "menu: moving"
+IF LOGTO("$LGI/a2") THEN PRINT "menu: moved" ELSE PRINT "menu: refused"
+PRINT "menu: still running"
+LIEOF
+MVXPRIV=developer "$TCL" -a "$LGI/a1" -c 'CATALOG BP MENU' >/dev/null 2>&1
+liout="$(cd "$LGI/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MENU 2>/dev/null)"
+if [ "$liout" = "menu: moving
+a2-login
+menu: moved
+menu: still running" ]; then
+  PASS=$((PASS + 1)); echo "  a LOGTO runs the target's LOGIN before it returns"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL login/logto: [$liout]"
+fi
+
+# 3. A LOGIN THAT GIVES UP MUST NOT TAKE THE CALLER WITH IT.  The session is
+# already in the new account by then; killing the menu that moved there would
+# be the worst of both.
+printf 'PRINT "a2-login"\nABORT\n' > "$LGI/a2/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+about="$(cd "$LGI/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MENU 2>/dev/null)"
+case "$about" in
+  *"menu: moved"*"menu: still running"*) abok=1 ;;
+  *) abok=0 ;;
+esac
+if [ "$abok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  an aborting LOGIN is reported, not fatal to the caller"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL login/abort: [$about]"
+fi
+
+# 4. IT IS THE ACCOUNT'S OWN, NEVER INHERITED.  A LOGIN reachable through the
+# system account would run in every account on the machine, silently.
+SYSV="$(MVXPRIV=developer "$TCL" -a "$LGI/a3" -c 'WHO' >/dev/null 2>&1; \
+        echo "${MVXSYSTEM:-$ROOT/build/system}")"
+if [ -d "$SYSV/VOC" ]; then
+  printf 'V\nCATALOG/NOSUCHLOGINPROG\n' > "$SYSV/VOC/LOGIN"
+  syout="$(MVXPRIV=developer "$TCL" -a "$LGI/a3" -c 'WHO' 2>&1 | head -2)"
+  rm -f "$SYSV/VOC/LOGIN"
+  case "$syout" in
+    *NOSUCHLOGINPROG*|*LOGIN*) syok=0 ;;
+    *) syok=1 ;;
+  esac
+  if [ "$syok" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  a LOGIN in the system account is not inherited"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL login/inherit: [$syout]"
+  fi
+else
+  echo "  (system-account LOGIN test skipped — VOC is not a directory)"
+fi
+
+# 5. LOGIN IS ITSELF A PROGRAM AND MAY LOGTO.  Two that point at each other
+# must not loop; the second one does not run.
+printf 'PRINT "a2-login"\nX = LOGTO("%s/a1")\n' "$LGI" > "$LGI/a2/BP/LOGIN"
+printf 'PRINT "a1-login"\nX = LOGTO("%s/a2")\n' "$LGI" > "$LGI/a1/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$LGI/a1" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+( MVXPRIV=developer "$TCL" -a "$LGI/a1" -c 'WHO' >"$TESTROOT/loginloop" 2>&1 ) &
+lipid=$!
+lin=0
+while kill -0 "$lipid" 2>/dev/null && [ "$lin" -lt 20 ]; do sleep 1; lin=$((lin + 1)); done
+if kill -0 "$lipid" 2>/dev/null; then
+  kill -9 "$lipid" 2>/dev/null
+  FAIL=$((FAIL + 1)); echo "FAIL login/recurse: two LOGINs that LOGTO each other did not stop"
+else
+  wait "$lipid" 2>/dev/null
+  lrc="$(grep -c 'a1-login' "$TESTROOT/loginloop" 2>/dev/null || echo 0)"
+  if [ "$lrc" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  a LOGIN that LOGTOs does not start another one"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL login/recurse: a1-login ran $lrc times"
+    sed 's/^/    | /' "$TESTROOT/loginloop" | head -6
+  fi
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
