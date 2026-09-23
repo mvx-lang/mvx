@@ -1552,6 +1552,32 @@ static int txn_enrol(mvx_ctx *ctx, mvx_file *f) {
     return 1;
 }
 
+/* SOMETHING IN THE TRANSACTION FAILED (mvx#253).
+ *
+ * A transaction that has had a failure inside it cannot do what it promised,
+ * so it must not be committable.  mvx#247 already refuses to commit a
+ * POISONED transaction and rolls it back instead; this is the other half --
+ * everything that ought to poison one.
+ *
+ * A FAILED WRITE DID NOT, and the hole was worse than it sounds.  The
+ * per-write bracket that makes one mapped write atomic (mvx#244) cannot fire
+ * while a language transaction is open: bulk_begin answers 0 because one is
+ * already open, so the write's own rollback is skipped, and its partial
+ * effects stay in the outer transaction.  A program that caught the failure
+ * with ON ERROR and carried on then committed a record whose mapping was
+ * never projected -- the torn write mvx#244 exists to prevent, brought back
+ * by the presence of a transaction, and strictly worse than having none.
+ *
+ * Says so, because the program has already been told the WRITE failed and
+ * will otherwise meet the consequence later, at a COMMIT that refuses with
+ * no obvious connection to the write. */
+static void txn_poison(mvx_ctx *ctx, const char *what) {
+    store_state *st = mvx_ctx_store_get(ctx);
+    if (!st || !st->txn_open || st->txn_poisoned) return;
+    st->txn_poisoned = 1;
+    txn_log("%s, so this transaction can no longer be committed", what);
+}
+
 /* TRANSACTION START -- arms it.  No file is named, so there is nothing to
    check yet and nothing to open: the first write enrols a connection.
    Returns 0 when one is already open, because nesting language transactions
@@ -1577,14 +1603,17 @@ int64_t mvx_txn_start(mvx_ctx *ctx) {
 /* TRANSACTION COMMIT.  A transaction that enrolled nothing commits nothing
    and succeeds: a program that wrote no records inside one has not failed.
  *
- * A REFUSED WRITE POISONS THE TRANSACTION, and then COMMIT fails and rolls
- * back what did enrol.  Without that the guarantee would be worth nothing in
- * exactly the case it exists for: START, write A, write B refused because it
- * is on another connection, COMMIT -- and A commits ALONE, which is the half
- * a unit of work this whole feature exists to prevent.  The write already
- * reported its own failure, but a program is entitled to handle that by
- * logging it, and it must not be able to leave a partial commit behind by
- * doing so.  An explicit ABORT remains the way to give up deliberately. */
+ * A FAILURE INSIDE IT POISONS THE TRANSACTION, and then COMMIT fails and
+ * rolls back what did enrol.  Without that the guarantee would be worth
+ * nothing in exactly the case it exists for: START, write A, write B fails,
+ * COMMIT -- and A commits ALONE, which is the half a unit of work this whole
+ * feature exists to prevent.  The write already reported its own failure, but
+ * a program is entitled to handle that by logging it, and it must not be able
+ * to leave a partial commit behind by doing so.  An explicit ABORT remains
+ * the way to give up deliberately.
+ *
+ * What poisons one is in txn_poison: a write refused at enrolment (mvx#247),
+ * and a write the backend or the mapping failed (mvx#253). */
 int64_t mvx_txn_commit(mvx_ctx *ctx) {
     store_state *st = state(ctx);
     if (!st || !st->txn_open) {
@@ -1593,7 +1622,7 @@ int64_t mvx_txn_commit(mvx_ctx *ctx) {
     }
     int ok = 1;
     if (st->txn_poisoned) {
-        txn_log("a write inside this transaction was refused, so there is "
+        txn_log("something inside this transaction failed, so there is "
                 "nothing it can commit; rolling back");
         if (st->txn_enrolled && st->txn_drv->rollback)
             st->txn_drv->rollback(st->txn_file);
@@ -1767,6 +1796,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
         map_load(o);
         if (o->map.nf > 0 && o->map.native &&
             !map_validate_one(ctx, f, &o->map, rec)) {
+            txn_poison(ctx, "a write was rejected by the native map");
             if (onerr) return -2;
             mvx_fatal("WRITE rejected by native map on %s id %.*s",
                       b->spec, (int)idlen, ip);
@@ -1846,6 +1876,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
     if (stripped) mv_clear(&stored);
     if (!ok) {
         if (txn && b->driver->rollback) b->driver->rollback(f);
+        txn_poison(ctx, "a write failed");
         if (need_old) mv_clear(&old);
         if (onerr) return -2;
         mvx_fatal("WRITE failed on %s id %.*s", b->spec, (int)idlen, ip);
@@ -1866,6 +1897,7 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
         else b->driver->bulk_commit(f);   /* no rollback offered: best effort */
     }
     if (need_old) mv_clear(&old);
+    if (!mok) txn_poison(ctx, "a mapped write could not be projected");
     if (!mok && onerr) return -2;
     if (!keep_lock) {                   /* WRITE releases; WRITEU keeps */
         char *key = lock_key(f, ip, idlen);

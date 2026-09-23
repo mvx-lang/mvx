@@ -3684,6 +3684,51 @@ else
   echo "  (language transaction tests skipped — sqlite driver not built)"
 fi
 
+  # A FAILURE INSIDE A TRANSACTION MAKES IT UNCOMMITTABLE (mvx#253).
+  #
+  # mvx#247 refuses to commit a transaction whose write was refused at
+  # enrolment.  A write the BACKEND or the MAPPING failed did not poison one,
+  # and the hole was worse than it sounds: the per-write bracket that makes a
+  # single mapped write atomic (mvx#244) cannot fire while a language
+  # transaction is open -- bulk_begin answers 0 because one already is -- so
+  # the failed write's partial effects stayed in the outer transaction and
+  # were committed.  A record went in whose mapping was never projected: the
+  # torn write mvx#244 exists to prevent, brought back by the presence of a
+  # transaction, and strictly worse than having none.
+  #
+  # Before the fix this printed COMMIT SUCCEEDED and left BAD1 and OK1 in the
+  # table, so a regression shows up as rows present rather than a quiet pass.
+  # Asserting the refusal alone would not do: the commit could refuse and
+  # still leave the rows behind.
+  cat > "$TESTROOT/txfail.b" <<'TXFEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "no transaction" ; STOP
+WRITE "GOOD":@AM:"1":@VM:"2" ON F, "OK1"
+PRINT "wrote OK1"
+WRITE "BAD":@AM:"3":@VM:"4" ON F, "BAD1" ON ERROR PRINT "the second write failed"
+TRANSACTION COMMIT THEN PRINT "COMMIT SUCCEEDED" ELSE PRINT "commit refused"
+TXFEOF
+  if "$MVX" "$TESTROOT/txfail.b" -o "$TESTROOT/txfail" 2>"$TESTROOT/cerr"; then
+    tfout="$(cd "$TXA" && MVXACCOUNT=. MVX_FAULT=mapchild "$TESTROOT/txfail" \
+             2>/dev/null)"
+    tfrows="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id IN ('"'"'OK1'"'"','"'"'BAD1'"'"');' \
+      2>/dev/null)"
+    tfwant="wrote OK1
+the second write failed
+commit refused"
+    if [ "$tfout" = "$tfwant" ] && [ "$tfrows" = 0 ]; then
+      PASS=$((PASS + 1))
+      echo "  a failed write makes the transaction uncommittable, and nothing lands"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL txn failed-write poison: rows=$tfrows (want 0)"
+      printf '%s\n' "$tfout" | sed 's/^/    | /' | head -6
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL txn failed-write poison: did not compile"
+  fi
+
 # A BACKEND WITH NO BRACKET MUST SAY SO, not silently write (mvx#247).  This is
 # the requirement that a transaction cannot be quietly downgraded: the dir
 # driver has no bulk_begin/bulk_commit/rollback, so a write inside one is
