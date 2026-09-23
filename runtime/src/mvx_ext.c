@@ -101,13 +101,9 @@ static void load_dir(const char *dir) {
             continue;
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-        /* IDENTIFY IT BY THE FILE, NOT THE SPELLING (mvx#258).  The account's
-           own chain is searched relative to the working directory, so before
-           LOGTO existed every account's library was remembered as "LIB/x.so"
-           -- and after a LOGTO the new account's library matched the old
-           account's entry and was silently skipped. */
-        char real[4096];
-        const char *key = realpath(path, real) ? real : path;
+        /* PROBE: the realpath keying is out while CI says whether it is what
+           broke the installed MVPKG's first CALL. */
+        const char *key = path;
         if (already_loaded(key)) continue;
         remember_loaded(key);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */

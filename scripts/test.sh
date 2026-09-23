@@ -4364,9 +4364,15 @@ if [ "$QUICK" = 0 ]; then
         *)
           FAIL=$((FAIL + 1))
           echo "FAIL install: the bundled MVPKG does not run (${itrip:-?}):"
-          echo "    and in the CATALOG executables?"
-          for L in "$ISYS/CATALOG"/*; do
-            case "$L" in *.so|*.dSYM) continue ;; esac
+          # WHERE THE SUBROUTINE ACTUALLY IS.  This used to ask only the
+          # CATALOG executables and skip *.so -- which since mvx#248 is where
+          # the code lives on Linux, so it printed nothing whatever the truth
+          # was.  Ask the library chain the runtime actually walks.
+          echo "    the system LIB holds:"
+          ls "$ISYS/LIB" 2>/dev/null | head -8 | sed 's/^/      /'
+          echo "    and mvx_sub_GETOPT is exported by:"
+          for L in "$ISYS/LIB"/* "$ISYS/CATALOG"/*; do
+            case "$L" in *.dSYM) continue ;; esac
             nm -D "$L" 2>/dev/null | grep -q "mvx_sub_GETOPT" && echo "      $L"
           done | head -5
           printf '%s\n' "$mout" | head -5 | sed 's/^/    | /' ;;
