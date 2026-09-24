@@ -29,6 +29,7 @@
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef void (*mvx_subfn)(mvx_ctx *, int32_t, mv_value **);
@@ -38,6 +39,42 @@ typedef void (*mvx_subfn)(mvx_ctx *, int32_t, mv_value **);
    shared with the extension registry — mvx_ext_load_libs() dlopen's every
    package lib RTLD_GLOBAL, so both mvx_sub_ symbols and mvx_ext tables land in
    one pass. */
+/* TWO PACKAGES CLAIMING ONE SUBROUTINE (mvx#266).
+ *
+ * dlsym(RTLD_DEFAULT, ...) takes the first definition loaded and cannot see
+ * that there were others, so an account holding two builds of the same
+ * subroutine runs whichever the loader met first -- and `load_dir' walks LIB
+ * with readdir, whose order is arbitrary.  Measured: mvpkg bundles its own
+ * CMD.RUN while the cmd package ships another, and they differ (one calls
+ * GETOPT.SENTENCE, one does not), so the same install worked or failed by
+ * filesystem chance with nothing said.
+ *
+ * Said once per subroutine, not per CALL: the check walks the loaded
+ * libraries, which is cheap once and wasteful on the hot path. */
+static void report_duplicate(const char *name, const char *sym) {
+    static struct seen { struct seen *next; char name[1]; } *g_seen;
+    for (struct seen *s = g_seen; s; s = s->next)
+        if (strcmp(s->name, name) == 0) return;
+    size_t n = strlen(name);
+    struct seen *s = malloc(sizeof *s + n);
+    if (s) {
+        memcpy(s->name, name, n + 1);
+        s->next = g_seen;
+        g_seen = s;
+    }
+
+    const char *winner = NULL, *other = NULL;
+    if (mvx_ext_providers(sym, &winner, &other) < 2) return;
+    fprintf(stderr,
+            "mvx: %s is defined by more than one library, and which one runs "
+            "depends on\n     the order LIB was read:\n"
+            "       %s  (in use)\n"
+            "       %s  (shadowed)\n"
+            "     They are not required to agree.  One of them should not be "
+            "installed here.\n",
+            name, winner ? winner : "?", other ? other : "?");
+}
+
 static mvx_subfn find_sub(const char *name) {
     char sym[300];
     snprintf(sym, sizeof sym, "mvx_sub_%s", name);
@@ -46,6 +83,7 @@ static mvx_subfn find_sub(const char *name) {
         mvx_ext_load_libs();
         p = dlsym(RTLD_DEFAULT, sym);
     }
+    if (p) report_duplicate(name, sym);
     return (mvx_subfn)p;
 }
 
