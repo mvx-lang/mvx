@@ -43,9 +43,27 @@ struct mvx_cursor {
     int64_t n, pos;
 };
 
-/* One environment per process (per account).  Opened lazily. */
+/* ONE ENVIRONMENT AT A TIME, AND IT KNOWS WHICH ACCOUNT IT IS (mvx#278).
+ *
+ * This used to be a single global env with NO KEY -- `if (g_env) return
+ * g_env;' -- so it belonged to whichever account opened a file first in the
+ * process, and every account after it silently used that one.  A program that
+ * opened a file in one account, LOGTO'd to another and wrote there WROTE INTO
+ * THE FIRST ACCOUNT'S DATABASE, and the second never saw the record.  Reads
+ * were wrong the same way.  That is the menu-switching-company case mvx#258
+ * and mvx#264 exist to serve.
+ *
+ * `MVXACCOUNT' is "." under the shell and after mvx_logto, so the path did not
+ * distinguish accounts either.  The env is keyed on the RESOLVED ABSOLUTE path
+ * now, which names the database rather than the way it was spelled.
+ *
+ * Still one at a time: an lmdb file always lives in its own account's env
+ * (lmdb_open takes no location), and the macOS named-semaphore cost below is
+ * a reason not to hold several.  Asking for a different one closes the
+ * current. */
 static MDB_env *g_env;
 static pid_t g_env_pid;
+static char g_env_path[4096];
 
 /* Close the environment on a clean exit so LMDB releases its lock.  On macOS
    that lock is a *named* POSIX semaphore (one per environment); leaving it
@@ -61,12 +79,37 @@ static void env_atexit(void) {
     }
 }
 
-static MDB_env *env_get(char *err, size_t errlen) {
-    if (g_env) return g_env;
+/* The database this account means, named absolutely.  realpath on the ACCOUNT
+   (which exists) rather than on the store (which may not yet). */
+static void env_path(char *out, size_t cap) {
     const char *acct = getenv("MVXACCOUNT");
     if (!acct || !acct[0]) acct = ".";
+    char rp[4096];
+    const char *base = realpath(acct, rp) ? rp : acct;
+    snprintf(out, cap, "%s/mvxdata.lmdb", base);
+}
+
+static void env_drop(void) {
+    if (g_env && getpid() == g_env_pid) mdb_env_close(g_env);
+    g_env = NULL;
+    g_env_path[0] = '\0';
+}
+
+/* Let an account go (mvx#251's contract, mvx#278's fix).  Without this
+   mvx_store_leave could close every file and still leave the env open, so the
+   next account inherited it.  The location is always the account's own. */
+static void lmdb_release_conn(const char *loc) {
+    (void)loc;
+    env_drop();
+}
+
+static MDB_env *env_get(char *err, size_t errlen) {
     char path[4096];
-    snprintf(path, sizeof path, "%s/mvxdata.lmdb", acct);
+    env_path(path, sizeof path);
+    if (g_env) {
+        if (strcmp(g_env_path, path) == 0) return g_env;
+        env_drop();                  /* a different account: not ours any more */
+    }
     mkdir(path, 0775);
 
     MDB_env *env;
@@ -96,7 +139,9 @@ static MDB_env *env_get(char *err, size_t errlen) {
     mdb_reader_check(env, &dead);
     g_env = env;
     g_env_pid = getpid();
-    atexit(env_atexit);
+    snprintf(g_env_path, sizeof g_env_path, "%s", path);
+    static int registered;
+    if (!registered) { atexit(env_atexit); registered = 1; }
     return env;
 }
 
@@ -255,6 +300,7 @@ static const mvx_driver mvx_driver_lmdb = {
     lmdb_write_ix, lmdb_del_ix, lmdb_index_select, lmdb_index_drop,
     NULL, NULL,                         /* locks: runtime local table */
     .select_count = lmdb_select_count,
+    .release_conn = lmdb_release_conn,  /* let a left account go (mvx#278) */
 };
 
 static int lmdb_create(const char *spec, char *err, size_t errlen) {

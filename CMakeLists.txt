@@ -149,6 +149,10 @@ add_library(mvxrt SHARED
   runtime/src/mvx_json.c
   runtime/src/mvx_doc.c
   runtime/src/mvx_ext.c
+  runtime/src/mvx_voc.c
+  runtime/src/mvx_logto.c
+  runtime/src/mvx_para.c
+  runtime/src/mvx_proc.c
   runtime/src/mvx_store.c
   runtime/src/mvx_exec.c
   runtime/src/mvx_perm.c
@@ -162,6 +166,17 @@ add_library(mvxrt SHARED
   runtime/src/mvx_acct.c
   daemon/sha256.c)
 target_include_directories(mvxrt PUBLIC runtime/include)
+
+# --- the client library (#289) ------------------------------------------
+# One API for a program outside MVX -- and, through mv-connect, a language
+# binding -- to use an account: records, the values in them, subroutines and
+# sentences.  Separate from mvxrt on purpose: this is the surface with an ABI
+# PROMISE, while mvx_runtime.h is internal that happens to be installed, and
+# keeping them apart is what lets mv_value keep changing (mvx#183) without
+# breaking anything built against mvxc.h.
+add_library(mvxc SHARED client/mvxc.c)
+target_include_directories(mvxc PUBLIC client/include)
+target_link_libraries(mvxc PRIVATE mvxrt)
 target_include_directories(mvxrt PRIVATE daemon)   # sha256.h for program identity
 # The runtime calls libm (sin/pow/sqrt/... for the numeric intrinsics);
 # glibc keeps libm separate, so link it explicitly (a no-op on macOS,
@@ -170,6 +185,13 @@ find_library(M_LIBRARY m)
 if(M_LIBRARY)
   target_link_libraries(mvxrt PRIVATE ${M_LIBRARY})
 endif()
+# DECLARE THE dlopen DEPENDENCY (mvx#203).  The runtime dlopen's storage
+# drivers, extension libraries and cataloged subroutines.  glibc 2.34 merged
+# libdl into libc, so on anything newer this links by accident and the
+# omission is invisible; on the glibc 2.28 the release now builds against,
+# `dlopen' is in libdl and has to be asked for.  CMAKE_DL_LIBS is empty where
+# it is not needed, so this is correct everywhere rather than a special case.
+target_link_libraries(mvxrt PRIVATE ${CMAKE_DL_LIBS})
 target_compile_definitions(mvxrt PRIVATE
   MVX_VERSION="${MVX_VERSION}"
   MVX_DRIVER_DIR="${CMAKE_BINARY_DIR}/lib"
@@ -377,12 +399,15 @@ endif()
 # driver, and that is what gets an option.
 add_executable(mvx-msgd daemon/mvx_msgd.c daemon/msgdrv_loop.c)
 target_include_directories(mvx-msgd PRIVATE runtime/include)
+# It dlopen's its transport driver, and links nothing else -- see mvxrt above
+# for why the dependency has to be spelled out (mvx#203).
+target_link_libraries(mvx-msgd PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(mvx-msgd PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # --- mvx-git-adopt: adopt a plain-git checkout into a native account ----
 add_executable(mvx-git-adopt tools/mvx_git_adopt.c)
-target_link_libraries(mvx-git-adopt PRIVATE mvxrt)
+target_link_libraries(mvx-git-adopt PRIVATE mvxrt ${CMAKE_DL_LIBS})
 set_target_properties(mvx-git-adopt PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -390,6 +415,16 @@ set_target_properties(mvx-git-adopt PROPERTIES
 add_executable(mvx-doc-migrate tools/mvx_doc_migrate.c)
 target_link_libraries(mvx-doc-migrate PRIVATE mvxrt ${CMAKE_DL_LIBS})
 set_target_properties(mvx-doc-migrate PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# --- mvx-launch: the executable half of a cataloged program (mvx#248) --
+# Holds no program code.  A copy of it is published as CATALOG/<name>, and it
+# loads CATALOG/<name>.so beside itself -- so a program is compiled once and
+# exists on disk once, instead of being built both as an executable and as a
+# library.
+add_executable(mvx-launch tools/mvx_launch.c)
+target_link_libraries(mvx-launch PRIVATE mvxrt ${CMAKE_DL_LIBS})
+set_target_properties(mvx-launch PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # --- classic TCL shell -------------------------------------------------
@@ -410,12 +445,24 @@ set_target_properties(mvx PROPERTIES
 set(MVX_SYS_DIR ${CMAKE_BINARY_DIR}/system)
 file(GLOB MVX_VERB_SOURCES ${CMAKE_SOURCE_DIR}/verbs/*.b)
 set(MVX_SYS_VERBS "")
+# --catalog, the same way the CATALOG verb publishes anything (mvx#248): a
+# main program has to be loadable, so the runtime can run it in an existing
+# process instead of forking, and the driver decides what that takes -- one
+# file on macOS, where an executable is also loadable, and two where it is
+# not.  The verbs need it as much as anything a user catalogs: they are ALL
+# main programs, so leaving them out would make a standard verb the one kind
+# of EXECUTE that still has to spawn.
+#
+# BYPRODUCTS rather than a second OUTPUT, because whether there IS a second
+# file is the driver's decision and not one CMake can see.
 foreach(vsrc ${MVX_VERB_SOURCES})
   get_filename_component(vname ${vsrc} NAME_WE)
   add_custom_command(OUTPUT ${MVX_SYS_DIR}/CATALOG/${vname}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MVX_SYS_DIR}/CATALOG
-    COMMAND $<TARGET_FILE:mvx-basic> ${vsrc} -o ${MVX_SYS_DIR}/CATALOG/${vname}
-    DEPENDS mvx-basic mvxrt mvx_crt mvxdrv_dir mvxdrv_lmdb ${vsrc}
+    COMMAND $<TARGET_FILE:mvx-basic> --catalog ${vsrc}
+            -o ${MVX_SYS_DIR}/CATALOG/${vname}
+    BYPRODUCTS ${MVX_SYS_DIR}/CATALOG/${vname}${CMAKE_SHARED_LIBRARY_SUFFIX}
+    DEPENDS mvx-basic mvx-launch mvxrt mvx_crt mvxdrv_dir mvxdrv_lmdb ${vsrc}
     COMMENT "Cataloging ${vname}")
   list(APPEND MVX_SYS_VERBS ${MVX_SYS_DIR}/CATALOG/${vname})
 endforeach()
@@ -497,13 +544,16 @@ endif()
 set_target_properties(mvx mvx-basic mvx-git-adopt PROPERTIES
   INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 
-set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd)
+# mvx-launch is installed even though nothing invokes it by name: --catalog
+# copies it beside a cataloged program, so a tree without it cannot catalog
+# on a platform that needs the loader (mvx#248).
+set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd mvx-launch)
 if(MVX_WITH_DAEMON)
   list(APPEND MVX_INSTALL_BINS mvx-lmdbd mvx-lmdbd-admin)
 endif()
 install(TARGETS ${MVX_INSTALL_BINS} RUNTIME DESTINATION bin)
 
-set(MVX_INSTALL_DRIVERS mvxrt mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
+set(MVX_INSTALL_DRIVERS mvxrt mvxc mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
 if(MVX_MQTT_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxmsg_mqtt)
 endif()
@@ -527,6 +577,10 @@ install(FILES ${CMAKE_BINARY_DIR}/lib/mvx_crt.o DESTINATION lib)
 # source tree: its build finds them at <prefix>/include, the install-prefix
 # counterpart of the source tree's runtime/include.
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/runtime/include/
+        DESTINATION include FILES_MATCHING PATTERN "*.h")
+
+# The client library's header, the one external contract with an ABI promise.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/client/include/
         DESTINATION include FILES_MATCHING PATTERN "*.h")
 
 # --- configuration summary ---------------------------------------------

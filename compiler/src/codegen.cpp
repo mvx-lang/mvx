@@ -330,6 +330,7 @@ private:
                     joinArr(s.target->sval, NK::NotNum, changed);
                 break;
             case Stmt::K::Open:
+            case Stmt::K::Close:
             case Stmt::K::Readnext:
                 joinVar(s.name, NK::NotNum, changed);
                 break;
@@ -384,6 +385,7 @@ private:
     BasicBlock *retBB_ = nullptr;
 
     StructType *valTy_ = nullptr;
+    StructType *arrTy_ = nullptr;   // { i64 d1, i64 d2, [0 x mv_value] elems }
     PointerType *ptrTy_ = nullptr;
     Type *i64Ty_ = nullptr, *i32Ty_ = nullptr, *dblTy_ = nullptr,
          *voidTy_ = nullptr;
@@ -643,6 +645,51 @@ private:
         return b_.CreateGEP(a.elemTy, base, idx);
     }
 
+    /* INT(a / b) for integer a and b, without the float round trip (mvx#183).
+     *
+     * sdiv truncates toward zero and so does INT(), so the two agree on every
+     * pair sdiv is defined for.  It is NOT defined for b == 0, nor for
+     * INT64_MIN / -1, where the float path yields the saturating convert's
+     * answer -- so those branch away to it and keep the result identical.
+     *
+     * The guard is not a cost in the case this exists for.  A divisor that is
+     * a literal, or a variable holding one (`CHUNK = 16' at the top of a
+     * program, which is how MV code spells a constant), folds at compile time
+     * and the branch folds with it, leaving a shift.  Only a genuinely
+     * variable divisor pays the compare, and it pays it instead of a sitofp
+     * and an fdiv. */
+    Value *intDivTrunc(const Expr &lhs, const Expr &rhs) {
+        Value *a = evalNum(lhs), *b = evalNum(rhs);
+        Value *zero = ConstantInt::get(i64Ty_, 0);
+        Value *bad = b_.CreateOr(
+            b_.CreateICmpEQ(b, zero),
+            b_.CreateAnd(b_.CreateICmpEQ(b, ConstantInt::get(i64Ty_, -1)),
+                         b_.CreateICmpEQ(a, ConstantInt::get(
+                                                i64Ty_, INT64_MIN))));
+        BasicBlock *slowBB = newBB("idiv.slow");
+        BasicBlock *fastBB = newBB("idiv.fast");
+        BasicBlock *joinBB = newBB("idiv.join");
+        b_.CreateCondBr(bad, slowBB, fastBB,
+                        MDBuilder(llctx_).createUnlikelyBranchWeights());
+
+        b_.SetInsertPoint(fastBB);
+        Value *q = b_.CreateSDiv(a, b);
+        b_.CreateBr(joinBB);
+        BasicBlock *fastEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(slowBB);
+        Value *fq = dblToI64(b_.CreateFDiv(b_.CreateSIToFP(a, dblTy_),
+                                           b_.CreateSIToFP(b, dblTy_)));
+        b_.CreateBr(joinBB);
+        BasicBlock *slowEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(joinBB);
+        PHINode *phi = b_.CreatePHI(i64Ty_, 2);
+        phi->addIncoming(q, fastEnd);
+        phi->addIncoming(fq, slowEnd);
+        return phi;
+    }
+
     Value *fpIntrinsic(Intrinsic::ID id, ArrayRef<Value *> args) {
         Function *f =
             intrinsicDecl(&mod_, id, {dblTy_});
@@ -844,8 +891,31 @@ private:
                 return dblToI64(callRt("mvx_num_system", dblTy_,
                                        {ptrTy_, dblTy_},
                                        {ctxArg_, asDbl(*e.args[0])}));
-            if (f == "INT")
-                return asI64(*e.args[0]);   // fptosi_sat truncates to zero
+            if (f == "INT") {
+                /* INT(a / b) ON INTEGERS IS AN INTEGER DIVIDE (mvx#183).
+                 *
+                 * `/' is always real division in MV -- 7/2 is 3.5 -- so Div
+                 * is NK::Dbl and the pair compiles to sitofp, fdiv, fptosi.
+                 * Wrapped in INT() that round trip is pointless: sdiv also
+                 * truncates toward zero, so the results are identical for
+                 * every integer pair, and the banked sieve computes a bank
+                 * number this way on every element it marks.
+                 *
+                 * THE TWO UNSAFE PAIRS ARE BRANCHED AROUND, not
+                 * excluded: sdiv by zero is undefined in LLVM where fdiv
+                 * gives infinity and the saturating convert clamps it, and
+                 * INT64_MIN / -1 overflows.  intDivTrunc tests for both and
+                 * keeps the float path for them, under an unlikely-branch
+                 * hint, so a VARIABLE divisor gets the integer divide too --
+                 * which is what the banked sieve needs, since it divides by
+                 * CHUNK rather than by a literal. */
+                const Expr &arg = *e.args[0];
+                if (arg.kind == Expr::K::Bin && arg.op == BinOp::Div &&
+                    num_.kindOf(*arg.lhs) == NK::Int &&
+                    num_.kindOf(*arg.rhs) == NK::Int)
+                    return intDivTrunc(*arg.lhs, *arg.rhs);
+                return asI64(arg);   // fptosi_sat truncates to zero
+            }
             if (f == "SQRT")
                 return fpIntrinsic(Intrinsic::sqrt, {asDbl(*e.args[0])});
             {
@@ -934,8 +1004,61 @@ private:
         Value *i = numIndex(*e.args[0]);
         Value *j = e.args.size() == 2 ? numIndex(*e.args[1])
                                       : ConstantInt::get(i64Ty_, 0);
+        if (e.args.size() == 1)
+            return arrElem1D(arr, i, j);
         return callRt("mv_arr_elem", ptrTy_, {ptrTy_, i64Ty_, i64Ty_},
                       {arr, i, j});
+    }
+
+    /* A ONE-SUBSCRIPT ELEMENT IS A BOUNDS CHECK AND AN OFFSET (mvx#183).
+     *
+     * `mv_arr_elem' is a call into the runtime on every element access, and
+     * for a shared library that is a PLT crossing as well.  Measured on the
+     * banked sieve: mv_arr_elem 139 samples and DYLD-STUB$$mv_arr_elem 95, a
+     * tenth of the benchmark, to do two comparisons and add an offset.
+     *
+     * The 1-D body is exactly that -- `i < 1 || i > d1 || j != 0' then
+     * `&elems[i-1]' -- so it is emitted here instead.  THE ERROR PATH STILL
+     * CALLS THE RUNTIME: the message names the bound and the subscript, and
+     * having one copy of it matters more than the branch it costs on a path
+     * that ends in mvx_fatal anyway.  That also keeps 2-D and j != 0 correct
+     * without restating their rules here.
+     *
+     * Not done for two subscripts: the multiply makes it longer, and nothing
+     * measured spends its time there. */
+    Value *arrElem1D(Value *arr, Value *i, Value *j) {
+        Value *zero = ConstantInt::get(i64Ty_, 0);
+        Value *one  = ConstantInt::get(i64Ty_, 1);
+        Value *d1 = b_.CreateLoad(i64Ty_, b_.CreateStructGEP(arrTy_, arr, 0));
+        Value *d2 = b_.CreateLoad(i64Ty_, b_.CreateStructGEP(arrTy_, arr, 1));
+        Value *ok = b_.CreateAnd(
+            b_.CreateICmpEQ(d2, zero),
+            b_.CreateAnd(b_.CreateICmpSGE(i, one), b_.CreateICmpSLE(i, d1)));
+
+        BasicBlock *fastBB = newBB("arr.fast");
+        BasicBlock *slowBB = newBB("arr.slow");
+        BasicBlock *joinBB = newBB("arr.join");
+        b_.CreateCondBr(ok, fastBB, slowBB,
+                        MDBuilder(llctx_).createLikelyBranchWeights());
+
+        b_.SetInsertPoint(fastBB);
+        Value *p = b_.CreateInBoundsGEP(
+            arrTy_, arr, {zero, ConstantInt::get(i32Ty_, 2),
+                          b_.CreateSub(i, one)});
+        b_.CreateBr(joinBB);
+        BasicBlock *fastEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(slowBB);
+        Value *q = callRt("mv_arr_elem", ptrTy_, {ptrTy_, i64Ty_, i64Ty_},
+                          {arr, i, j});       /* names the bound, then fatals */
+        b_.CreateBr(joinBB);
+        BasicBlock *slowEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(joinBB);
+        PHINode *phi = b_.CreatePHI(ptrTy_, 2);
+        phi->addIncoming(p, fastEnd);
+        phi->addIncoming(q, slowEnd);
+        return phi;
     }
 
     // Pointer to an mv_value holding the expression's value.  Lvalues are
@@ -960,7 +1083,8 @@ private:
         }
         if (e.kind == Expr::K::Var && sysConstChar(e.sval) < 0 &&
             e.sval != "@USER.TYPE" && e.sval != "@SENTENCE" &&
-            e.sval != "@USERNO")
+            e.sval != "@USERNO" && e.sval != "@TRANSACTION" &&
+            e.sval != "@LEVEL")
             return getScalar(e.sval, e.line);
         if (e.kind == Expr::K::Paren && arrayNames_.count(e.sval))
             return arrayElemPtr(e);
@@ -1003,6 +1127,44 @@ private:
             if (e.sval == "@USER.TYPE") {          // session type (0 = interactive)
                 callRt("mv_user_type", voidTy_, {ptrTy_, ptrTy_},
                        {ctxArg_, dest});
+                return;
+            }
+            if (e.sval == "@TRANSACTION") {
+                /* Am I inside a transaction (mvx#247)?  The spelling is not
+                 * a choice -- measured on both platforms that have it:
+                 * @TRANSACTION is 0 outside a transaction and non-zero in one.
+                 *
+                 * IT IS A BOOLEAN, and MV code uses it as one -- `IF
+                 * @TRANSACTION THEN' is how it is written, and it is the ONLY
+                 * portable reading.  The non-zero value is not a small fixed
+                 * number: measured on UniVerse 14.2.1, one START answered 3,
+                 * then 4, then 7, 8, 9 on successive runs -- it is a
+                 * monotonically increasing transaction NUMBER, with nesting
+                 * counted on top of it (three nested STARTs gave n, n+1, n+2).
+                 * UniData answers 1.  So `IF @TRANSACTION = 1' is code that
+                 * works on one system and silently never fires on the other.
+                 *
+                 * MVX answers the nesting depth, 0 or 1, because a second
+                 * START is refused rather than nested -- which agrees with
+                 * UniData.  Nothing should depend on the number. */
+                Value *n = callRt("mvx_txn_depth", i64Ty_, {ptrTy_},
+                                  {ctxArg_});
+                callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_}, {dest, n});
+                return;
+            }
+            if (e.sval == "@LEVEL") {
+                /* HOW MANY PROGRAMS ARE ABOVE ME (mvx#270).  Measured on
+                 * UniData 8.3 and UniVerse 14.2.1, which agree exactly: a
+                 * program run from TCL answers 0, and the same program
+                 * reached through an EXECUTE answers 1.
+                 *
+                 * The use is a routine that must not talk to a terminal it
+                 * does not own -- `IF @LEVEL THEN' means something is above
+                 * me, so ask nobody.  @USER.TYPE does NOT answer this: it
+                 * says whether there is a terminal, and a program three
+                 * EXECUTEs deep still has one. */
+                Value *n = callRt("mvx_level", i64Ty_, {ptrTy_}, {ctxArg_});
+                callRt("mv_set_int", voidTy_, {ptrTy_, i64Ty_}, {dest, n});
                 return;
             }
             if (e.sval == "@USERNO") {
@@ -1442,6 +1604,12 @@ private:
         case Stmt::K::Assign: emitAssign(s); break;
         case Stmt::K::Dim:    emitDim(s);    break;
         case Stmt::K::If:     emitIf(s);     break;
+        case Stmt::K::TxnStart:
+        case Stmt::K::TxnCommit:
+            emitTxn(s);   break;
+        case Stmt::K::TxnAbort:
+            callRt("mvx_txn_abort", voidTy_, {ptrTy_}, {ctxArg_});
+            break;
         case Stmt::K::For:    emitFor(s);    break;
         case Stmt::K::Loop:   emitLoop(s);   break;
         case Stmt::K::Print:  emitPrint(s);  break;
@@ -1493,6 +1661,13 @@ private:
                     ConstantInt::get(i64Ty_, s.name == "ON" ? 1 : 0)});
             break;
         case Stmt::K::Open:     emitOpen(s);     break;
+        case Stmt::K::Close:
+            /* Hands the variable over so the runtime can clear it: a closed
+               file variable must stop being one, or the next READ through it
+               reads a handle that is gone (mvx#251). */
+            callRt("mvx_close", voidTy_, {ptrTy_, ptrTy_},
+                   {ctxArg_, getScalar(s.name, s.line)});
+            break;
         case Stmt::K::ReadF:    emitReadF(s);    break;
         case Stmt::K::WriteF:   emitWriteF(s);   break;
         case Stmt::K::ReadV:    emitReadV(s);    break;
@@ -1538,9 +1713,31 @@ private:
             Value *ret = s.name2.empty()
                              ? (Value *)ConstantPointerNull::get(ptrTy_)
                              : getScalar(s.name2, s.line);
-            callRt("mvx_execute", i64Ty_,
-                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_},
-                   {ctxArg_, evalPtr(*s.value), cap, ret});
+            if (!s.hasError) {
+                callRt("mvx_execute", i64Ty_,
+                       {ptrTy_, ptrTy_, ptrTy_, ptrTy_},
+                       {ctxArg_, evalPtr(*s.value), cap, ret});
+                break;
+            }
+            /* ON ERROR: the program it runs gave up (mvx#256).  An abort in
+               it would otherwise take THIS program too, which is what should
+               happen to ordinary code and must not happen to a shell.  The
+               flag says which way it ended; a plain non-zero STOP is not an
+               error and does not come here. */
+            AllocaInst *ab = eb_.CreateAlloca(i32Ty_, nullptr, "exec.aborted");
+            b_.CreateStore(ConstantInt::get(i32Ty_, 0), ab);
+            callRt("mvx_execute_trapping", i64Ty_,
+                   {ptrTy_, ptrTy_, ptrTy_, ptrTy_, ptrTy_},
+                   {ctxArg_, evalPtr(*s.value), cap, ret, ab});
+            Value *abv = b_.CreateLoad(i32Ty_, ab, "aborted");
+            Value *bad = b_.CreateICmpNE(abv, ConstantInt::get(i32Ty_, 0));
+            BasicBlock *errBB  = newBB("exec.err");
+            BasicBlock *doneBB = newBB("exec.done");
+            b_.CreateCondBr(bad, errBB, doneBB);
+            b_.SetInsertPoint(errBB);
+            emitBlock(s.errorBody);
+            if (!b_.GetInsertBlock()->getTerminator()) b_.CreateBr(doneBB);
+            b_.SetInsertPoint(doneBB);
             break;
         }
 
@@ -2144,6 +2341,31 @@ private:
         b_.CreateStore(arr, slot);
     }
 
+    /* TRANSACTION START / COMMIT (mvx#247).
+     *
+     * A direct runtime call, not an extension function: the transaction is
+     * session state the store owns, and routing it through the extension
+     * registry would put a name in a table that a package could shadow.
+     * The answer is 0/1 and the statement's THEN/ELSE tests it, so this is
+     * emitIf with the condition supplied rather than parsed. */
+    void emitTxn(const Stmt &s) {
+        const char *fn = s.kind == Stmt::K::TxnStart ? "mvx_txn_start"
+                                                     : "mvx_txn_commit";
+        Value *r = callRt(fn, i64Ty_, {ptrTy_}, {ctxArg_});
+        Value *c = b_.CreateICmpNE(r, ConstantInt::get(i64Ty_, 0));
+        BasicBlock *thenBB = newBB("txn.then");
+        BasicBlock *elseBB = newBB("txn.else");
+        BasicBlock *doneBB = newBB("txn.done");
+        b_.CreateCondBr(c, thenBB, elseBB);
+        b_.SetInsertPoint(thenBB);
+        emitBlock(s.body);
+        b_.CreateBr(doneBB);
+        b_.SetInsertPoint(elseBB);
+        emitBlock(s.elseBody);
+        b_.CreateBr(doneBB);
+        b_.SetInsertPoint(doneBB);
+    }
+
     void emitIf(const Stmt &s) {
         Value *c = evalCond(*s.cond);
         BasicBlock *thenBB = newBB("if.then");
@@ -2599,6 +2821,11 @@ void CodeGen::run(const std::string &outPath) {
     ptrTy_ = PointerType::get(llctx_, 0);
     valTy_ = StructType::create(llctx_, {i64Ty_, i64Ty_, dblTy_, ptrTy_},
                                 "mv_value");
+    /* mv_array: { int64 d1, int64 d2, mv_value elems[] } -- so an element
+       address is a GEP the DataLayout computes rather than an offset spelled
+       here (mvx#183). */
+    arrTy_ = StructType::create(llctx_,
+        {i64Ty_, i64Ty_, ArrayType::get(valTy_, 0)}, "mv_array");
 
     mod_.addModuleFlag(Module::Warning, "Debug Info Version",
                        DEBUG_METADATA_VERSION);

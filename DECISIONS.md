@@ -221,6 +221,283 @@ are permanent once separately compiled subroutines exist.
 
 ---
 
+## Language transactions (mvx#247)
+
+A program can bracket several writes so they commit or roll back as one unit,
+extending the per-write guarantee of mvx#244 (one mapped write — record,
+parent columns and child rows — is already atomic) across statements.
+
+- **The spelling is `TRANSACTION START` / `TRANSACTION COMMIT` /
+  `TRANSACTION ABORT`.** Verified by compiling and running probes on the real
+  systems, not from documentation: UniData **and** UniVerse both accept this
+  form, jBASE spells it `TRANSTART` / `TRANSEND` / `TRANSABORT`. Two of three
+  agree, and the agreeing pair is the pair MVX code is most often ported from.
+  Classic Pick, normally the tie-breaker, has no transactions to arbitrate
+  with.
+- **No `BEGIN TRANSACTION … END TRANSACTION` block.** UniVerse offers one and
+  it looks like the tidier construct, but the shape real code uses is not
+  lexical: on UniData at Gentrack, CueBic started the transaction in a
+  pre-save, called subroutines that wrote records, and committed at the top of
+  the next screen — all one process, never inside one block. A block form
+  would not have expressed that program, so it would have been decoration.
+- **`START` and `COMMIT` take `THEN`/`ELSE`; `ABORT` takes neither.** This is
+  UniData's and UniVerse's rule exactly. An abort has no failure a program
+  could branch on — discarding is best effort by definition — so a clause on
+  it would be a clause that never fires.
+- **A second `START` is refused, not nested** — which agrees with UniData and
+  diverges from UniVerse. Measured: on UniData 8.3 the second `START` takes
+  the `ELSE` and `@TRANSACTION` stays 1; on UniVerse 14.2.1 three successive
+  `TRANSACTION START`s all succeeded and each `ABORT` unwound one level.
+  Supporting that means savepoints in the backend and a partial rollback, and
+  nothing has asked for it; refusing is honest, where pretending to nest and
+  rolling the whole thing back on the inner `ABORT` would be silently wrong.
+  Revisit if a real program needs it.
+- **`@TRANSACTION` is a depth, and must keep working as a boolean.** It reads 0
+  outside and 1 inside on MVX and UniData. On UniVerse the non-zero value is
+  neither 1 nor stable: measured on 14.2.1, a single `TRANSACTION START`
+  answered 3, then 4, then 7, 8, 9 on successive runs — it is a monotonically
+  increasing transaction *number*, with nesting counted on top of it (three
+  nested `START`s gave n, n+1, n+2, unwinding back to 0). So MV code written
+  `IF @TRANSACTION` is not merely acceptable, it is the only portable reading;
+  `IF @TRANSACTION = 1` works on UniData and silently never fires on
+  UniVerse. MVX answers a depth rather than a flag only so it can grow if
+  savepoints ever arrive. jBASE has no `@TRANSACTION` at all — the compiler
+  says `Unknown @ system constant @TRANSACTION specified` — and exposes the
+  same question as `TRANSQUERY()`.
+- **One transaction, one connection.** A file spec is `"<location>\n<file>"`,
+  so a connection is (driver, location); the first write inside a transaction
+  enrols one and a write to any other is **refused**. Committing each backend
+  separately would be atomic per backend and not overall — worse than
+  refusing, because nothing afterwards could tell.
+- **A refused write poisons the transaction**, and `COMMIT` then fails and
+  rolls back what did enrol. Otherwise the guarantee would be worth nothing in
+  the case it exists for: `START`, write A, write B refused, `COMMIT` — and A
+  commits alone, which is the half a unit of work the feature exists to
+  prevent. The refused write already reported its own failure, but a program
+  is entitled to handle that by logging it and carrying on, and doing so must
+  not be able to leave a partial commit behind. An explicit `ABORT` remains
+  the way to give up deliberately.
+- **A backend with no bracket refuses the write and says so.** `sqlite`,
+  `postgres` and `mysql` implement `bulk_begin`/`bulk_commit`/`rollback`;
+  `dir`, `lmdb`, `lmdbnet` and `mongo` do not. A write to one of those inside
+  a transaction is diagnosed on stderr and fails — soft under `ON ERROR`,
+  fatal without. A transaction must never be silently downgraded to a series
+  of independent writes, because the program has already been told it has one.
+  (For `mongo` this is the driver, not the server: a replica set can hold a
+  transaction, and the ops could be added later without anything above the
+  driver changing.)
+- **Rollback happens on the way out, via `atexit`.** A crash or a kill is
+  already safe: the connection dies and the backend discards the uncommitted
+  transaction (proven for sqlite in mvx#244). `STOP` is not, because
+  `mvx_stop` is `exit(0)` and never reaches the store's shutdown. This matters
+  because in the CueBic pattern an explicit `ABORT` is never written at all —
+  the abort path *is* abnormal termination, and UniData is relied on to do it
+  for you.
+
+**Deliberate divergence: an `EXECUTE`'d child joins the transaction.** Neither
+jBASE nor UniData does this. Measured on jBASE 6.2.1.1, a child reached by
+`EXECUTE` reports `TRANSQUERY` = 0 while the parent still reads 1; measured on
+UniData, a child `COUNT` of a file the parent wrote inside a transaction
+answers "0 record(s) counted" — a stale view, silently wrong rather than an
+error. MVX scopes the transaction to the connection on `store_state` rather
+than to a program level, so once `EXECUTE` runs in-process (mvx#248) the child
+sees the parent's writes and is covered by the same commit. This is the one
+place MVX deliberately improves on both.
+
+## Changing account from a program (mvx#258)
+
+`LOGTO` used to be a builtin of `mvx` and nothing else, so a site that replaces
+TCL with its own login and menu — the point of mvx#248 — was bound to the
+account its shell started in. An operator picking a company or a division from
+a menu is exactly this, and CueBic did it.
+
+- **`LOGTO` changes account and RETURNS; it does not end the program.**
+  Measured on UniData 8.3 and UniVerse 14.2.1: a program that prints, does
+  `EXECUTE "LOGTO <acct>"`, then prints again prints both lines, and an
+  `EXECUTE "WHERE"` afterwards reports the new account. So a shell can offer a
+  menu of divisions and stay in its loop.
+- **`EXECUTE "LOGTO ..."` is a caller too, not just the intrinsic.** It is the
+  spelling that already works on both those systems, so ported code uses it.
+  Here it used to find no VOC entry, fall back to spawning `mvx -c`, move a
+  *child* that immediately exited, and leave the caller where it was without a
+  word — the worst kind of failure, a silent no-op.
+- **Deliberate divergence: the old account's files are CLOSED.** On UniData
+  **and UniVerse** a handle opened before the `LOGTO` still reads afterwards —
+  measured on both against a file that exists only in the account being left,
+  so it is the handle surviving and not a file of the same name in the new
+  account. There a handle is a path to a physical file, which exists whatever
+  account you are in.
+
+  MVX cannot follow, for a reason those systems do not have: **a handle here
+  does not name a file.** `spec` is `"<location>\n<file>"`, and for a
+  directory or an unbound LMDB file the location is empty and the driver
+  re-reads `$MVXACCOUNT` on every call. A handle that survived would not
+  dangle — it would *follow the session into the new account* and silently
+  read that account's file of the same name, which is worse than either
+  alternative. That is what the `g_file_gen` generation counter prevents.
+  Keeping one also costs a database connection rather than a file descriptor,
+  and mvx#251 measured where that ends: a session walking ten accounts could
+  open nothing from the ninth onward.
+
+  Matching them would mean the handle capturing an absolute,
+  account-independent location at OPEN time — a change to what a spec is, not
+  to `LOGTO`. mvx#267 holds the evidence and the two levers.
+- **An open transaction refuses the move**, with `STATUS()` = 2. Committing it
+  after the account changed would commit into somewhere the program no longer
+  is, and discarding it silently is worse. Same answer mvx#247 gives when one
+  transaction would reach two connections.
+- **Three callers, one implementation** — the intrinsic, `EXECUTE`, and the
+  `mvx` builtin all reach `mvx_logto`. The hard part is letting the old
+  account go *before* entering the new one, and a second copy of that would
+  drift.
+- **A `LOGIN` hook, on entering an account** (mvx#264, settled after this).
+  Both systems run the target account's VOC `LOGIN` on the way in — a fresh
+  login, a `LOGTO` from TCL, and a `LOGTO` from inside a program — and *not*
+  around each `BASIC` or `RUN`. MVX matches that: `mvx` startup and
+  `mvx_logto`, so a cataloged program run straight from Unix still pays
+  nothing and `docs/replacing-tcl.md` stays true.
+
+## The account's own setup: LOGIN (mvx#264)
+
+- **One spelling, `LOGIN`.** The two systems disagree and one prefers a name
+  the other ignores. Measured with `PA` paragraphs printing distinct banners:
+  UniData 8.3 keys on `LOGIN` and nothing else — neither the account name in
+  either case, nor the Unix user name, runs anything. UniVerse 14.2.1 honours
+  `LOGIN` *and* a record named after the account, and **the account-named one
+  wins**: with both present only `bench` ran. `LOGIN` is the only spelling
+  that works on both, and adopting UniVerse's precedence would mean an
+  operator's new `LOGIN` losing silently to a record they cannot see.
+- **An account-named login is not portable anyway.** It cannot survive a
+  rename, which is exactly what the open account format does when the same
+  tree is checked out under another name.
+- **It is a `V` record naming a program**, because MVX has neither paragraphs
+  nor PROCs. On UniData a cataloged program cannot be a `LOGIN` at all —
+  `CATALOG` there writes to `CTLG`, not `VOC`, and creates no VOC record — so
+  the portable idiom on those systems is a paragraph whose body runs a
+  program. The hook itself does not care: it executes the *sentence* `LOGIN`,
+  and both systems invoke paragraphs and PROCs the same way (measured:
+  `EXECUTE "MYPARA"` and `EXECUTE "MYPROC"` both run from BASIC). So if MVX
+  grows paragraphs or PROCs, `LOGIN` gets them with no change.
+- **The account's own, never inherited.** Not from a linked package, not from
+  the system account every account sits behind — one there would run in every
+  account on the machine, silently, with nothing naming its origin. An account
+  sets itself up; it does not set up its neighbours.
+- **A failing `LOGIN` does not fail the move.** By the time it runs the
+  session IS in the new account, so reporting failure would leave the program
+  believing it is somewhere it is not. An abort is caught rather than taking
+  the caller with it — a menu must not die because an account it moved to has
+  a broken setup.
+- **A `LOGIN` that `LOGTO`s does not start another one.** It is itself a
+  program and may move; two pointing at each other would otherwise never stop.
+
+## Paragraphs (mvx#269)
+
+A second executable VOC record type: attribute 1 `PA`, the rest sentences run
+in order. MVX had only `V`, naming a compiled program, and an account ported
+from UniData or UniVerse arrives carrying paragraphs — a `LOGIN` on UniData
+*is* one, because `CATALOG` there writes to `CTLG` and creates no VOC record,
+so a cataloged program cannot be a `LOGIN` at all.
+
+- **Not a new calling convention.** A paragraph is invoked as a sentence, like
+  a verb, on both systems — `EXECUTE "MYPARA"` runs one from BASIC there
+  (measured). So the prompt, `EXECUTE` and mvx#264's `LOGIN` all got them at
+  once, and `LOGIN` needed no change: it runs the *sentence* `LOGIN`.
+- **A `V` record wins.** The paragraph is looked for only when no program is
+  cataloged under the name, so nothing existing changes meaning.
+- **The rules are UniData's, measured.** Two contradicted what was about to be
+  built: sentences are **not** echoed (the `COUNT CLIENTS` echo that suggested
+  otherwise came from `COUNT` itself), and `<<%1>>` is **not** parameter
+  substitution — a paragraph containing it, invoked as `PARA HELLO`, prompted
+  with the literal text `%1` and consumed the next line of input. Paragraphs
+  have no `%n` parameters at all.
+- **`<<text>>` asks once.** `<<Say it>> and <<Say it>>` is one question whose
+  answer is substituted in both places.
+- **A failing sentence does not stop the paragraph**, and the message names
+  it. UniData prints `In Paragraph: X.`; MVX prints `In paragraph X: <line>`,
+  because the sentence that failed is the thing you need to see.
+- **Deferred, not forgotten:** labels, `GO`, and `IF` are classic paragraph
+  features left out of the first cut. PROCs are mvx#271 — a genuinely
+  different language (two buffers, a pointer, an opcode set) and legacy even
+  on the systems that have it.
+
+## @LEVEL (mvx#270)
+
+How many programs are above this one. A program could not previously tell:
+`SYSTEM(2)`/`SYSTEM(3)` and `@USER.TYPE` all answer whether there is a
+*terminal*, which a program three `EXECUTE`s deep still has.
+
+- **The numbering is theirs, measured.** UniData 8.3 and UniVerse 14.2.1 agree
+  exactly: run from TCL a program answers `0`, and the same program reached
+  through an `EXECUTE` answers `1`.
+- **The prompt is not a program.** MVX's shell runs every verb by pushing a
+  level, so without saying so the first verb typed would answer `1` where both
+  systems answer `0` — and every `IF @LEVEL THEN` ported from them would fire
+  exactly when it must not. The shell marks its own context `-1` at startup;
+  a program run straight from Unix starts at `0` with no shell involved.
+- **It is the missing half of mvx#264.** An account's `LOGIN` runs from a
+  `LOGTO` inside a running program, sharing that program's screen and
+  keyboard. `@LEVEL` is how it declines to prompt: 0 when entered directly, 1
+  when a running program moved here.
+- **Not the same question as `@USER.TYPE`**, which stays the right guard for
+  "is there a terminal at all" — a phantom, a pipe, a web session. A routine
+  that prompts wants both.
+
+## PROCs (mvx#271)
+
+The third executable VOC record type, after `V` and mvx#269's `PA`. A PROC
+builds a command in a buffer and executes it, where a paragraph simply *is*
+the sentences.
+
+- **Implemented rather than translated.** The issue raised converting simple
+  PROCs to paragraphs on import instead. Measuring killed that: a PROC's
+  arguments come from *moving a pointer over the invoking sentence* (`S2`,
+  then `A`), which a paragraph cannot express — paragraphs have no `%n`
+  parameters at all (measured for mvx#269). A translation would work only for
+  PROCs that take no arguments, which is not the interesting half.
+- **The opcode set is the measured intersection.** `O H A S P X RI RO GO IF`
+  and numeric labels, verified identical on UniData 8.3 **and** ScarletDME
+  2.6-6. `P` executes **and returns**, so a PROC may run several commands in
+  turn — a line after `P` still runs on both.
+- **Word 1 is the verb**, so the first argument is word 2. `S2` is the usual
+  opening line, on both systems.
+- **An unknown opcode is named, not skipped.** The secondary input buffer,
+  `T`, `STON`/`STOFF` and `[]` are not implemented — they exist because PROC
+  had no other way to do what MVX does directly. Skipping them silently would
+  run half a PROC and report success, which is the failure mode this project
+  spends most of its effort avoiding.
+- **jBASE has no PROCs** — and no paragraphs, and no login record. Three of
+  the four systems have them; jBASE's account model is a Unix directory and
+  its login is the Unix login.
+- **A `GO` lands ON the labelled line**, not after it: `10 Omatched` carries
+  the label *and* the opcode. Getting this wrong made the jump silently do
+  nothing, which is how it was caught.
+
+## An account's database is its own (mvx#278)
+
+The lmdb driver cached **one global env with no key** — `if (g_env) return
+g_env;` — so it belonged to whichever account opened a file first in the
+process, and every account after it silently used that one.
+
+- **It was data loss, not a cache inefficiency.** Measured: a program that
+  opened a file in account A, `LOGTO`'d to B and wrote there wrote into **A's**
+  database, and B never saw the record. Reads were wrong the same way.
+- **`MVXACCOUNT` is `"."`** under the shell and after `mvx_logto`, so the path
+  could not distinguish accounts even had it been keyed. The env is keyed on
+  the **resolved absolute path** now — the database, not the spelling.
+- **lmdb implemented no `release_conn`**, so mvx#251's `mvx_store_leave` — the
+  thing that exists to let an account go on `LOGTO` — could not clear it. It
+  does now, which is both the contract and a second line of defence.
+- **Still one env at a time.** An lmdb file always lives in its own account's
+  env (`lmdb_open` takes no location), and each open env costs a named
+  semaphore on macOS. Asking for a different one closes the current.
+- **Order is why it hid.** The corruption needs a file opened in the first
+  account *before* the `LOGTO`; move first and open after, and it behaves —
+  which is what most fixtures do. mvx#251's ten-account walk passed because
+  that fixture used sqlite, which keys on the path and does release.
+
+Found while examining mvx#267, which argues the same defect one layer up: a
+spec should carry an absolute location rather than one re-resolved per call.
+
 ## Decision A — value representation
 
 **Chosen: boxed value with numeric tags (option 1), plus compiler numeric

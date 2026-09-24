@@ -76,6 +76,7 @@ struct Stmt {
         Common,     // args: Var/Paren items; name2: block name ("" unnamed)
         Echo,       // name: "ON" or "OFF"
         Open,       // args: [dict,] spec; name: file var; THEN/ELSE
+        Close,      // name: file var
         ReadF,      // target: record var; args: file, id; name: "U" locks
         WriteF,     // value: record; args: file, id; name: "U" keeps lock
         ReadV,      // target: var; args: file, id, attr; name: "U" locks
@@ -90,6 +91,9 @@ struct Stmt {
         Readnext,   // name: id var; THEN/ELSE
         Execute,    // value: sentence; name: CAPTURING var; name2: RETURNING
         Formlist,   // value: dynamic array -> active select list
+        TxnStart,   // TRANSACTION START  — THEN/ELSE on whether it started
+        TxnCommit,  // TRANSACTION COMMIT — THEN/ELSE on whether it committed
+        TxnAbort,   // TRANSACTION ABORT  — no clause: nothing to branch on
     };
     enum class LoopCond { None, While, Until };
 

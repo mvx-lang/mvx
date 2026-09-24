@@ -29,17 +29,25 @@ void mvx_fatal(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
-    exit(70); /* EX_SOFTWARE */
+    /* A FAULT TAKES THE CALLER WITH IT (mvx#248), which is what UniData does:
+       a runtime error in a program reached by EXECUTE does not hand control
+       back, it ends the lot.  So this unwinds as an ABORT rather than a STOP
+       -- it passes through any level that ran this program and settles only
+       where something is prepared to catch it, ending the process when
+       nothing is, which is exactly what it did before there were levels. */
+    mvx_level_end(70, 1); /* EX_SOFTWARE */
 }
 
 void mvx_stop(void) {
-    exit(0);
+    mvx_level_end(0, 0);
 }
 
-/* STOP <code> — end the program with a process exit status (a verb like CHECK
-   uses it to gate CI).  Clamp to a byte, the portable exit-code range. */
+/* STOP <code> — end the program with a status (a verb like CHECK uses it to
+   gate CI).  Clamp to a byte, the portable exit-code range: it is a process
+   exit status at the outermost level, and what EXECUTE ... RETURNING sees
+   at any other. */
 void mvx_exit(int32_t code) {
-    exit(code & 0xFF);
+    mvx_level_end(code & 0xFF, 0);
 }
 
 /* STOP <expr> / ABORT <expr> (#120).
@@ -54,9 +62,12 @@ void mvx_exit(int32_t code) {
  *   anything else -> print it and stop non-zero, which is what classic Pick
  *                    does with a STOP message and what the idiom expects
  *
- * `abort` only changes the wording and the status of an empty operand: both
- * end the process, because in MVX a verb IS a process, so there is no calling
- * program left to return to that ABORT would have to unwind past. */
+ * `abort` is no longer only a matter of wording (mvx#248).  A program can now
+ * be run at a LEVEL inside a caller, and the two part company there: a STOP
+ * comes back to the caller, an ABORT passes through it and takes it too.
+ * Measured on UniData, which is the behaviour being matched.  With nothing
+ * running a level -- every program today -- both still end the process, so
+ * this reads exactly as it did. */
 void mvx_stop_value(const mv_value *v, int32_t abort_) {
     char nb[64];
     const char *p;
@@ -66,14 +77,16 @@ void mvx_stop_value(const mv_value *v, int32_t abort_) {
         if (n >= (int64_t)sizeof t) n = sizeof t - 1;
         memcpy(t, p, (size_t)n);
         t[n] = '\0';
-        exit(atoi(t) & 0xFF);
+        mvx_level_end(atoi(t) & 0xFF, abort_);
     }
     if (n > 0) {
         fwrite(p, 1, (size_t)n, stderr);
         fputc('\n', stderr);
-        exit(1);                      /* a message means it did not go well */
+        /* a message means it did not go well */
+        mvx_level_end(1, abort_);
     }
-    exit(abort_ ? 1 : 0);             /* bare ABORT is abnormal, bare STOP is not */
+    /* bare ABORT is abnormal, bare STOP is not */
+    mvx_level_end(abort_ ? 1 : 0, abort_);
 }
 
 void mvx_arity_check(const char *name, int32_t expected, int32_t got) {

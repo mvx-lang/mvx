@@ -56,7 +56,15 @@ static inline int64_t mv_itoa64(char *buf, int64_t v) {
     return len;
 }
 
-static span val_span(const mv_value *v, char *buf, size_t cap) {
+/* ALWAYS INLINE, and measured.  This is a handful of instructions -- a tag
+   test and, for the common cases, a pointer pair or one digit -- but it sits
+   in the inner loop of every dynamic-array edit, so the call sequence costs
+   more than the body.  On the banked sieve the compiler left it out of line
+   and `sample' put 378 of 1759 in-loop samples in it, which is call overhead
+   rather than work.  The hint is not decoration: without it the write path
+   pays a branch-and-link per element edit. */
+__attribute__((always_inline))
+static inline span val_span(const mv_value *v, char *buf, size_t cap) {
     switch (v->tag) {
     case MV_STR:
         return (span){mv_str_bytes(v->s), v->s->len};

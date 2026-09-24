@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef __APPLE__
 #define LIB_SUFFIX ".dylib"
@@ -63,6 +64,83 @@ static void register_ext(const mvx_ext *e) {
     }
 }
 
+/* WHAT HAS ALREADY BEEN LOADED (mvx#248).  The scan can now run more than
+   once -- see mvx_ext_load_libs -- and a library loaded twice would register
+   its extension functions twice.  dlopen itself is refcounted and would not
+   mind, but the registry would grow a duplicate for every rescan. */
+typedef struct loaded_lib {
+    struct loaded_lib *next;
+    void *h;                            /* NULL when the dlopen failed */
+    char path[1];
+} loaded_lib;
+static loaded_lib *g_libs;
+
+static int already_loaded(const char *path) {
+    for (loaded_lib *l = g_libs; l; l = l->next)
+        if (strcmp(l->path, path) == 0) return 1;
+    return 0;
+}
+
+static loaded_lib *remember_loaded(const char *path) {
+    size_t n = strlen(path);
+    loaded_lib *l = malloc(sizeof *l + n);
+    if (!l) return NULL;                /* forgetting costs a duplicate, not
+                                           correctness */
+    l->h = NULL;
+    memcpy(l->path, path, n + 1);
+    l->next = g_libs;
+    g_libs = l;
+    return l;
+}
+
+/* TWO LIBRARIES IN ONE DIRECTORY CLAIMING THE SAME SUBROUTINE (mvx#266)
+ *
+ * CALL resolves with dlsym(RTLD_DEFAULT, ...), which takes the first
+ * definition loaded and cannot see that there were others.
+ *
+ * SHADOWING ACROSS TIERS IS THE POINT, not a fault: the account's LIB/ beats
+ * a linked package's, which beats the system account's, and that is how an
+ * account replaces a subroutine it does not want.  The same package present
+ * at two tiers is that mechanism working, and warning about it would be noise
+ * on every install.
+ *
+ * WITHIN ONE DIRECTORY there is no such intent.  Nothing ordered those files
+ * but readdir, so which definition wins is filesystem chance -- and they need
+ * not agree: mvpkg bundles its own build of cmd's CMD.RUN while the cmd
+ * package ships another, one calling GETOPT.SENTENCE and one not, so the same
+ * install worked or failed at random with nothing said.
+ *
+ * Reports only that case.  Fills *winner with the file in use and *other with
+ * the one it shadows; returns how many share a directory with it. */
+int mvx_ext_providers(const char *sym, const char **winner, const char **other) {
+    void *in_use = dlsym(RTLD_DEFAULT, sym);
+    const char *paths[16];
+    int n = 0;
+    for (loaded_lib *l = g_libs; l && n < 16; l = l->next) {
+        if (!l->h || !dlsym(l->h, sym)) continue;
+        paths[n++] = l->path;
+    }
+    for (int i = 0; i < n; i++) {
+        const char *si = strrchr(paths[i], '/');
+        for (int j = i + 1; j < n; j++) {
+            const char *sj = strrchr(paths[j], '/');
+            size_t di = si ? (size_t)(si - paths[i]) : 0;
+            size_t dj = sj ? (size_t)(sj - paths[j]) : 0;
+            if (di != dj || strncmp(paths[i], paths[j], di) != 0)
+                continue;                       /* different tiers: intended */
+            /* Same directory.  Name the one actually in use first. */
+            int iw = 0;
+            for (loaded_lib *l = g_libs; l; l = l->next)
+                if (l->h && strcmp(l->path, paths[i]) == 0 &&
+                    dlsym(l->h, sym) == in_use) iw = 1;
+            if (winner) *winner = iw ? paths[i] : paths[j];
+            if (other)  *other  = iw ? paths[j] : paths[i];
+            return 2;
+        }
+    }
+    return n > 1 ? 1 : n;          /* only cross-tier shadowing: not a clash */
+}
+
 static void load_dir(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) return;
@@ -74,7 +152,17 @@ static void load_dir(const char *dir) {
             continue;
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        /* IDENTIFY IT BY THE FILE, NOT THE SPELLING (mvx#258).  The account's
+           own chain is searched relative to the working directory, so before
+           LOGTO existed every account's library was remembered as "LIB/x.so"
+           -- and after a LOGTO the new account's library matched the old
+           account's entry and was silently skipped. */
+        char real[4096];
+        const char *key = realpath(path, real) ? real : path;
+        if (already_loaded(key)) continue;
+        loaded_lib *ent = remember_loaded(key);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */
+        if (ent) ent->h = h;
         if (!h) {
             /* SAY WHY (#117).  This used to fail silently, so a library built
                against a newer runtime just never loaded and the user met it
@@ -120,10 +208,43 @@ static void register_builtins(void) {
     done = 1;
     register_ext(mvx_json_builtin());
     register_ext(mvx_msg_builtin());
+    register_ext(mvx_logto_builtin());
 }
 
+/* A PACKAGE CAN BE LINKED WHILE THE SESSION IS RUNNING (mvx#248).
+ *
+ * This used to load once and never again, which was right while every verb
+ * was a forked process that did its own loading in its own account.  With
+ * verbs running in the session, a LINK-PKG during that session would never
+ * take effect: the subroutines in the package just linked stay invisible, and
+ * a CALL to one fails with "subroutine is not cataloged" -- a message that
+ * names the subroutine and says nothing about the cause.
+ *
+ * Shown by restoring the one-shot and running LINK-PKG between two calls:
+ * both fail, where with the rescan the second succeeds.
+ *
+ * So the PACKAGES file is stamped and the scan repeats when it changes.
+ * Nothing is UNloaded: a library already open may have pointers into it, and
+ * the cost of leaving it is an open handle rather than a wrong answer.  The
+ * account's own LIB/ is rescanned too, because BUILD-PKG can add to it. */
+static long long packages_stamp(void) {
+    struct stat sb;
+    if (stat("PACKAGES", &sb) != 0) return 0;
+#ifdef __APPLE__
+    return (long long)sb.st_mtimespec.tv_sec * 1000000000LL +
+           sb.st_mtimespec.tv_nsec + sb.st_size;
+#else
+    return (long long)sb.st_mtim.tv_sec * 1000000000LL +
+           sb.st_mtim.tv_nsec + sb.st_size;
+#endif
+}
+
+static long long g_pkgstamp = -1;
+
 void mvx_ext_load_libs(void) {
-    if (g_loaded) return;
+    long long stamp = packages_stamp();
+    if (g_loaded && stamp == g_pkgstamp) return;
+    g_pkgstamp = stamp;
     g_loaded = 1;
 
     register_builtins();                        /* before any dlopen */
@@ -149,6 +270,21 @@ void mvx_ext_load_libs(void) {
     char syslib[4096];
     snprintf(syslib, sizeof syslib, "%s/LIB", sys);
     load_dir(syslib);
+}
+
+/* THE CHAIN IS PER ACCOUNT, TOO (mvx#258).  The rescan above is triggered by
+ * PACKAGES changing, which catches a LINK-PKG but not a LOGTO: the new account
+ * may have no PACKAGES at all, and then the stamp is 0 in both -- unchanged --
+ * so its own LIB/ would never be scanned and a CALL into it would fail with
+ * "subroutine is not cataloged", naming the subroutine and not the cause.
+ *
+ * Nothing is unloaded.  A library already open may have pointers into it, and
+ * "first registration wins" in register_ext means the account left keeps any
+ * extension name it registered.  That is the same trade mvx_ext_load_libs
+ * already makes for LINK-PKG: an open handle rather than a wrong answer. */
+void mvx_ext_reset_libs(void) {
+    g_loaded = 0;
+    g_pkgstamp = -1;
 }
 
 int mvx_ext_has(const char *name) {

@@ -170,6 +170,16 @@ private:
             s->target = primaryRef();
             endStatementSoft();
             break;
+        /* CLOSE fvar -- the standard MV statement, which MVX did not have.
+           Without it a file opened stays open for the life of the session,
+           and so does the connection under it (mvx#251). */
+        case Tok::KwClose: {
+            advance();
+            s = mk(Stmt::K::Close);
+            s->name = expect(Tok::Ident, "file variable").text;
+            endStatementSoft();
+            break;
+        }
         case Tok::KwOpen: {
             advance();
             s = mk(Stmt::K::Open);
@@ -412,6 +422,13 @@ private:
                     s->name2 = expect(Tok::Ident, "RETURNING variable").text;
                 } else break;
             }
+            /* ON ERROR -- the program it runs gave up (mvx#256).  An ABORT or
+               a runtime fault in a program reached by EXECUTE takes its
+               caller with it, which is UniData's behaviour and right for
+               ordinary code; a program that means to be a SHELL needs to
+               survive its menu options, and this is how it says so.  Opt-in,
+               so anything without the clause behaves exactly as before. */
+            onErrorClause(*s);
             endStatementSoft();
             break;
         }
@@ -543,6 +560,13 @@ private:
             // that cannot be anything else, and stays an ordinary identifier
             // everywhere else.  Making them keywords would break working
             // code for the sake of two statements.
+            // TRANSACTION START | COMMIT | ABORT (mvx#247), the spelling
+            // UniData and UniVerse both compile.  Contextual like SEND: only
+            // a statement when one of the three words follows.
+            if (cur().text == "TRANSACTION" && txnAhead()) {
+                s = txnStmt();
+                break;
+            }
             if (cur().text == "SEND" && sendAhead()) { s = sendStmt(); break; }
             if (cur().text == "MESSAGE" && messageAhead()) {
                 s = messageStmt();
@@ -828,6 +852,47 @@ private:
             default: break;
             }
         return false;
+    }
+
+    // `TRANSACTION' opens a statement only when START, COMMIT or ABORT
+    // follows -- so it stays usable as an ordinary variable name.
+    bool txnAhead() const {
+        /* ABORT is already a keyword (the statement), so it does not arrive as
+           an identifier the way START and COMMIT do. */
+        if (peek().kind == Tok::KwAbort) return true;
+        if (peek().kind != Tok::Ident) return false;
+        const std::string &w = peek().text;
+        return w == "START" || w == "COMMIT";
+    }
+
+    /* TRANSACTION START / COMMIT / ABORT.
+     *
+     * THE CLAUSE RULES ARE UniData's AND UniVerse's, not a choice: measured on
+     * both, START and COMMIT reject a bare form and require THEN/ELSE, and
+     * ABORT rejects a clause.  Which is coherent -- starting and committing
+     * can fail in ways a program should branch on, an abort cannot -- and
+     * matching it means a program moves between the three untouched. */
+    StmtP txnStmt() {
+        int line = advance().line;                  // TRANSACTION
+        if (at(Tok::KwAbort)) {
+            advance();
+            auto s = mk(Stmt::K::TxnAbort);
+            s->line = line;
+            if (at(Tok::KwThen) || at(Tok::KwElse))
+                err("TRANSACTION ABORT takes no THEN or ELSE: there is no "
+                    "failure to branch on, and UniData and UniVerse both "
+                    "refuse one");
+            endStatementSoft();
+            return s;
+        }
+        std::string what = advance().text;          // START or COMMIT
+        auto s = mk(what == "START" ? Stmt::K::TxnStart : Stmt::K::TxnCommit);
+        s->line = line;
+        if (!at(Tok::KwThen) && !at(Tok::KwElse))
+            err("TRANSACTION " + what + " needs THEN or ELSE: whether it "
+                "worked is the whole point of the statement");
+        thenElse(*s);
+        return s;
     }
 
     // `MESSAGE' opens a statement only when ON, OFF or DEFER follows, which

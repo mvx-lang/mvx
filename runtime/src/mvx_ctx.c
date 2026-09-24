@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include <libgen.h>
 #include <stdio.h>
+#include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -135,19 +136,123 @@ typedef struct common_block {
     struct common_block *next;
 } common_block;
 
+/* ENVIRONMENT LEVELS (mvx#248).
+ *
+ * A context is ONE RUNNING PROGRAM.  Until now there was only ever one of
+ * them per process, because a program reached by EXECUTE was a separate
+ * process and the operating system did the separating.  In-process it has to
+ * be written down instead, and every piece of state has to be put on one side
+ * of the line or the other -- there is no third answer, and a field that
+ * nobody decided about is a field that bleeds.
+ *
+ * WHAT SPANS LEVELS lives in the session, and is shared by pointer.  WHAT
+ * BELONGS TO ONE PROGRAM lives in the context.  The split follows what the
+ * other MV systems do, measured rather than assumed -- on jBASE 6.2.1.1 a
+ * program reached by EXECUTE read the caller's NAMED common and found its
+ * UNNAMED common uninitialised. */
+typedef struct mvx_session {
+    void *store;            /* storage state, owned by mvx_store.c: the open
+                               files, the lock table, the select list and the
+                               transaction.  SHARED is the point of the
+                               exercise -- it is what lets a program called by
+                               another see what that other one has written. */
+    common_block *commons;  /* NAMED blocks only: COMMON /NAME/ spans levels */
+    int64_t print_col;      /* current output column, for comma zones.  Shared
+                               because it describes the TERMINAL and not a
+                               program: a program that printed without a
+                               newline and returned has left the cursor where
+                               it left it, and the next comma zone has to line
+                               up with that rather than with a fiction. */
+    int refs;               /* levels holding it; the last one tears it down */
+} mvx_session;
+
 struct mvx_ctx {
-    int64_t print_col;      /* current output column, for comma zones */
-    int64_t status;         /* STATUS() value, set by conversions */
-    common_block *commons;
-    void *store;            /* storage state, owned by mvx_store.c */
+    mvx_session *session;   /* shared with every other level */
+    jmp_buf unwind;         /* where mvx_level_run resumes; see level_unwind */
+    int catching;           /* 1 while a caller is prepared to catch */
+    int64_t stop_code;      /* what the STOP asked for */
+    int aborting;           /* ABORT or a fault: do not stop at this level */
+    common_block *unnamed;  /* COMMON with no name: THIS program's own */
+    int64_t status;         /* STATUS(): this program's last conversion, so a
+                               program called by another cannot change what
+                               its caller is about to test */
+    int64_t depth;          /* @LEVEL: how many programs are above this one.
+                               0 for a program run from the prompt or straight
+                               from Unix, 1 for one an EXECUTE reached, and so
+                               on -- measured on UniData 8.3 and UniVerse
+                               14.2.1, which agree (mvx#270).  The SHELL sets
+                               its own to -1, because a prompt is not a
+                               program: without that the first verb typed
+                               would answer 1 where those systems answer 0,
+                               and every `IF @LEVEL THEN' ported from them
+                               would fire when it must not. */
+    char *sentence;         /* SENTENCE(): what invoked THIS program.  It used
+                               to be read from the environment on every call,
+                               which was safe only while a program reached by
+                               EXECUTE was a separate process with a separate
+                               environment.  In one process a setenv would
+                               change the caller's sentence underneath it, and
+                               leave it changed after the call returned. */
 };
 
-void *mvx_ctx_store_get(mvx_ctx *ctx) { return ctx->store; }
-void  mvx_ctx_store_set(mvx_ctx *ctx, void *p) { ctx->store = p; }
+/* THE INNERMOST RUNNING LEVEL (mvx#248).
+ *
+ * STOP, ABORT and the runtime's own fatal path take no context -- they are
+ * called from anywhere, including deep inside the runtime -- so the level
+ * they are ending has to be findable without one.  One session per process
+ * and no threads, so a file-scope pointer is the whole mechanism, as it is
+ * for the transaction's exit handler in mvx_store.c.
+ *
+ * NULL until something runs a program at a level, which is what makes this
+ * behaviour-neutral for now: with no catcher, every path below ends the
+ * process exactly as it did before. */
+static mvx_ctx *g_level;
+
+/* End the running program: return to whoever ran this level if there is one,
+ * end the process if there is not.
+ *
+ * STOP RETURNS TO THE CALLER; ABORT AND A FAULT DO NOT.  Measured on UniData:
+ * a STOP in a program reached by EXECUTE comes back to its caller and the
+ * caller keeps running, while an ABORT or a runtime fault takes the caller
+ * with it.  So an abort passes THROUGH a level instead of stopping at it, and
+ * settles wherever something is prepared to catch it -- which is why it
+ * carries a flag rather than being a different unwind.
+ *
+ * A STOP that unwinds never reaches exit(), so the transaction's exit handler
+ * does not run and an open transaction SURVIVES into the caller (mvx#247).
+ * That is deliberate rather than incidental: the pattern this serves starts a
+ * transaction in one program and commits it in another, and a STOP in between
+ * is ordinary control flow, not a reason to discard the work. */
+static void level_unwind(int64_t code, int aborting) __attribute__((noreturn));
+static void level_unwind(int64_t code, int aborting) {
+    mvx_ctx *lv = g_level;
+    if (lv && lv->catching) {
+        lv->stop_code = code;
+        lv->aborting = aborting;
+        longjmp(lv->unwind, 1);
+    }
+    exit((int)(code & 0xFF));
+}
+
+void mvx_level_end(int64_t code, int aborting) { level_unwind(code, aborting); }
+
+void *mvx_ctx_store_get(mvx_ctx *ctx) { return ctx->session->store; }
+void  mvx_ctx_store_set(mvx_ctx *ctx, void *p) { ctx->session->store = p; }
 
 mvx_ctx *mvx_ctx_create(void) {
     mvx_ctx *ctx = calloc(1, sizeof(mvx_ctx));
-    if (!ctx) mvx_fatal("out of memory creating context");
+    mvx_session *ses = calloc(1, sizeof(mvx_session));
+    if (!ctx || !ses) mvx_fatal("out of memory creating context");
+    ses->refs = 1;
+    ctx->session = ses;
+
+    /* The sentence is read ONCE, here, rather than on every SENTENCE() call.
+       The shell exports it before exec'ing a verb, so this is the same value
+       it always was -- but it is now this level's copy, and a program that
+       runs another one cannot have its own changed by that. */
+    const char *sent = getenv("MVX_SENTENCE");
+    ctx->sentence = strdup(sent ? sent : "");
+    if (!ctx->sentence) mvx_fatal("out of memory creating context");
 
     /* EVERY PROGRAM IS PRESENT, whether or not it ever sends a message
        (mvx#234).  Being logged on is not a messaging feature: WHO should
@@ -175,9 +280,7 @@ mvx_ctx *mvx_ctx_create(void) {
     return ctx;
 }
 
-void mvx_ctx_destroy(mvx_ctx *ctx) {
-    mvx_store_shutdown(ctx);
-    common_block *b = ctx->commons;
+static void commons_free(common_block *b) {
     while (b) {
         common_block *next = b->next;
         for (int c = 0; c < COMMON_MAX_CHUNKS; c++) {
@@ -192,6 +295,110 @@ void mvx_ctx_destroy(mvx_ctx *ctx) {
         free(b);
         b = next;
     }
+}
+
+/* A NEW LEVEL ON THE SAME SESSION (mvx#248).  The program about to run shares
+   the caller's open files, locks, select list and transaction, and gets its
+   own unnamed COMMON, its own STATUS and its own sentence.  This is what an
+   in-process EXECUTE does; a CALL does NOT, because a subroutine runs inside
+   its caller and shares everything, which is why mvx_call takes the context
+   it was given. */
+mvx_ctx *mvx_level_push(mvx_ctx *parent, const char *sentence) {
+    mvx_ctx *ctx = calloc(1, sizeof(mvx_ctx));
+    if (!ctx) mvx_fatal("out of memory creating a program level");
+    ctx->session = parent->session;
+    ctx->session->refs++;
+    ctx->depth = parent->depth + 1;     /* @LEVEL (mvx#270) */
+    ctx->sentence = strdup(sentence ? sentence : "");
+    if (!ctx->sentence) mvx_fatal("out of memory creating a program level");
+    return ctx;
+}
+
+/* RUN A PROGRAM AT A NEW LEVEL, and catch what it ends with (mvx#248).
+ *
+ * This is what an in-process EXECUTE calls, and it is where the setjmp lives,
+ * because the level that CATCHES is the one that ran the program -- not the
+ * one that stopped.
+ *
+ * Returns the code the program ended with: 0 for falling off the end, and
+ * whatever STOP asked for otherwise.  An ABORT or a runtime fault does not
+ * come back here at all; it is re-raised so it passes through this level and
+ * settles at the next catcher, ending the process if there is none, which is
+ * what UniData does when nothing is left to return to.
+ *
+ * `volatile` on rc because it is written after the setjmp and read after the
+ * longjmp, which is the one thing setjmp does not promise to preserve. */
+static int64_t level_run(mvx_ctx *parent, mvx_program_fn entry,
+                         const char *sentence, int stop_aborts,
+                         int *aborted) {
+    mvx_ctx *lv = mvx_level_push(parent, sentence);
+    mvx_ctx *prev = g_level;
+    volatile int64_t rc = 0;
+    volatile int ab = 0;
+    g_level = lv;
+    lv->catching = 1;
+
+    if (setjmp(lv->unwind) == 0) {
+        entry(lv);                      /* fell off the end: an ordinary end */
+    } else if (lv->aborting && !stop_aborts) {
+        int64_t code = lv->stop_code;
+        g_level = prev;
+        mvx_level_pop(lv);
+        level_unwind(code, 1);          /* keep going up; never returns here */
+    } else {
+        rc = lv->stop_code;             /* a STOP, or an abort we stop here */
+        ab = lv->aborting;
+    }
+
+    g_level = prev;
+    mvx_level_pop(lv);
+    if (aborted) *aborted = ab;
+    return rc;
+}
+
+int64_t mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
+                      const char *sentence) {
+    return level_run(parent, entry, sentence, 0, NULL);
+}
+
+/* THE PROMPT IS WHERE AN ABORT STOPS (mvx#248).
+ *
+ * An abort passes through a program that ran another -- measured on UniData,
+ * a fault in a program reached by EXECUTE takes its caller with it -- but it
+ * does NOT pass through the prompt.  ABORT in a verb returns you to TCL, it
+ * does not log you out: measured on UniData 8.3, the command after an aborted
+ * verb ran and the session was still there.  Which is the whole point of the
+ * statement -- an ABORT that ended the session would be of no use to anybody.
+ *
+ * So something has to be the boundary, and this is it. */
+int64_t mvx_level_run_at_prompt(mvx_ctx *parent, mvx_program_fn entry,
+                                const char *sentence, int *aborted) {
+    return level_run(parent, entry, sentence, 1, aborted);
+}
+
+/* Drop a level.  The session stays: it belongs to whoever is still running,
+   and the last holder tears it down in mvx_ctx_destroy. */
+void mvx_level_pop(mvx_ctx *ctx) {
+    if (!ctx) return;
+    commons_free(ctx->unnamed);
+    free(ctx->sentence);
+    if (ctx->session) ctx->session->refs--;
+    free(ctx);
+}
+
+void mvx_ctx_destroy(mvx_ctx *ctx) {
+    if (!ctx) return;
+    mvx_session *ses = ctx->session;
+    /* Shut the store down while this context still names it -- the store's
+       teardown asks for it by context (and rolls back an open transaction,
+       mvx#247), so it has to happen before the session goes. */
+    if (ses && ses->refs <= 1) mvx_store_shutdown(ctx);
+    commons_free(ctx->unnamed);
+    free(ctx->sentence);
+    if (ses && --ses->refs <= 0) {
+        commons_free(ses->commons);
+        free(ses);
+    }
     free(ctx);
 }
 
@@ -199,16 +406,41 @@ void mvx_ctx_set_status(mvx_ctx *ctx, int64_t s) { ctx->status = s; }
 
 int64_t mvx_status(mvx_ctx *ctx) { return ctx->status; }
 
+/* @LEVEL -- how many programs are above this one (mvx#270).  A program can
+   otherwise not tell: SYSTEM(2)/SYSTEM(3) answer whether there is a terminal,
+   which a program three EXECUTEs deep still has.  The classic use is a shared
+   routine declining to prompt when it did not come from the operator:
+
+       IF @LEVEL THEN ... ;* something is above me, ask nobody
+
+   which is exactly what an account's LOGIN needs, since mvx#264 runs it from
+   a LOGTO inside a running program whose screen and keyboard it would
+   otherwise take over. */
+int64_t mvx_level(mvx_ctx *ctx) { return ctx->depth < 0 ? 0 : ctx->depth; }
+
+/* The prompt is not a program, so the shell says so once at startup and every
+   level beneath it counts from 0. */
+void mvx_ctx_set_base_level(mvx_ctx *ctx, int64_t d) { ctx->depth = d; }
+
 /* ------------------------------------------------------- COMMON blocks */
 
+/* WHICH LIST A BLOCK BELONGS TO (mvx#248).  Unnamed COMMON is simply the
+   block whose name is "", the way jBASE spells it too, and it is the one that
+   does NOT cross an EXECUTE: a program reached that way gets a fresh one,
+   while COMMON /NAME/ reaches the caller's.  Both measured on jBASE 6.2.1.1. */
+static common_block **common_list(mvx_ctx *ctx, const char *name) {
+    return name[0] ? &ctx->session->commons : &ctx->unnamed;
+}
+
 static common_block *common_get(mvx_ctx *ctx, const char *name) {
-    for (common_block *b = ctx->commons; b; b = b->next)
+    common_block **head = common_list(ctx, name);
+    for (common_block *b = *head; b; b = b->next)
         if (strcmp(b->name, name) == 0) return b;
     common_block *b = calloc(1, sizeof(common_block));
     if (!b) mvx_fatal("out of memory creating COMMON block");
     b->name = strdup(name);
-    b->next = ctx->commons;
-    ctx->commons = b;
+    b->next = *head;
+    *head = b;
     return b;
 }
 
@@ -246,7 +478,7 @@ void mv_print(mvx_ctx *ctx, const mv_value *v) {
     case MV_STR:
         fwrite(mv_str_bytes(v->s), 1, (size_t)v->s->len, stdout);
         for (int64_t k = 0; k < v->s->len; k++)
-            ctx->print_col = (mv_str_bytes(v->s)[k] == '\n') ? 0 : ctx->print_col + 1;
+            ctx->session->print_col = (mv_str_bytes(v->s)[k] == '\n') ? 0 : ctx->session->print_col + 1;
         return;
     case MV_INT:
         snprintf(buf, sizeof buf, "%lld", (long long)v->i);
@@ -267,20 +499,20 @@ void mv_print(mvx_ctx *ctx, const mv_value *v) {
         break;
     }
     fputs(buf, stdout);
-    ctx->print_col += num_len_probe(buf);
+    ctx->session->print_col += num_len_probe(buf);
 }
 
 void mv_print_nl(mvx_ctx *ctx) {
     fputc('\n', stdout);
-    ctx->print_col = 0;
+    ctx->session->print_col = 0;
 }
 
 void mv_print_tab(mvx_ctx *ctx) {
     /* Classic 18-column print zones. */
-    int64_t next = ((ctx->print_col / 18) + 1) * 18;
-    while (ctx->print_col < next) {
+    int64_t next = ((ctx->session->print_col / 18) + 1) * 18;
+    while (ctx->session->print_col < next) {
         fputc(' ', stdout);
-        ctx->print_col++;
+        ctx->session->print_col++;
     }
 }
 
@@ -303,9 +535,7 @@ void mv_env(mv_value *dst, const mv_value *name) {
 
 /* The TCL command line that invoked this program, set by the shell. */
 void mv_sentence(mvx_ctx *ctx, mv_value *dst) {
-    (void)ctx;
-    const char *s = getenv("MVX_SENTENCE");
-    if (!s) s = "";
+    const char *s = ctx->sentence ? ctx->sentence : "";
     mv_set_str(dst, s, (int64_t)strlen(s));
 }
 

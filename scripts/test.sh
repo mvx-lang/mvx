@@ -173,6 +173,9 @@ lang strfns world
 lang strmath
 lang ifdef
 lang equate
+# mvx#183: INT(a/b) on integers is an integer divide -- faster, and exact
+# above 2^53 where the float round trip was off by one.
+lang intdiv
 # mvx#226: messaging must cost nothing when no registry is running.
 lang msg
 lang matparse
@@ -184,6 +187,22 @@ lang vector
 lang ongoto
 lang uname
 lang opendict
+
+# mvx#247: the language transaction surface.  No file is opened, so this pins
+# the statement forms, the clause rules UniData and UniVerse enforce, and the
+# refusals -- the atomicity itself needs a backend and is proven below.
+#
+# The two streams are captured SEPARATELY and printed in a fixed order.  The
+# refusals go to stderr unbuffered while PRINT is block-buffered down a pipe,
+# so interleaving them would make the golden depend on flush timing.
+out="$TESTROOT/txn"
+if "$MVX" "$ROOT/tests/txn.b" -o "$out" 2>"$TESTROOT/cerr"; then
+  "$out" >"$TESTROOT/txn.o" 2>"$TESTROOT/txn.e"
+  check txn "$(printf 'stdout:\n%s\nstderr:\n%s' \
+                "$(cat "$TESTROOT/txn.o")" "$(cat "$TESTROOT/txn.e")")"
+else
+  check txn "COMPILE FAILED: $(cat "$TESTROOT/cerr")"
+fi
 
 # STOP <code> sets the process exit status (CHECK-style CI gating): capture
 # both stdout and the exit code so the whole contract is pinned.
@@ -590,6 +609,48 @@ EOF
   "$MVX" "$httpsrc" -o "$TESTROOT/httpbin" 2>/dev/null
   check tcl-http "$("$TESTROOT/httpbin"; echo "downloaded: [$(cat "$HDL" 2>/dev/null)]")"
   { kill "$HPID" && wait "$HPID"; } 2>/dev/null
+
+  # HTTPPOST (#286).  The name used to live ONLY in the mvx-lang/curl package,
+  # so it existed on a machine that had installed curl and nowhere else -- and a
+  # plain checkout could not compile mv_package, whose MVPKG.TRACK calls it on
+  # the stated rule that the thing reporting an install must not depend on the
+  # install having happened.  Asserting the round trip, not just the symbol:
+  # a bodyless server would answer 501 and a status check alone would not care.
+  #
+  # python3 -m http.server refuses POST, so this one echoes what it received --
+  # which is what makes the body and the Content-Type observable.
+  POSTSRV="$TESTROOT/postsrv.py"
+  cat > "$POSTSRV" <<'PYEOF'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(n)
+        out = b'type=' + (self.headers.get('Content-Type') or '').encode() + \
+              b' len=' + str(n).encode() + b' body=' + body
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *a): pass
+HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+PYEOF
+  PPORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  python3 "$POSTSRV" "$PPORT" >/dev/null 2>&1 &
+  PPID_=$!
+  sleep 1
+  PDL="$TESTROOT/post.dl"
+  postsrc="$TESTROOT/post.b"
+  cat > "$postsrc" <<EOF
+S = HTTPPOST("http://127.0.0.1:$PPORT/installs/x", "application/json", '{"a":1}', "$PDL")
+PRINT "post status=":S
+* a connect error is -1, the same as the other two report it
+PRINT "unreachable=":HTTPPOST("http://127.0.0.1:1/x", "text/plain", "hi", "$PDL.no")
+EOF
+  "$MVX" "$postsrc" -o "$TESTROOT/postbin" 2>/dev/null
+  check tcl-httppost "$("$TESTROOT/postbin"; echo "echoed: [$(cat "$PDL" 2>/dev/null)]")"
+  { kill "$PPID_" && wait "$PPID_"; } 2>/dev/null
 else
   echo "  (http test skipped — python3 not found)"
 fi
@@ -1152,6 +1213,77 @@ check tcl-pkgfunction "$( \
   MVXPRIV=developer "$TCL" -a "$FNACC" -c 'CATALOG BP USEFN' 2>&1; \
   echo '--- and a DEFFUN call resolves across the boundary'; \
   (cd "$FNACC" && MVXACCOUNT=. ./CATALOG/USEFN) 2>&1 | normalise)"
+
+# THE MANIFEST CAN BE mvpkg.json (mvx#285).  mv_package dropped PKG -- "PKG is
+# gone; mvpkg.json is the manifest" is one of its own tests -- and every reader
+# on this side looked only for PKG, so linking it answered "is not a package".
+# Nothing here had ever linked a package without a PKG, which is how a package
+# manager became unlinkable by the thing that links packages.
+#
+# The dependency grammars differ and that is the part worth asserting: PKG holds
+# short names, mvpkg.json owner-qualified ones with an optional @system filter
+# and :constraint.  `json@!mvx` means NOT on mvx, so it must be skipped here
+# while curl and cmd are still demanded -- a bare strip of the prefix would
+# demand the one dependency this platform excludes.
+JPKG="$TESTROOT/jsonpkg"; rm -rf "$JPKG"; mkdir -p "$JPKG/BP"
+printf '# MVX account descriptor\nname=jsonpkg\nversion=1\n' > "$JPKG/.mvx"
+cat > "$JPKG/mvpkg.json" <<'JEOF'
+{ "name": "mvx-lang/jsonpkg", "version": "3.1.4",
+  "systems": ["mvx", "udt"],
+  "dependencies": ["mvx-lang/jdep", "mvx-lang/jskip@!mvx:^1.5", "?mvx-lang/jopt"],
+  "devDependencies": ["mvx-lang/jbuild"] }
+JEOF
+printf 'SUBROUTINE JSONSUB(R)\nR = "json-manifest"\nRETURN\n' > "$JPKG/BP/JSONSUB"
+JDEP="$TESTROOT/jdep"; rm -rf "$JDEP"; mkdir -p "$JDEP/BP"
+printf '# MVX account descriptor\nname=jdep\nversion=1\n' > "$JDEP/.mvx"
+printf 'jdep\n1.0.0\na dependency named the PKG way\n' > "$JDEP/PKG"
+printf 'SUBROUTINE JDEPSUB(R)\nR = "dep"\nRETURN\n' > "$JDEP/BP/JDEPSUB"
+# 9200 recognises a sibling by its VOC, so a dependency has to look like an
+# account, not just a directory with the right name.
+mkdir -p "$JDEP/VOC"
+JACC="$TESTROOT/jacc"; rm -rf "$JACC"; mkdir -p "$JACC"
+"$ROOT/scripts/mkaccount.sh" "$JACC" >/dev/null 2>&1
+check tcl-jsonmanifest "$( \
+  MVXPRIV=developer "$TCL" -a "$JPKG" -c 'BUILD-PKG .' >/dev/null 2>&1; \
+  MVXPRIV=developer "$TCL" -a "$JDEP" -c 'BUILD-PKG .' >/dev/null 2>&1; \
+  echo '--- links, and pulls the dependency that applies'; \
+  "$TCL" -a "$JACC" -c "LINK-PKG $JPKG" 2>&1 | normalise; \
+  echo '--- name, version and systems all came from the JSON'; \
+  "$TCL" -a "$JACC" -c 'LIST-PKGS' 2>&1 | normalise; \
+  echo '--- and a package with neither manifest is still refused'; \
+  mkdir -p "$TESTROOT/nomanifest"; \
+  "$TCL" -a "$JACC" -c "LINK-PKG $TESTROOT/nomanifest" 2>&1 | normalise)"
+
+# THE SAME CLASSIFICATION, THE OTHER BUILDER.  The check above runs BUILD-PKG,
+# the verb; mkpkg.sh builds the same package shape from the shell, and it kept
+# the #101 bug for both of them -- it tested only SUBROUTINE, so a FUNCTION was
+# treated as a main program and the link failed on a missing _mvx_main.  One
+# path being tested is what let the other stay broken.
+MKPKG="$TESTROOT/mkfnpkg"; mkdir -p "$MKPKG/BP"
+printf '# MVX account descriptor\nname=mkfnpkg\nversion=1\n' > "$MKPKG/.mvx"
+printf 'mkfnpkg\n1.0.0\nclassification under mkpkg\n' > "$MKPKG/PKG"
+printf 'FUNCTION TRIPLE(X)\nRETURN(X * 3)\n' > "$MKPKG/BP/TRIPLE"
+printf 'SUBROUTINE NOTE(S)\nS = "noted"\nRETURN\n' > "$MKPKG/BP/NOTE"
+printf 'PRINT "a program"\n' > "$MKPKG/BP/APROG"
+if MVXPRIV=developer "$ROOT/scripts/mkpkg.sh" "$MKPKG" >"$TESTROOT/mkpkgout" 2>&1
+then
+  mkcat="$(ls "$MKPKG/CATALOG" 2>/dev/null | grep -v dSYM | grep -v '\.so$' \
+           | grep -v '\.dylib$' | sort | tr '\n' ' ')"
+  mklib="$(ls "$MKPKG/LIB" 2>/dev/null | grep -v dSYM | wc -l | tr -d ' ')"
+  # Only the PROGRAM is cataloged; the FUNCTION and the SUBROUTINE bundle
+  # into the package library and get none of the program treatment.
+  if [ "$mkcat" = "APROG " ] && [ "$mklib" -ge 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  mkpkg catalogs only the program, not the FUNCTION or SUBROUTINE"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL mkpkg classification: CATALOG=[$mkcat] LIB entries=$mklib"
+    sed 's/^/    | /' "$TESTROOT/mkpkgout" | tail -6
+  fi
+else
+  FAIL=$((FAIL + 1)); echo "FAIL mkpkg classification: build failed"
+  sed 's/^/    | /' "$TESTROOT/mkpkgout" | tail -8
+fi
 
 # Fetched and built once here, reused by every package test below.
 PKG_GETOPT="$(pkg_dir getopt)"
@@ -3332,6 +3464,75 @@ SQW2EOF
   # connection; the sqlite3 CLI above IS a second connection, so the counts
   # having been readable at all is the evidence that it committed.
 
+  # THE TORN WRITE, INJECTED (mvx#244).  A mapped write is the record, the
+  # parent columns, then a DELETE and N INSERTs per association.  The store
+  # brackets the lot in one transaction so half of it can never survive -- a
+  # guarantee that had no test, because the only way to break it is to fail
+  # between two statements no caller can see.  MVX_FAULT does that:
+  #
+  #   mapcrash  the process dies with the transaction open, so what is
+  #             asserted is that SQLITE discards it -- not merely that the
+  #             store remembered to call rollback
+  #   mapchild  the projection fails and the store must roll back itself
+  #
+  # Distinct ids matter: rewriting the SAME id with the same content would
+  # look identical whether it rolled back or not, and would prove nothing.
+  cat > "$TESTROOT/sqtorn.b" <<'SQTEOF'
+OPEN "ORD" TO F ELSE STOP
+ID = ENV("TORNID")
+WRITE "C":ID:@AM:"5":@VM:"6":@VM:"7":@AM:"10":@VM:"20":@VM:"30" ON F, ID
+SQTEOF
+  if "$MVX" "$TESTROOT/sqtorn.b" -o "$TESTROOT/sqtorn" 2>/dev/null; then
+    before="$(sqlite3 "$SQA/acct.sqlite" 'SELECT COUNT(*) FROM "ORD";' 2>/dev/null)"
+    (cd "$SQA" && MVXACCOUNT=. TORNID=T1 "$TESTROOT/sqtorn" >/dev/null 2>&1)
+    (cd "$SQA" && MVXACCOUNT=. TORNID=T2 MVX_FAULT=mapcrash \
+       "$TESTROOT/sqtorn" >/dev/null 2>&1)
+    crashrc=$?
+    (cd "$SQA" && MVXACCOUNT=. TORNID=T3 MVX_FAULT=mapchild \
+       "$TESTROOT/sqtorn" >/dev/null 2>&1)
+    good="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'T1'"'"';' 2>/dev/null)"
+    goodc="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES" WHERE id = '"'"'T1'"'"';' 2>/dev/null)"
+    torn="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id IN ('"'"'T2'"'"','"'"'T3'"'"');' 2>/dev/null)"
+    tornc="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES" WHERE id IN ('"'"'T2'"'"','"'"'T3'"'"');' 2>/dev/null)"
+    # AND THE PROGRAM IS TOLD (mvx#245).  The rollback above was always right;
+    # what was wrong was returning 0 -- success -- to a program with no ON
+    # ERROR, so it believed it had written a record that had just been taken
+    # back out.  The record-write failure beside it was fatal without a
+    # handler all along; these are two failures of one WRITE and only one of
+    # them spoke.
+    t4err="$(cd "$SQA" && MVXACCOUNT=. TORNID=T4 MVX_FAULT=mapchild \
+       "$TESTROOT/sqtorn" 2>&1 >/dev/null)"
+    t4rc=$?
+    t4gone="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'T4'"'"';' 2>/dev/null)"
+    case "$t4err" in *"rolled back"*) t4said=1 ;; *) t4said=0 ;; esac
+    if [ "$t4rc" != 0 ] && [ "$t4said" = 1 ] && [ "$t4gone" = 0 ]; then
+      PASS=$((PASS + 1))
+      echo "  a rolled-back mapped write fails the program, and says why"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL map/rollback-reported: rc=$t4rc said=$t4said left=$t4gone"
+      printf '%s\n' "$t4err" | sed 's/^/    | /' | head -3
+    fi
+
+    if [ "$crashrc" = 97 ] && [ "$good" = 1 ] && [ "$goodc" = 3 ] \
+       && [ "$torn" = 0 ] && [ "$tornc" = 0 ]; then
+      PASS=$((PASS+1))
+      echo "  a mapped write torn part way leaves neither record nor rows"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL sqlite torn write: crash-rc='$crashrc' clean=$good/$goodc(want 1/3)" \
+           "torn=$torn/$tornc(want 0/0), before=$before"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL sqlite torn write: did not compile"
+  fi
+
+
   # TWO FIELDS ON ONE ATTRIBUTE (#158).  Two dictionary items may name the same
   # attribute -- PRICE with MD2 and PRICE.RAW with no conversion are one stored
   # value read two ways.  Mirroring both is the point of mirror mode: every
@@ -3426,6 +3627,317 @@ SQREOF
   fi
 else
   echo "  (sqlite test skipped — driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# LANGUAGE TRANSACTIONS (mvx#247).
+#
+# mvx#244 proved that ONE mapped write is atomic -- the record, its parent
+# columns and its child rows land together or not at all.  This is the wider
+# claim: a program can bracket SEVERAL writes and they commit or roll back as
+# one unit.  The tests are built on their own account rather than reusing the
+# sqlite block's, so what they assert does not depend on records an earlier
+# test left behind.
+#
+# The shape being served is the one Gentrack used on UniData: the transaction
+# is started in a pre-save, the writes happen in subroutines called later, and
+# the commit is somewhere else again -- an explicit ABORT is never written at
+# all, because the abort path IS abnormal termination.  So START/GOSUB/COMMIT
+# and the rollback-on-STOP both have to hold.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== language transactions"
+  TXA="$TESTROOT/txacct"; mkdir -p "$TXA"
+  printf '# MVX account descriptor\nname=txacct\nversion=1\n' > "$TXA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$TXA" > "$TXA/BINDINGS"
+  "$TCL" -a "$TXA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  # A mapped file, so every write touches the record, the parent columns AND a
+  # child table -- the case where a partial commit does the most damage.
+  cat > "$TESTROOT/txd.b" <<'TXDEOF'
+OPEN "DICT", "ORD" TO D ELSE PRINT "no dict" ; STOP
+WRITE "D":@AM:"1":@AM:"":@AM:"Cust":@AM:"10L" ON D, "CUST"
+WRITE "D":@AM:"2":@AM:"":@AM:"Qty":@AM:"6R":@AM:"LINES" ON D, "QTY"
+WRITE "D":@AM:"3":@AM:"":@AM:"Price":@AM:"8R":@AM:"LINES" ON D, "PRICE"
+TXDEOF
+  "$MVX" "$TESTROOT/txd.b" -o "$TESTROOT/txd" >/dev/null 2>&1
+  (cd "$TXA" && MVXACCOUNT=. "$TESTROOT/txd" >/dev/null 2>&1)
+  "$TCL" -a "$TXA" -c 'CREATE-MAP ORD CUST QTY PRICE' >/dev/null 2>&1
+
+  # TWO writes in one bracket, ended three ways.  Distinct ids per mode: the
+  # same id rewritten with the same content would look identical whether it
+  # rolled back or not, and would prove nothing (the trap mvx#244 fell into).
+  cat > "$TESTROOT/txw.b" <<'TXWEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+M = ENV("TXNMODE")
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "CA":@AM:"5":@VM:"6":@AM:"10":@VM:"20" ON F, M:"A"
+WRITE "CB":@AM:"7":@VM:"8":@AM:"30":@VM:"40" ON F, M:"B"
+BEGIN CASE
+   CASE M = "CM" ; TRANSACTION COMMIT ELSE PRINT "commit failed"
+   CASE M = "AB" ; TRANSACTION ABORT
+   CASE M = "ST" ; STOP
+END CASE
+TXWEOF
+  if "$MVX" "$TESTROOT/txw.b" -o "$TESTROOT/txw" 2>"$TESTROOT/cerr"; then
+    for m in CM AB ST; do
+      (cd "$TXA" && MVXACCOUNT=. TXNMODE=$m "$TESTROOT/txw" >/dev/null 2>&1)
+    done
+    kept="$(sqlite3 "$TXA/acct.sqlite" \
+      "SELECT group_concat(id) FROM (SELECT id FROM \"ORD\" ORDER BY id);" 2>/dev/null)"
+    keptc="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES";' 2>/dev/null)"
+    # COMMIT keeps both records and all four child rows; ABORT keeps neither;
+    # STOP without a commit keeps neither, which is the atexit rollback --
+    # mvx_stop is exit(0) and never reaches the store's shutdown.
+    if [ "$kept" = "CMA,CMB" ] && [ "$keptc" = 4 ]; then
+      PASS=$((PASS+1))
+      echo "  two writes commit as one unit; abort and STOP discard both"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL txn multi-write: kept='$kept' (want CMA,CMB) rows='$keptc' (want 4)"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL txn multi-write: did not compile"
+  fi
+
+  # THE CUEBIC SHAPE: started in one place, written in a subroutine called
+  # later, committed somewhere else again -- and @TRANSACTION readable at every
+  # step, because that is how the code decided whether it was already inside
+  # one.
+  cat > "$TESTROOT/txc.b" <<'TXCEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+GOSUB 100
+PRINT "after the gosub=":@TRANSACTION
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+PRINT "after the commit=":@TRANSACTION
+STOP
+100 PRINT "inside the gosub=":@TRANSACTION
+WRITE "CQ":@AM:"1":@VM:"2":@AM:"3":@VM:"4" ON F, "QA"
+RETURN
+TXCEOF
+  if "$MVX" "$TESTROOT/txc.b" -o "$TESTROOT/txc" 2>"$TESTROOT/cerr"; then
+    cout="$(cd "$TXA" && MVXACCOUNT=. "$TESTROOT/txc" 2>&1)"
+    qa="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'QA'"'"';' 2>/dev/null)"
+    qac="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD__LINES" WHERE id = '"'"'QA'"'"';' 2>/dev/null)"
+    want="inside the gosub=1
+after the gosub=1
+after the commit=0"
+    if [ "$cout" = "$want" ] && [ "$qa" = 1 ] && [ "$qac" = 2 ]; then
+      PASS=$((PASS+1))
+      echo "  a transaction spans a GOSUB and commits outside it"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL txn cuebic: rec=$qa/$qac (want 1/2), out=[$cout]"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL txn cuebic: did not compile"
+  fi
+
+  # ONE TRANSACTION, ONE CONNECTION.  Two sqlite files are two connections, so
+  # a bracket cannot cover both: committing each separately would be atomic per
+  # backend and not overall, which is worse than refusing, because nothing
+  # afterwards can tell.
+  #
+  # AND THE REFUSAL POISONS THE TRANSACTION, which is the point of this test.
+  # The first write is on the enrolled connection and would otherwise commit
+  # ALONE -- the half a unit of work the whole feature exists to prevent.  The
+  # program here handles the refusal by printing it and carrying on, which is
+  # exactly what real code does, so the guarantee cannot depend on the program
+  # reacting: COMMIT fails and rolls back, and NEITHER record survives.
+  TXB="$TESTROOT/txspan"; mkdir -p "$TXB"
+  printf '# MVX account descriptor\nname=txspan\nversion=1\n' > "$TXB/.mvx"
+  printf '* sqlite %s/a.sqlite\nOTHER sqlite %s/b.sqlite\n' "$TXB" "$TXB" \
+    > "$TXB/BINDINGS"
+  "$TCL" -a "$TXB" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  "$TCL" -a "$TXB" -c 'CREATE-FILE OTHER' >/dev/null 2>&1
+  cat > "$TESTROOT/txs.b" <<'TXSEOF'
+OPEN "ORD" TO F1 ELSE PRINT "no ORD" ; STOP
+OPEN "OTHER" TO F2 ELSE PRINT "no OTHER" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "one" ON F1, "R1" ON ERROR PRINT "first write refused"
+WRITE "two" ON F2, "R2" ON ERROR PRINT "second write refused"
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+READ A FROM F1, "R1" THEN PRINT "R1 present" ELSE PRINT "R1 absent"
+READ B FROM F2, "R2" THEN PRINT "R2 present" ELSE PRINT "R2 absent"
+TXSEOF
+  if "$MVX" "$TESTROOT/txs.b" -o "$TESTROOT/txs" 2>"$TESTROOT/cerr"; then
+    sout="$(cd "$TXB" && MVXACCOUNT=. "$TESTROOT/txs" 2>/dev/null)"
+    serr="$(cd "$TXB" && MVXACCOUNT=. "$TESTROOT/txs" 2>&1 >/dev/null)"
+    want="second write refused
+commit failed
+R1 absent
+R2 absent"
+    case "$serr" in
+      *"different connection"*) spanmsg=1 ;;
+      *) spanmsg=0 ;;
+    esac
+    if [ "$sout" = "$want" ] && [ "$spanmsg" = 1 ]; then
+      PASS=$((PASS+1))
+      echo "  a refused second connection poisons the commit; neither lands"
+    else
+      FAIL=$((FAIL+1))
+      echo "FAIL txn span: out=[$sout] msg=$spanmsg err=[$serr]"
+    fi
+  else
+    FAIL=$((FAIL+1)); echo "FAIL txn span: did not compile"
+  fi
+else
+  echo "  (language transaction tests skipped — sqlite driver not built)"
+fi
+
+  # A TRANSACTION WHOSE CONNECTION WENT AWAY CANNOT COMMIT (mvx#253).
+  #
+  # A transaction lives on a connection, and the backend can take that
+  # connection away without telling anybody.  MySQL reconnects SILENTLY when
+  # an idle session outlives wait_timeout: the server rolls the open
+  # transaction back, later writes autocommit one at a time, and COMMIT
+  # succeeds against a connection that has no transaction on it -- so the
+  # program is told its work landed when half of it was discarded.  An MV
+  # session idles across user think-time for far longer than wait_timeout,
+  # and the transaction shape this serves is the one that stays open longest.
+  #
+  # WHAT IS TESTED HERE IS THE DECISION, not the detection: the arrival is
+  # injected, because the real one needs a server and an idle timeout.  The
+  # drivers' own conn_epoch -- mysql_thread_id, PQbackendPID -- is what has to
+  # be right for the real event, and that wants a live server (MVX_MYSQL /
+  # MVX_PG) to exercise.  Testing the decision is still worth it: the decision
+  # is where the silence was.
+  cat > "$TESTROOT/txconn.b" <<'TXCEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "no transaction" ; STOP
+WRITE "A":@AM:"1":@VM:"2" ON F, "CL1"
+PRINT "wrote CL1"
+TRANSACTION COMMIT THEN PRINT "COMMIT SUCCEEDED" ELSE PRINT "commit refused"
+TXCEOF
+  if "$MVX" "$TESTROOT/txconn.b" -o "$TESTROOT/txconn" 2>"$TESTROOT/cerr"; then
+    tcbad="$(cd "$TXA" && MVXACCOUNT=. MVX_FAULT=connlost "$TESTROOT/txconn" \
+             2>/dev/null)"
+    tcrows="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'CL1'"'"';' 2>/dev/null)"
+    # And the same program with no fault must still commit, or this would
+    # pass by refusing everything.
+    tcok="$(cd "$TXA" && MVXACCOUNT=. "$TESTROOT/txconn" 2>/dev/null)"
+    if [ "$tcbad" = "wrote CL1
+commit refused" ] && [ "$tcrows" = 0 ] \
+       && [ "$tcok" = "wrote CL1
+COMMIT SUCCEEDED" ]; then
+      PASS=$((PASS + 1))
+      echo "  a transaction whose connection changed refuses to commit"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL txn conn lost: rows=$tcrows lost=[$tcbad] normal=[$tcok]"
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL txn conn lost: did not compile"
+  fi
+
+  # A FAILURE INSIDE A TRANSACTION MAKES IT UNCOMMITTABLE (mvx#253).
+  #
+  # mvx#247 refuses to commit a transaction whose write was refused at
+  # enrolment.  A write the BACKEND or the MAPPING failed did not poison one,
+  # and the hole was worse than it sounds: the per-write bracket that makes a
+  # single mapped write atomic (mvx#244) cannot fire while a language
+  # transaction is open -- bulk_begin answers 0 because one already is -- so
+  # the failed write's partial effects stayed in the outer transaction and
+  # were committed.  A record went in whose mapping was never projected: the
+  # torn write mvx#244 exists to prevent, brought back by the presence of a
+  # transaction, and strictly worse than having none.
+  #
+  # Before the fix this printed COMMIT SUCCEEDED and left BAD1 and OK1 in the
+  # table, so a regression shows up as rows present rather than a quiet pass.
+  # Asserting the refusal alone would not do: the commit could refuse and
+  # still leave the rows behind.
+  cat > "$TESTROOT/txfail.b" <<'TXFEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "no transaction" ; STOP
+WRITE "GOOD":@AM:"1":@VM:"2" ON F, "OK1" ON ERROR PRINT "the first write failed"
+WRITE "BAD":@AM:"3":@VM:"4" ON F, "BAD1" ON ERROR PRINT "the second write failed"
+TRANSACTION COMMIT THEN PRINT "COMMIT SUCCEEDED" ELSE PRINT "commit refused"
+TXFEOF
+  if "$MVX" "$TESTROOT/txfail.b" -o "$TESTROOT/txfail" 2>"$TESTROOT/cerr"; then
+    tfout="$(cd "$TXA" && MVXACCOUNT=. MVX_FAULT=mapchild "$TESTROOT/txfail" \
+             2>/dev/null)"
+    tfrows="$(sqlite3 "$TXA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id IN ('"'"'OK1'"'"','"'"'BAD1'"'"');' \
+      2>/dev/null)"
+    # BOTH WRITES NEED THE CLAUSE NOW (mvx#245).  MVX_FAULT=mapchild fails
+    # every projection, and a rolled-back mapped write is a real failure
+    # rather than a silent success -- so a write without ON ERROR ends the
+    # program, as the record-write failure beside it always did.  This test
+    # used to reach COMMIT only because the first write lied about working.
+    tfwant="the first write failed
+the second write failed
+commit refused"
+    if [ "$tfout" = "$tfwant" ] && [ "$tfrows" = 0 ]; then
+      PASS=$((PASS + 1))
+      echo "  a failed write makes the transaction uncommittable, and nothing lands"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL txn failed-write poison: rows=$tfrows (want 0)"
+      printf '%s\n' "$tfout" | sed 's/^/    | /' | head -6
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL txn failed-write poison: did not compile"
+  fi
+
+# A BACKEND WITH NO BRACKET MUST SAY SO, not silently write (mvx#247).  This is
+# the requirement that a transaction cannot be quietly downgraded: the dir
+# driver has no bulk_begin/bulk_commit/rollback, so a write inside one is
+# refused and diagnosed rather than committed on its own.  Soft with ON ERROR,
+# fatal without -- a program that did not ask for the error must not continue
+# past a write it believes is in a transaction.
+echo "== a backend with no transaction support refuses one"
+TXN="$TESTROOT/txnone"; mkdir -p "$TXN/data"
+printf '# MVX account descriptor\nname=txnone\nversion=1\n' > "$TXN/.mvx"
+printf '* dir %s/data\n' "$TXN" > "$TXN/BINDINGS"
+"$TCL" -a "$TXN" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+cat > "$TESTROOT/txn1.b" <<'TXN1EOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "CA":@AM:"5" ON F, "NA" ON ERROR PRINT "the write was refused"
+PRINT "depth=":@TRANSACTION
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+READ R FROM F, "NA" THEN PRINT "NA was written" ELSE PRINT "NA is absent"
+TXN1EOF
+cat > "$TESTROOT/txn2.b" <<'TXN2EOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "start refused" ; STOP
+WRITE "CA":@AM:"5" ON F, "FA"
+PRINT "this line must not be reached"
+TXN2EOF
+if "$MVX" "$TESTROOT/txn1.b" -o "$TESTROOT/txn1" 2>"$TESTROOT/cerr" \
+   && "$MVX" "$TESTROOT/txn2.b" -o "$TESTROOT/txn2" 2>>"$TESTROOT/cerr"; then
+  nout="$(cd "$TXN" && MVXACCOUNT=. "$TESTROOT/txn1" 2>/dev/null)"
+  nerr="$(cd "$TXN" && MVXACCOUNT=. "$TESTROOT/txn1" 2>&1 >/dev/null)"
+  fout="$(cd "$TXN" && MVXACCOUNT=. "$TESTROOT/txn2" 2>/dev/null)"; frc=$?
+  nwant="the write was refused
+depth=1
+commit failed
+NA is absent"
+  # EVERY message is one whole line.  The spec is "<location>\n<file>", so a
+  # message that prints it raw splits in half, and an operator greps for the
+  # driver's complaint and finds a bare file name on the line below it.  So
+  # assert that every line carries the prefix: a continuation line would not.
+  nlines="$(printf '%s\n' "$nerr" | wc -l | tr -d ' ')"
+  npre="$(printf '%s\n' "$nerr" | grep -c '^TRANSACTION: ')"
+  case "$nerr" in
+    *"the dir driver has no transaction support"*) nmsg=1 ;;
+    *) nmsg=0 ;;
+  esac
+  if [ "$nout" = "$nwant" ] && [ "$nmsg" = 1 ] && [ "$nlines" = "$npre" ] \
+     && [ -z "$fout" ] && [ "$frc" != 0 ]; then
+    PASS=$((PASS+1))
+    echo "  the dir driver refuses a transactional write, each message whole,"
+    echo "  and a program without ON ERROR does not run past it"
+  else
+    FAIL=$((FAIL+1))
+    echo "FAIL txn unsupported: out=[$nout] msg=$nmsg lines=$nlines/$npre" \
+         "fatal-out=[$fout] fatal-rc=$frc err=[$nerr]"
+  fi
+else
+  FAIL=$((FAIL+1)); echo "FAIL txn unsupported: did not compile"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3801,6 +4313,133 @@ if [ "$QUICK" = 0 ]; then
   fi
 fi
 
+# the client library (#289): an external C program driving an account through
+# mvxc.h -- the surface mv-connect and any language binding is built on.
+#
+# COMPILED AND RUN, not just built.  The point of the library is that someone
+# OUTSIDE the tree links it, so a check that only builds it would miss the
+# things that actually break a consumer: a header that needs an internal one,
+# a symbol that is not exported, a string that dies before the caller reads it.
+if command -v cc >/dev/null 2>&1; then
+  CLA="$TESTROOT/clacct"
+  "$ROOT/scripts/mkaccount.sh" "$CLA" >/dev/null 2>&1
+  mkdir -p "$CLA/BP"
+  printf 'PRINT "level=":@LEVEL\n' > "$CLA/BP/LVL"
+  printf 'SUBROUTINE DOUBLE.IT(IN, OUT)\nOUT = IN * 2\nRETURN\n' > "$CLA/BP/DOUBLE.IT"
+  # AND THE ACCOUNT'S LOGIN, which connecting runs -- at @LEVEL 1, so a LOGIN
+  # that prompts can tell it does not own the screen (mvx#264).
+  printf 'PRINT "login=":@LEVEL\n' > "$CLA/BP/LOGIN"
+  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP LVL'       >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP DOUBLE.IT' >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP LOGIN'     >/dev/null 2>&1
+  "$TCL" -a "$CLA" -c "CREATE-FILE PARTS" >/dev/null 2>&1
+  cat > "$TESTROOT/client.c" <<'CLEOF'
+#include <mvxc.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    mvxc_status st;
+    mvxc_session *s = mvxc_connect(argv[1], &st);
+    if (!s) { printf("connect failed\n"); return 1; }
+    mvxc_file *f = mvxc_open(s, "PARTS", NULL, &st);
+    if (!f) { printf("open failed: %s\n", mvxc_error(s)); return 1; }
+
+    mvxc_val *r = mvxc_new();
+    mvxc_set_attr(r, 1, "Widget");
+    mvxc_set_attr(r, 2, "9.99");
+    mvxc_set_val (r, 3, 1, "red");
+    mvxc_set_val (r, 3, 2, "blue");
+    printf("write=%d\n", mvxc_write(f, "W1", r));
+    mvxc_free(r);
+
+    /* two accessors live at once is the contract, so assert it */
+    r = mvxc_read(f, "W1", &st);
+    printf("read=%d %s %s\n", st, mvxc_attr(r, 1), mvxc_attr(r, 2));
+    printf("mv=%d [%s,%s] attrs=%d\n", mvxc_dcount(r, 3),
+           mvxc_val_at(r, 3, 1), mvxc_val_at(r, 3, 2), mvxc_dcount(r, 0));
+
+    mvxc_ins_val(r, 3, 3, "green");
+    mvxc_del_val(r, 3, 1);
+    mvxc_write(f, "W1", r);
+    mvxc_free(r);
+    r = mvxc_read(f, "W1", &st);
+    printf("edited=%d [%s,%s]\n", mvxc_dcount(r, 3),
+           mvxc_val_at(r, 3, 1), mvxc_val_at(r, 3, 2));
+    mvxc_free(r);
+
+    /* a miss is a status, not an error */
+    r = mvxc_read(f, "NOSUCH", &st);
+    printf("miss=%d null=%d\n", st, r == NULL);
+
+    mvxc_select(f);
+    int n = 0; while (mvxc_next(s)) n++;
+    printf("select=%d\n", n);
+
+    /* an uncataloged CALL returns; it must not trap or abort */
+    printf("nosub=%d\n", mvxc_call(s, "NO.SUCH.SUB", 0, NULL));
+
+    /* AND THE ONE THAT IS NOT OBVIOUS: a sentence run through the library
+       answers @LEVEL 1, never 0.  0 means "nothing is above me, I own the
+       screen", which is false here and would let an interactive routine
+       prompt a caller that has no terminal. */
+    mvxc_val *cap = mvxc_new();
+    /* SEQUENCED, NOT NESTED.  Putting mvxc_execute and mvxc_str in one
+       argument list is unspecified evaluation order, and on gcc/x86-64 the
+       read ran FIRST and execute then released the string printf was about to
+       use.  The rule is doing its job -- a mutating call invalidates -- but it
+       is easy to break by accident, which is why it says so in mvxc.h. */
+    mvxc_status es = mvxc_execute(s, "LVL", cap);
+    printf("exec=%d [%s]\n", es, mvxc_str(cap));
+    mvxc_free(cap);
+
+    printf("delete=%d\n", mvxc_delete(f, "W1"));
+    mvxc_close(f);
+
+    /* --- a real subroutine, in and out ------------------------------- */
+    printf("cataloged=%d %d\n", mvxc_cataloged(s, "DOUBLE.IT"),
+                                mvxc_cataloged(s, "NO.SUCH.SUB"));
+    mvxc_val *in = mvxc_new_str("21"), *out = mvxc_new();
+    mvxc_val *av[2]; av[0] = in; av[1] = out;
+    mvxc_status cs = mvxc_call(s, "DOUBLE.IT", 2, av);
+    printf("call=%d out=%s\n", cs, mvxc_str(out));
+    mvxc_free(in); mvxc_free(out);
+
+    /* --- file administration ------------------------------------------
+       The default hash type is the ACCOUNT'S (sqlite here, lmdb elsewhere),
+       so only the name is asserted for it; DIR is asked for by name and can
+       be. */
+    printf("create=%d %d\n", mvxc_create_file(s, "ZZTEMP", NULL),
+                             mvxc_create_file(s, "ZZDIR", "DIR"));
+    mvxc_val *fl = mvxc_files(s);
+    int nf = mvxc_dcount(fl, 0), hash = 0, dir = 0;
+    for (int i = 1; i <= nf; i++) {
+        const char *nm = mvxc_val_at(fl, i, 1);
+        if (!strcmp(nm, "ZZTEMP")) hash = 1;
+        if (!strcmp(nm, "ZZDIR") && !strcmp(mvxc_val_at(fl, i, 2), "dir")) dir = 1;
+    }
+    printf("listed hash=%d dir=%d\n", hash, dir);
+    mvxc_free(fl);
+    printf("dropfile=%d missing=%d\n", mvxc_delete_file(s, "ZZTEMP"),
+                                       mvxc_delete_file(s, "NOSUCHFILE"));
+    mvxc_delete_file(s, "ZZDIR");
+    mvxc_disconnect(s);
+    return 0;
+}
+CLEOF
+  if cc -I"$ROOT/client/include" -o "$TESTROOT/clientbin" "$TESTROOT/client.c" \
+        -L"$ROOT/build" -lmvxc -Wl,-rpath,"$ROOT/build" \
+        > "$TESTROOT/client.cc.log" 2>&1; then
+    check tcl-client "$( \
+      cd "$CLA" && MVXPRIV=developer "$TESTROOT/clientbin" "$CLA" 2>&1 | normalise)"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL client: the library does not link from outside the tree"
+    sed -n 's/^/    | /p' "$TESTROOT/client.cc.log" | head -6
+  fi
+else
+  echo "  (client library test skipped — no cc)"
+fi
+
 # -------------------------------------------------------- phase 4: install
 # Install to a throwaway prefix and drive it with every MVX_* override
 # unset, proving the binaries locate the runtime, drivers, and system
@@ -3959,6 +4598,26 @@ if [ "$QUICK" = 0 ]; then
         *)
           FAIL=$((FAIL + 1))
           echo "FAIL install: the bundled MVPKG does not run (${itrip:-?}):"
+          # WHERE THE SUBROUTINE ACTUALLY IS.  This used to ask only the
+          # CATALOG executables and skip *.so -- which since mvx#248 is where
+          # the code lives on Linux, so it printed nothing whatever the truth
+          # was.  Ask the library chain the runtime actually walks.
+          echo "    the system LIB holds:"
+          ls "$ISYS/LIB" 2>/dev/null | head -8 | sed 's/^/      /'
+          echo "    and mvx_sub_GETOPT is exported by:"
+          for L in "$ISYS/LIB"/* "$ISYS/CATALOG"/*; do
+            case "$L" in *.dSYM) continue ;; esac
+            nm -D "$L" 2>/dev/null | grep -q "mvx_sub_GETOPT" && echo "      $L"
+          done | head -5
+          # AND WHETHER THE PACKAGES EVEN ARRIVED.  Every sibling failure
+          # here prints the install log and this one did not, so a dependency
+          # that failed to fetch -- mvpkg's own getopt, say -- looked exactly
+          # like a broken library chain, which cost a round of CI to tell
+          # apart.  The fetch WARNS AND CARRIES ON by design, so the warning
+          # is the only place it is recorded.
+          echo "    and the install said:"
+          grep -iE "warning|fetch|download|package" "$ILOG" 2>/dev/null \
+            | tail -8 | sed 's/^/      /'
           printf '%s\n' "$mout" | head -5 | sed 's/^/    | /' ;;
       esac
     else
@@ -3989,6 +4648,1261 @@ fi
 # only moment that change is provably behaviour-neutral.  This is what keeps
 # them in: a rule nothing checks is a rule that decays, and this one has to hold
 # across six files that have no other reason to agree with each other.
+# ---------------------------------------------------------------------------
+# A CATALOGED PROGRAM CAN BE LOADED AND CALLED IN THIS PROCESS (mvx#248).
+#
+# A main program compiles to mvx_main(ctx) whichever way it is linked, so the
+# same source can be published in a form the runtime loads instead of forking.
+# How many FILES that takes differs: on macOS an executable is also loadable
+# and there is one, elsewhere there is a library plus a small loader.  The
+# test resolves a base path the way the runtime will have to -- suffix first,
+# then plain -- so the rule is what is under test, not one platform's shape.
+#
+# Nothing consumes this yet, which is exactly why it needs a test: an
+# artifact nobody loads is an artifact nobody notices has stopped working.
+#
+# It loads TWO programs, because every main exports the same symbol and a
+# one-program test would pass whatever the loader did with the second.
+echo "== a cataloged program can be loaded and called in-process"
+CLA="$TESTROOT/catload-acct"
+"$ROOT/scripts/mkaccount.sh" "$CLA" >/dev/null 2>&1
+mkdir -p "$CLA/BP"
+printf 'PRINT "this is program ONE"\n' > "$CLA/BP/PONE"
+printf 'PRINT "this is program TWO"\n' > "$CLA/BP/PTWO"
+MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP PONE' >"$TESTROOT/clc" 2>&1
+MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP PTWO' >>"$TESTROOT/clc" 2>&1
+if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/catalog-load.c" \
+      -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/catalog-load" \
+      2>"$TESTROOT/clerr"; then
+  clout="$(DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+    "$TESTROOT/catalog-load" "$CLA/CATALOG/PONE" "$CLA/CATALOG/PTWO" 2>&1)"
+  clwant="this is program ONE
+this is program TWO
+catalog-load: both cataloged programs ran in this process"
+  if [ "$clout" = "$clwant" ]; then
+    PASS=$((PASS + 1))
+    echo "  two cataloged programs load and each runs its own code"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL catalog-load: got [$clout]"
+    sed 's/^/    | /' "$TESTROOT/clc" | head -6
+  fi
+
+  # The standard verbs are cataloged by the BUILD rather than by the verb, so
+  # they are a second path to the same thing and drift if only one is checked.
+  # Probed, not run: a verb wants a sentence and an account.
+  vprobe="$(DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+    "$TESTROOT/catalog-load" --probe "$ROOT/build/system/CATALOG/LIST" \
+                                     "$ROOT/build/system/CATALOG/SORT" 2>&1)"
+  case "$vprobe" in
+    *"2 cataloged program(s) are loadable here")
+      PASS=$((PASS + 1)); echo "  and so do the standard verbs the build catalogs" ;;
+    *)
+      FAIL=$((FAIL + 1)); echo "FAIL verb loadable: $vprobe" ;;
+  esac
+else
+  FAIL=$((FAIL + 1)); echo "FAIL catalog-load: did not compile"
+  sed 's/^/    /' "$TESTROOT/clerr" | head -10
+fi
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT LEVELS (mvx#248).
+#
+# A level is one running program.  Until a program reached by EXECUTE runs in
+# this process, the operating system does the separating and none of this is
+# written down -- in one process every piece of state is either deliberately
+# shared or deliberately fresh, and the failure when one is wrong is SILENT:
+# the caller reads a value it never wrote, or fails to read one it did.
+#
+# The expected answers are jBASE 6.2.1.1's, measured by running the same shape
+# there: a program reached by EXECUTE read the caller's NAMED common and found
+# its UNNAMED common uninitialised.
+#
+# The transaction is the exception, and the reason for the whole exercise.
+# jBASE and UniData both leave an EXECUTE'd program OUTSIDE the caller's
+# transaction, looking at a stale view; here it is inside one, so its write is
+# part of what the caller commits.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a program at a new level shares the session and keeps the rest"
+  LVA="$TESTROOT/levels"; mkdir -p "$LVA"
+  printf '# MVX account descriptor\nname=levels\nversion=1\n' > "$LVA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$LVA" > "$LVA/BINDINGS"
+  "$TCL" -a "$LVA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  cat > "$TESTROOT/lvchild.b" <<'LVEOF'
+COMMON UNC
+COMMON /NM/ NMC
+PRINT "  child sentence=[":SENTENCE():"]"
+PRINT "  child sees named=[":NMC:"]"
+PRINT "  child @TRANSACTION=":@TRANSACTION
+OPEN "ORD" TO F ELSE PRINT "  child: no ORD" ; STOP
+WRITE "written by the child" ON F, "FROMCHILD"
+NMC = "child-named"
+UNC = "child-unnamed"
+LVEOF
+  "$MVX" --catalog "$TESTROOT/lvchild.b" -o "$LVA/lvchild" >/dev/null 2>&1
+  if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/levels.c" \
+        -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/levels-test" \
+        2>"$TESTROOT/lverr"; then
+    # MVX_SENTENCE is set to something the child must NOT see: SENTENCE() used
+    # to read it from the environment on every call, which one process makes
+    # wrong -- the caller's sentence would change underneath it.
+    lvout="$(cd "$LVA" && MVXACCOUNT=. MVX_SENTENCE="THE PARENT SENTENCE" \
+      DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+      "$TESTROOT/levels-test" "$LVA/lvchild" 2>&1)"
+    lvrc=$?
+    lvwrote="$(sqlite3 "$LVA/acct.sqlite" \
+      'SELECT id FROM "ORD" WHERE id = '"'"'FROMCHILD'"'"';' 2>/dev/null)"
+    lvwant="  child sentence=[CHILD ITS OWN SENTENCE]
+  child sees named=[parent-named]
+  child @TRANSACTION=1
+levels:   a named COMMON block crosses into the level and back
+levels:   the unnamed COMMON block is the caller's own
+levels: a level shares the session and keeps the rest"
+    if [ "$lvrc" = 0 ] && [ "$lvout" = "$lvwant" ] \
+       && [ "$lvwrote" = FROMCHILD ]; then
+      PASS=$((PASS + 1))
+      echo "  its own sentence, its own unnamed COMMON, the caller's named one"
+      PASS=$((PASS + 1))
+      echo "  and it writes inside the caller's transaction, which commits it"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL levels: rc=$lvrc wrote=[$lvwrote]"
+      printf '%s\n' "$lvout" | sed 's/^/    | /' | head -12
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL levels: did not compile"
+    sed 's/^/    /' "$TESTROOT/lverr" | head -10
+  fi
+else
+  echo "  (level tests skipped — sqlite driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# STOP RETURNS TO THE CALLER, ABORT DOES NOT (mvx#248).
+#
+# UniData's split, measured there rather than chosen.  It matters because a
+# program run inside another is about to become ordinary: without it, an
+# in-process EXECUTE would end the caller every time the program it ran
+# reached its last line, and a verb run at the prompt would end the shell.
+#
+# Nothing runs a level yet, so with no catcher every path still ends the
+# process exactly as before -- which the rest of this suite is the check on.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a program that STOPs returns to whoever ran it"
+  UWA="$TESTROOT/unwind"; mkdir -p "$UWA"
+  printf '# MVX account descriptor\nname=unwind\nversion=1\n' > "$UWA/.mvx"
+  printf '* sqlite %s/acct.sqlite\n' "$UWA" > "$UWA/BINDINGS"
+  "$TCL" -a "$UWA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  printf 'PRINT "  child: plain STOP"\nSTOP\nPRINT "  NOT REACHED"\n' \
+    > "$TESTROOT/uwA.b"
+  printf 'PRINT "  child: STOP 7"\nSTOP 7\n'          > "$TESTROOT/uwB.b"
+  printf 'PRINT "  child: falls off the end"\n'        > "$TESTROOT/uwC.b"
+  printf 'PRINT "  child: ABORT"\nABORT\n'            > "$TESTROOT/uwD.b"
+  cat > "$TESTROOT/uwW.b" <<'UWEOF'
+OPEN "ORD" TO F ELSE PRINT "  child: no ORD" ; STOP
+WRITE "written then STOPped" ON F, "SURVIVE"
+PRINT "  child: wrote, now STOP without committing"
+STOP
+UWEOF
+  for u in A B C D W; do
+    "$MVX" --catalog "$TESTROOT/uw$u.b" -o "$UWA/uw$u" >/dev/null 2>&1
+  done
+  if cc -std=c11 -I "$ROOT/runtime/include" "$ROOT/tests/unwind.c" \
+        -L "$ROOT/build/lib" -lmvxrt -o "$TESTROOT/unwind-test" \
+        2>"$TESTROOT/uwerr"; then
+    uwrun() { DYLD_LIBRARY_PATH="$ROOT/build/lib" LD_LIBRARY_PATH="$ROOT/build/lib" \
+              "$TESTROOT/unwind-test" "$@" 2>&1; }
+
+    # Three ways of ending that all come back, each carrying its own code.
+    sout="$(cd "$UWA" && MVXACCOUNT=. uwrun stop "$UWA/uwA" "$UWA/uwB" "$UWA/uwC")"
+    swant="  child: plain STOP
+caller: uwA came back, rc=0
+  child: STOP 7
+caller: uwB came back, rc=7
+  child: falls off the end
+caller: uwC came back, rc=0
+unwind: the caller ran on"
+    if [ "$sout" = "$swant" ]; then
+      PASS=$((PASS + 1)); echo "  STOP, STOP <code> and the last line all return, with the code"
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL unwind stop:"
+      printf '%s\n' "$sout" | sed 's/^/    | /' | head -10
+    fi
+
+    # And one that must NOT: the caller is never resumed, so neither the
+    # second program nor the closing line can appear.
+    aout="$(cd "$UWA" && MVXACCOUNT=. uwrun stop "$UWA/uwD" "$UWA/uwC")"; arc=$?
+    case "$aout" in
+      *"came back"*|*"ran on"*) aok=0 ;;
+      *) aok=1 ;;
+    esac
+    if [ "$aok" = 1 ] && [ "$arc" != 0 ]; then
+      PASS=$((PASS + 1)); echo "  ABORT passes through and takes the caller with it"
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL unwind abort: rc=$arc out=[$aout]"
+    fi
+
+    # AND THE TRANSACTION SURVIVES A STOP (mvx#247).  A STOP that unwinds
+    # never reaches exit(), so the rollback registered there does not run --
+    # which is what lets a transaction be started in one program, written by
+    # another that ends, and committed by a third.
+    tout="$(cd "$UWA" && MVXACCOUNT=. uwrun txn "$UWA/uwW")"
+    twrote="$(sqlite3 "$UWA/acct.sqlite" \
+      'SELECT id FROM "ORD" WHERE id = '"'"'SURVIVE'"'"';' 2>/dev/null)"
+    twant="  child: wrote, now STOP without committing
+caller: uwW came back, rc=0
+caller: @TRANSACTION is still 1 after it ended
+caller: commit -> 1
+unwind: the caller ran on"
+    if [ "$tout" = "$twant" ] && [ "$twrote" = SURVIVE ]; then
+      PASS=$((PASS + 1))
+      echo "  a transaction outlives the program that STOPped inside it"
+    else
+      FAIL=$((FAIL + 1)); echo "FAIL unwind txn: wrote=[$twrote]"
+      printf '%s\n' "$tout" | sed 's/^/    | /' | head -8
+    fi
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL unwind: did not compile"
+    sed 's/^/    /' "$TESTROOT/uwerr" | head -10
+  fi
+else
+  echo "  (unwind tests skipped — sqlite driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# EXECUTE RUNS THE PROGRAM IN THIS PROCESS (mvx#248).
+#
+# The suite already drives the in-process path -- SSELECT feeding READNEXT,
+# CATALOG from inside BUILD, WHO with CAPTURING -- but only where it happens
+# to.  These are the three things that path changed and nothing else asserts:
+# what comes back, what a failure does to the caller, and the fallback that
+# makes an account cataloged before this still work.
+#
+# The abort case is the sharp one.  A program reached by EXECUTE used to be a
+# separate process, so one that died left its caller running; now it takes the
+# caller with it, which is UniData's behaviour and the thing most likely to be
+# "fixed" by somebody who thinks a crashing child should be contained.
+echo "== a program reached by EXECUTE runs in this process"
+EXA="$TESTROOT/exec-inproc"
+"$ROOT/scripts/mkaccount.sh" "$EXA" >/dev/null 2>&1
+printf 'ORD sqlite %s/acct.sqlite\n' "$EXA" >> "$EXA/BINDINGS"
+"$TCL" -a "$EXA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+mkdir -p "$EXA/BP"
+
+# The code a STOP hands back, and the caller carrying on after it.
+printf 'PRINT "  child: stopping 5"\nSTOP 5\n'        > "$EXA/BP/EXRC"
+# A child that gives up must take the caller with it.
+printf 'PRINT "  child: aborting"\nABORT\n'           > "$EXA/BP/EXAB"
+cat > "$EXA/BP/EXCALL" <<'EXEOF'
+EXECUTE "EXRC" RETURNING RC
+PRINT "caller: EXRC returned ":RC
+EXECUTE "EXAB"
+PRINT "caller: NOT REACHED -- an abort must not come back"
+EXEOF
+# And a verb whose loadable form is missing, as every account cataloged
+# before mvx#248 has: it must still run, by the old route.
+printf 'PRINT "  child: the old way"\n'                > "$EXA/BP/EXOLD"
+cat > "$EXA/BP/EXFALL" <<'EXEOF'
+EXECUTE "EXOLD" CAPTURING OUT
+PRINT "caller: captured [":TRIM(OUT):"]"
+EXEOF
+for v in EXRC EXAB EXCALL EXOLD EXFALL; do
+  MVXPRIV=developer "$TCL" -a "$EXA" -c "CATALOG BP $v" >/dev/null 2>&1
+done
+# Now make EXOLD look like an account cataloged BEFORE mvx#248: a plain
+# executable, and no loadable form at all.
+#
+# DELETING THE LIBRARY DOES NOT SIMULATE THAT, which is what this test did
+# first and what CI caught.  On macOS CATALOG/<name> is the program, so
+# removing a .dylib that was never there changes nothing and the test passed
+# while asserting nothing.  On Linux the .so IS the program and CATALOG/<name>
+# is the loader, so removing it leaves a loader pointing at nothing -- a state
+# no account has ever been in, and the failure was the loader saying so.
+rm -rf "$EXA/CATALOG/EXOLD"*
+"$MVX" "$EXA/BP/EXOLD" -o "$EXA/CATALOG/EXOLD" >/dev/null 2>&1
+
+exout="$(cd "$EXA" && MVXPRIV=developer MVXACCOUNT=. "$TCL" -a "$EXA" -c EXCALL 2>&1)"
+exrc=$?
+exwant="  child: stopping 5
+caller: EXRC returned 5
+  child: aborting"
+if [ "$exout" = "$exwant" ] && [ "$exrc" != 0 ]; then
+  PASS=$((PASS + 1))
+  echo "  STOP <code> comes back with its code; ABORT takes the caller too"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL execute inproc: rc=$exrc"
+  printf '%s\n' "$exout" | sed 's/^/    | /' | head -8
+fi
+
+# THE FALLBACK, which is what makes this safe for an account that predates
+# it: no loadable form, so EXECUTE spawns exactly as it always did -- and
+# CAPTURING still works down that route.
+fbout="$(cd "$EXA" && MVXPRIV=developer MVXACCOUNT=. "$TCL" -a "$EXA" -c EXFALL 2>&1)"
+if [ "$fbout" = "caller: captured [child: the old way]" ]; then
+  PASS=$((PASS + 1))
+  echo "  a verb with no loadable form still runs, by the old route"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL execute fallback: [$fbout]"
+fi
+
+# ---------------------------------------------------------------------------
+# THE PROMPT RUNS VERBS IN THIS PROCESS (mvx#248).
+#
+# Three things follow that could not be done while each verb was its own
+# process, and one that must still be true.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a verb typed at the prompt runs in the session"
+  TPA="$TESTROOT/tcl-inproc"
+  "$ROOT/scripts/mkaccount.sh" "$TPA" >/dev/null 2>&1
+  printf 'ORD sqlite %s/acct.sqlite\n' "$TPA" >> "$TPA/BINDINGS"
+  "$TCL" -a "$TPA" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+  mkdir -p "$TPA/BP"
+  # Two verbs, one transaction: impossible when the second was a new process
+  # with a new store.
+  cat > "$TPA/BP/TPA1" <<'TPEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+TRANSACTION START ELSE PRINT "no transaction" ; STOP
+WRITE "from the first verb" ON F, "V1"
+PRINT "A: wrote V1, @TRANSACTION=":@TRANSACTION
+TPEOF
+  cat > "$TPA/BP/TPA2" <<'TPEOF'
+PRINT "B: @TRANSACTION=":@TRANSACTION
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+WRITE "from the second verb" ON F, "V2"
+TRANSACTION COMMIT ELSE PRINT "commit failed"
+PRINT "B: committed"
+TPEOF
+  # Open the file once, use it in a later verb -- how MV sites are laid out.
+  printf 'COMMON /FILES/ F.ORD\nOPEN "ORD" TO F.ORD ELSE PRINT "no ORD" ; STOP\nPRINT "LOGIN: opened"\n' \
+    > "$TPA/BP/TPLOG"
+  printf 'COMMON /FILES/ F.ORD\nREAD R FROM F.ORD, "V1" THEN PRINT "USE: ":R ELSE PRINT "USE: could not read"\n' \
+    > "$TPA/BP/TPUSE"
+  # And an abort must land back at the prompt, not end the session.
+  printf 'PRINT "V: aborting"\nABORT\n'   > "$TPA/BP/TPAB"
+  printf 'PRINT "V: still here"\n'         > "$TPA/BP/TPOK"
+  for v in TPA1 TPA2 TPLOG TPUSE TPAB TPOK; do
+    MVXPRIV=developer "$TCL" -a "$TPA" -c "CATALOG BP $v" >/dev/null 2>&1
+  done
+
+  txout="$(printf 'TPA1\nTPA2\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^[AB]:')"
+  txids="$(sqlite3 "$TPA/acct.sqlite" 'SELECT group_concat(id) FROM (SELECT id FROM "ORD" ORDER BY id);' 2>/dev/null)"
+  txwant="A: wrote V1, @TRANSACTION=1
+B: @TRANSACTION=1
+B: committed"
+  if [ "$txout" = "$txwant" ] && [ "$txids" = "V1,V2" ]; then
+    PASS=$((PASS + 1)); echo "  one transaction spans two verbs, and commits both"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl txn: ids=[$txids]"
+    printf '%s\n' "$txout" | sed 's/^/    | /' | head -6
+  fi
+
+  opout="$(printf 'TPLOG\nTPUSE\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^(LOGIN|USE):')"
+  if [ "$opout" = "LOGIN: opened
+USE: from the first verb" ]; then
+    PASS=$((PASS + 1)); echo "  a file opened by one verb is still open for the next"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl common files: [$opout]"
+  fi
+
+  # THE ABORT STOPS HERE.  It takes a calling PROGRAM with it, but the prompt
+  # is where it settles -- on UniData the command after an aborted verb runs
+  # and the session is still there.  Without that boundary every ABORT and
+  # every runtime fault would end the session.
+  about="$(printf 'TPAB\nTPOK\nOFF\n' | MVXPRIV=developer "$TCL" -a "$TPA" 2>&1 \
+           | grep -E '^V:')"
+  if [ "$about" = "V: aborting
+V: still here" ]; then
+    PASS=$((PASS + 1)); echo "  an aborting verb returns to the prompt, session intact"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL tcl abort: [$about]"
+  fi
+else
+  echo "  (prompt-in-process tests skipped — sqlite driver not built)"
+fi
+
+# A PACKAGE LINKED MID-SESSION TAKES EFFECT (mvx#248).
+#
+# Subroutine libraries used to load once per process, which was right while
+# every verb was a forked process that did its own loading.  With verbs
+# running in the session, a LINK-PKG during that session would never be seen:
+# the subroutines in the package just linked stay invisible and a CALL to one
+# fails with "subroutine is not cataloged" -- a message that names the
+# subroutine and says nothing about the cause.
+#
+# Restoring the one-shot makes the second CALL below fail too, which is how
+# this was confirmed to be testing something.
+echo "== a package linked during a session is usable in it"
+LPP="$TESTROOT/linkpkg-pkg"; mkdir -p "$LPP/BP"
+printf '# MVX account descriptor\nname=lpp\nversion=1\n' > "$LPP/.mvx"
+printf 'lpp\n1.0.0\na package with a subroutine\n' > "$LPP/PKG"
+printf 'SUBROUTINE LPP.HELLO(R)\nR = "from the linked package"\nRETURN\n' \
+  > "$LPP/BP/LPP.HELLO"
+MVXPRIV=developer "$ROOT/scripts/mkpkg.sh" "$LPP" >/dev/null 2>&1
+LPA="$TESTROOT/linkpkg-acct"
+"$ROOT/scripts/mkaccount.sh" "$LPA" >/dev/null 2>&1
+mkdir -p "$LPA/BP"
+printf 'CALL LPP.HELLO(R)\nPRINT "got: ":R\n' > "$LPA/BP/LPUSE"
+MVXPRIV=developer "$TCL" -a "$LPA" -c 'CATALOG BP LPUSE' >/dev/null 2>&1
+lpout="$(printf 'LPUSE\nLINK-PKG %s\nLPUSE\nOFF\n' "$LPP" \
+         | MVXPRIV=developer "$TCL" -a "$LPA" 2>&1 | grep -c 'got: from the linked package')"
+if [ "$lpout" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  a LINK-PKG is visible to the next CALL in the same session"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL link-pkg mid-session: $lpout successful call(s), want 1"
+fi
+
+# ---------------------------------------------------------------------------
+# EXECUTE ... ON ERROR (mvx#256).
+#
+# An ABORT or a fault in a program reached by EXECUTE takes its caller with
+# it, which is UniData's behaviour and right for ordinary code.  A SHELL is
+# the exception: a login and menu written in BASIC -- what a site replaces TCL
+# with -- has to survive the option it just ran.  On UniData the abort is
+# caught by TCL, so removing TCL removes the only thing catching one.
+#
+# The two properties that make this safe are asserted as carefully as the
+# feature itself: WITHOUT the clause nothing changes, and a non-zero STOP is
+# not an error.
+echo "== a BASIC shell can survive an option that gives up"
+OEA="$TESTROOT/on-error"
+"$ROOT/scripts/mkaccount.sh" "$OEA" >/dev/null 2>&1
+mkdir -p "$OEA/BP"
+printf 'PRINT "  v: aborting"\nABORT\n'      > "$OEA/BP/OEAB"
+printf 'PRINT "  v: fine"\n'                  > "$OEA/BP/OEOK"
+printf 'PRINT "  v: stopping 3"\nSTOP 3\n'   > "$OEA/BP/OE3"
+cat > "$OEA/BP/OESHELL" <<'OEEOF'
+EXECUTE "OEAB" ON ERROR
+   PRINT "shell: that option gave up -- still here"
+END
+PRINT "shell: the menu carries on"
+EXECUTE "OEOK"
+PRINT "shell: logged off normally"
+OEEOF
+# No clause: the abort must still take this program with it.
+printf 'PRINT "bare: running it"\nEXECUTE "OEAB"\nPRINT "bare: MUST NOT REACH"\n' \
+  > "$OEA/BP/OEBARE"
+# A non-zero STOP is an exit status, not a failure.
+cat > "$OEA/BP/OESTOP" <<'OEEOF'
+EXECUTE "OE3" RETURNING RC ON ERROR
+   PRINT "MUST NOT REACH: a STOP is not an error"
+END
+PRINT "stop: rc=":RC
+OEEOF
+for v in OEAB OEOK OE3 OESHELL OEBARE OESTOP; do
+  MVXPRIV=developer "$TCL" -a "$OEA" -c "CATALOG BP $v" >/dev/null 2>&1
+done
+
+shout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OESHELL 2>&1)"
+shrc=$?
+shwant="  v: aborting
+shell: that option gave up -- still here
+shell: the menu carries on
+  v: fine
+shell: logged off normally"
+if [ "$shout" = "$shwant" ] && [ "$shrc" = 0 ]; then
+  PASS=$((PASS + 1)); echo "  ON ERROR catches the abort and the menu runs on"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL on-error shell: rc=$shrc"
+  printf '%s\n' "$shout" | sed 's/^/    | /' | head -8
+fi
+
+bareout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OEBARE 2>&1)"
+barerc=$?
+case "$bareout" in *"MUST NOT REACH"*) bareok=0 ;; *) bareok=1 ;; esac
+if [ "$bareok" = 1 ] && [ "$barerc" != 0 ]; then
+  PASS=$((PASS + 1)); echo "  without the clause an abort still takes the caller"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL on-error bare: rc=$barerc out=[$bareout]"
+fi
+
+stopout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OESTOP 2>&1)"
+if [ "$stopout" = "  v: stopping 3
+stop: rc=3" ]; then
+  PASS=$((PASS + 1)); echo "  a non-zero STOP is a status, not an error"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL on-error stop: [$stopout]"
+fi
+
+# ---------------------------------------------------------------------------
+# A SESSION GIVES BACK THE ACCOUNTS IT LEAVES (mvx#251), AND CLOSE (mvx#258).
+#
+# Every connection-holding driver caches by location with a cap of 8 and no
+# eviction, and nothing ever released one: the only close calls in the tree
+# were on failed-connect paths.  So a session that moved between accounts --
+# a menu switching company or division, which is what a site replaces TCL
+# with -- accumulated one connection per account and could open nothing at
+# all from the ninth onward, for the rest of its life.
+#
+# There was also no CLOSE statement, which is why files piled up: a file
+# opened was open until the session ended, and its connection with it.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a session gives back the accounts it leaves"
+  LKB="$TESTROOT/leave"
+  # Ten accounts, each with its own sqlite database.
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    "$ROOT/scripts/mkaccount.sh" "$LKB/a$i" >/dev/null 2>&1
+    printf 'ORD sqlite %s/a%s/db.sqlite\n' "$LKB" "$i" >> "$LKB/a$i/BINDINGS"
+    "$TCL" -a "$LKB/a$i" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+    mkdir -p "$LKB/a$i/BP"
+    printf 'OPEN "ORD" TO F ELSE PRINT "  CANNOT OPEN" ; STOP\nPRINT "  opened ok"\n' \
+      > "$LKB/a$i/BP/T"
+    MVXPRIV=developer "$TCL" -a "$LKB/a$i" -c 'CATALOG BP T' >/dev/null 2>&1
+  done
+  lkraw="$({ for i in 1 2 3 4 5 6 7 8 9 10; do
+               echo "LOGTO $LKB/a$i"; echo T
+             done; echo OFF; } \
+           | MVXPRIV=developer "$TCL" -a "$LKB/a1" 2>&1)"
+  lkout="$(printf '%s\n' "$lkraw" | grep -c 'opened ok')"
+  if [ "$lkout" = 10 ]; then
+    PASS=$((PASS + 1)); echo "  ten accounts in one session, all ten usable"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL leave: $lkout of 10 accounts usable (the cap is 8 without release)"
+    printf '%s\n' "$lkraw" | sed 's/^/    | /' | head -12
+  fi
+
+  # A handle from before the LOGTO must SAY it is stale, not read a freed one.
+  mkdir -p "$LKB/a1/BP"
+  cat > "$LKB/a1/BP/STALE" <<'STEOF'
+OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
+PRINT "opened in the first account"
+STEOF
+  MVXPRIV=developer "$TCL" -a "$LKB/a1" -c 'CATALOG BP STALE' >/dev/null 2>&1
+  stout="$({ echo "STALE"; echo "LOGTO $LKB/a2"; echo OFF; } \
+           | MVXPRIV=developer "$TCL" -a "$LKB/a1" 2>&1)"
+  case "$stout" in
+    *"opened in the first account"*) stok=1 ;;
+    *) stok=0 ;;
+  esac
+  if [ "$stok" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  and leaving one does not disturb the next"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL leave/stale: [$stout]"
+  fi
+
+  # CLOSE, and the contrast that shows it does something: the same loop
+  # without it hits the cap at the ninth database.
+  CLB="$TESTROOT/closetest"
+  "$ROOT/scripts/mkaccount.sh" "$CLB" >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    printf 'F%s sqlite %s/db%s.sqlite\n' "$i" "$CLB" "$i" >> "$CLB/BINDINGS"
+    "$TCL" -a "$CLB" -c "CREATE-FILE F$i" >/dev/null 2>&1
+  done
+  mkdir -p "$CLB/BP"
+  cat > "$CLB/BP/CYCLE" <<'CLEOF'
+FOR I = 1 TO 10
+   NM = "F":I
+   OPEN NM TO F ELSE PRINT "  failed to open ":NM ; STOP
+   CLOSE F
+NEXT I
+PRINT "all ten"
+CLEOF
+  cat > "$CLB/BP/NOCLOSE" <<'CLEOF'
+FOR I = 1 TO 10
+   NM = "F":I
+   OPEN NM TO F ELSE PRINT "  failed to open ":NM ; STOP
+NEXT I
+PRINT "all ten"
+CLEOF
+  MVXPRIV=developer "$TCL" -a "$CLB" -c 'CATALOG BP CYCLE'   >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$CLB" -c 'CATALOG BP NOCLOSE' >/dev/null 2>&1
+  clwith="$(cd "$CLB" && MVXACCOUNT=. ./CATALOG/CYCLE 2>&1 | tail -1)"
+  clwout="$(cd "$CLB" && MVXACCOUNT=. ./CATALOG/NOCLOSE 2>&1 | tail -1)"
+  if [ "$clwith" = "all ten" ] && [ "$clwout" != "all ten" ]; then
+    PASS=$((PASS + 1))
+    echo "  CLOSE gives the connection back; without it the ninth fails"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL close: with=[$clwith] without=[$clwout] (without must fail)"
+  fi
+else
+  echo "  (leave/CLOSE tests skipped — sqlite driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# A PROGRAM CAN CHANGE ACCOUNT (mvx#258).
+#
+# LOGTO was a builtin of `mvx` and nothing else, so a site that replaces TCL
+# with its own login and menu -- the whole point of mvx#248 -- was bound to
+# the account its shell started in.  An operator picking a company or a
+# division from a menu is exactly this.
+#
+# `EXECUTE "LOGTO ..."` is in here too, and it is the half that was actively
+# misleading: it found no VOC entry, fell back to spawning `mvx -c`, moved a
+# CHILD that immediately exited, and left the caller where it was without a
+# word.  On UniData 8.3 and UniVerse 14.2 the same line moves the calling
+# program and the program survives -- measured, both of them -- so ported
+# code uses that spelling and has to find it working.
+#
+# Each account gets its own sqlite database with a record saying which it is,
+# so "did the account change?" is answered by what the program READS, not by
+# where it thinks it is.
+if ls "$ROOT"/build/lib/libmvxdrv_sqlite.* >/dev/null 2>&1; then
+  echo "== a program can change account"
+  LG="$TESTROOT/logto"
+  for i in 1 2; do
+    "$ROOT/scripts/mkaccount.sh" "$LG/a$i" >/dev/null 2>&1
+    printf 'ORD sqlite %s/a%s/db.sqlite\n' "$LG" "$i" >> "$LG/a$i/BINDINGS"
+    "$TCL" -a "$LG/a$i" -c 'CREATE-FILE ORD' >/dev/null 2>&1
+    mkdir -p "$LG/a$i/BP"
+    printf 'OPEN "ORD" TO F ELSE STOP\nWRITE "account %s" ON F, "WHO"\n' "$i" \
+      > "$LG/a$i/BP/SEED"
+    MVXPRIV=developer "$TCL" -a "$LG/a$i" -c 'CATALOG BP SEED' >/dev/null 2>&1
+    (cd "$LG/a$i" && MVXACCOUNT=. ./CATALOG/SEED >/dev/null 2>&1)
+  done
+
+  # A subroutine that exists ONLY in the second account, to prove the library
+  # chain moves too: it is searched relative to the working directory, and the
+  # rescan is triggered by PACKAGES changing -- which a LOGTO does not do.
+  printf 'SUBROUTINE ONLY.IN.A2(X)\nPRINT "  a2 subroutine ran"\nRETURN\n' \
+    > "$LG/a2/BP/ONLY.IN.A2"
+  MVXPRIV=developer "$TCL" -a "$LG/a2" -c 'CATALOG BP ONLY.IN.A2' >/dev/null 2>&1
+
+  cat > "$LG/a1/BP/MOVE" <<LGEOF
+EXECUTE "LOGTO $LG/a2"
+OPEN "ORD" TO F ELSE PRINT "  no ORD" ; STOP
+READ R FROM F, "WHO" THEN PRINT "  execute: ":R ELSE PRINT "  no WHO"
+CLOSE F
+CALL ONLY.IN.A2(0)
+IF LOGTO("$LG/a1") THEN
+   OPEN "ORD" TO G ELSE PRINT "  no ORD" ; STOP
+   READ R2 FROM G, "WHO" THEN PRINT "  intrinsic: ":R2 ELSE PRINT "  no WHO"
+END ELSE
+   PRINT "  intrinsic refused, STATUS=":STATUS()
+END
+IF LOGTO("$LG/nosuch") THEN
+   PRINT "  moved to an account that is not there -- WRONG"
+END ELSE
+   PRINT "  bad account: STATUS=":STATUS()
+END
+PRINT "  the program is still running"
+LGEOF
+  MVXPRIV=developer "$TCL" -a "$LG/a1" -c 'CATALOG BP MOVE' >/dev/null 2>&1
+  lgout="$(cd "$LG/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MOVE 2>/dev/null)"
+  lgwant="  execute: account 2
+  a2 subroutine ran
+  intrinsic: account 1
+  bad account: STATUS=1
+  the program is still running"
+  if [ "$lgout" = "$lgwant" ]; then
+    PASS=$((PASS + 1))
+    echo "  EXECUTE and LOGTO() both move the calling program, and it goes on"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL logto: [$lgout]"
+    echo "  wanted: [$lgwant]"
+  fi
+
+  # AN OPEN TRANSACTION REFUSES THE MOVE (mvx#251's rule, reached from BASIC).
+  # Committing it after the account changed would commit into somewhere the
+  # program no longer is; discarding it silently is worse.
+  cat > "$LG/a1/BP/MOVETXN" <<LGEOF
+OPEN "ORD" TO F ELSE STOP
+TRANSACTION START ELSE PRINT "  no transaction" ; STOP
+WRITE "x" ON F, "TMP"
+IF LOGTO("$LG/a2") THEN
+   PRINT "  moved with a transaction open -- WRONG"
+END ELSE
+   PRINT "  refused, STATUS=":STATUS()
+END
+TRANSACTION ABORT
+IF LOGTO("$LG/a2") THEN
+   PRINT "  and allowed once it is settled"
+END ELSE
+   PRINT "  still refused after the abort -- WRONG"
+END
+LGEOF
+  MVXPRIV=developer "$TCL" -a "$LG/a1" -c 'CATALOG BP MOVETXN' >/dev/null 2>&1
+  txout="$(cd "$LG/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MOVETXN 2>/dev/null)"
+  if [ "$txout" = "  refused, STATUS=2
+  and allowed once it is settled" ]; then
+    PASS=$((PASS + 1)); echo "  an open transaction refuses the move, and says which refusal"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL logto/txn: [$txout]"
+  fi
+else
+  echo "  (LOGTO tests skipped — sqlite driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# AN ACCOUNT SETS ITSELF UP ON THE WAY IN (mvx#264).
+#
+# UniData and UniVerse both run something when a session ENTERS an account --
+# a fresh login, a LOGTO from TCL, and a LOGTO from inside a program (measured
+# on 8.3 and 14.2.1).  MVX ran nothing, so an account that needed setting up
+# could only be entered by a program that knew to do it.
+#
+# Entering, not per program: a cataloged program run straight from Unix pays
+# nothing, which is what keeps docs/replacing-tcl.md true.
+echo "== an account sets itself up on the way in"
+LGI="$TESTROOT/loginacct"
+for a in a1 a2 a3; do "$ROOT/scripts/mkaccount.sh" "$LGI/$a" >/dev/null 2>&1; done
+mkdir -p "$LGI/a2/BP" "$LGI/a1/BP"
+printf 'PRINT "a2-login"\n' > "$LGI/a2/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+
+# 1. entering it with `mvx' runs it; an account without one runs nothing.
+li1="$(MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'WHO' 2>/dev/null | head -1)"
+li2="$(MVXPRIV=developer "$TCL" -a "$LGI/a3" -c 'WHO' 2>/dev/null | head -1)"
+case "$li2" in a2-login|a3-login) li2bad=1 ;; *) li2bad=0 ;; esac
+if [ "$li1" = "a2-login" ] && [ "$li2bad" = 0 ]; then
+  PASS=$((PASS + 1)); echo "  entering an account runs its LOGIN, and only its own"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL login/enter: with=[$li1] without=[$li2]"
+fi
+
+# 2. a LOGTO runs the TARGET's LOGIN, and the program carries on after it.
+cat > "$LGI/a1/BP/MENU" <<LIEOF
+PRINT "menu: moving"
+IF LOGTO("$LGI/a2") THEN PRINT "menu: moved" ELSE PRINT "menu: refused"
+PRINT "menu: still running"
+LIEOF
+MVXPRIV=developer "$TCL" -a "$LGI/a1" -c 'CATALOG BP MENU' >/dev/null 2>&1
+liout="$(cd "$LGI/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MENU 2>/dev/null)"
+if [ "$liout" = "menu: moving
+a2-login
+menu: moved
+menu: still running" ]; then
+  PASS=$((PASS + 1)); echo "  a LOGTO runs the target's LOGIN before it returns"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL login/logto: [$liout]"
+fi
+
+# 3. A LOGIN THAT GIVES UP MUST NOT TAKE THE CALLER WITH IT.  The session is
+# already in the new account by then; killing the menu that moved there would
+# be the worst of both.
+printf 'PRINT "a2-login"\nABORT\n' > "$LGI/a2/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+about="$(cd "$LGI/a1" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MENU 2>/dev/null)"
+case "$about" in
+  *"menu: moved"*"menu: still running"*) abok=1 ;;
+  *) abok=0 ;;
+esac
+if [ "$abok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  an aborting LOGIN is reported, not fatal to the caller"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL login/abort: [$about]"
+fi
+
+# 4. IT IS THE ACCOUNT'S OWN, NEVER INHERITED.  A LOGIN reachable through the
+# system account would run in every account on the machine, silently.
+SYSV="$(MVXPRIV=developer "$TCL" -a "$LGI/a3" -c 'WHO' >/dev/null 2>&1; \
+        echo "${MVXSYSTEM:-$ROOT/build/system}")"
+if [ -d "$SYSV/VOC" ]; then
+  printf 'V\nCATALOG/NOSUCHLOGINPROG\n' > "$SYSV/VOC/LOGIN"
+  syout="$(MVXPRIV=developer "$TCL" -a "$LGI/a3" -c 'WHO' 2>&1 | head -2)"
+  rm -f "$SYSV/VOC/LOGIN"
+  case "$syout" in
+    *NOSUCHLOGINPROG*|*LOGIN*) syok=0 ;;
+    *) syok=1 ;;
+  esac
+  if [ "$syok" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  a LOGIN in the system account is not inherited"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL login/inherit: [$syout]"
+  fi
+else
+  echo "  (system-account LOGIN test skipped — VOC is not a directory)"
+fi
+
+# 5. LOGIN IS ITSELF A PROGRAM AND MAY LOGTO.  Two that point at each other
+# must not loop; the second one does not run.
+printf 'PRINT "a2-login"\nX = LOGTO("%s/a1")\n' "$LGI" > "$LGI/a2/BP/LOGIN"
+printf 'PRINT "a1-login"\nX = LOGTO("%s/a2")\n' "$LGI" > "$LGI/a1/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LGI/a2" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$LGI/a1" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+( MVXPRIV=developer "$TCL" -a "$LGI/a1" -c 'WHO' >"$TESTROOT/loginloop" 2>&1 ) &
+lipid=$!
+lin=0
+while kill -0 "$lipid" 2>/dev/null && [ "$lin" -lt 20 ]; do sleep 1; lin=$((lin + 1)); done
+if kill -0 "$lipid" 2>/dev/null; then
+  kill -9 "$lipid" 2>/dev/null
+  FAIL=$((FAIL + 1)); echo "FAIL login/recurse: two LOGINs that LOGTO each other did not stop"
+else
+  wait "$lipid" 2>/dev/null
+  lrc="$(grep -c 'a1-login' "$TESTROOT/loginloop" 2>/dev/null || echo 0)"
+  if [ "$lrc" = 1 ]; then
+    PASS=$((PASS + 1)); echo "  a LOGIN that LOGTOs does not start another one"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL login/recurse: a1-login ran $lrc times"
+    sed 's/^/    | /' "$TESTROOT/loginloop" | head -6
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# PARAGRAPHS (mvx#269).
+#
+# MVX had one executable VOC record type -- `V', naming a compiled program.
+# UniData and UniVerse also have paragraphs, and an account ported from either
+# arrives carrying them; a LOGIN on UniData IS one, because a cataloged
+# program cannot be a LOGIN there at all.
+#
+# Every rule below was MEASURED on UniData 8.3 rather than assumed, and two of
+# them contradicted what I was about to implement: sentences are not echoed,
+# and `<<%1>>' is not parameter substitution -- it prompts with the literal
+# text `%1'.  The same prompt twice is one question.
+echo "== paragraphs"
+PRA="$TESTROOT/paraacct"
+"$ROOT/scripts/mkaccount.sh" "$PRA" >/dev/null 2>&1
+mkdir -p "$PRA/BP"
+printf 'PRINT "hi"\n' > "$PRA/BP/SAYHI"
+printf 'PRINT "got: ":FIELD(SENTENCE(), " ", 2, 99)\n' > "$PRA/BP/ECHOARG"
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP SAYHI'   >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP ECHOARG' >/dev/null 2>&1
+cat > "$PRA/BP/MKP" <<'PREOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+A = "" ; A<1> = "PA" ; A<2> = "* comment" ; A<3> = "SAYHI" ; A<4> = ""
+A<5> = "SAYHI"
+WRITE A ON V, "PTWO"
+B = "" ; B<1> = "PA" ; B<2> = "SAYHI" ; B<3> = "NOSUCHVERBHERE" ; B<4> = "SAYHI"
+WRITE B ON V, "PERR"
+C = "" ; C<1> = "PA" ; C<2> = "ECHOARG <<Which one>> and <<Which one>>"
+WRITE C ON V, "PASK"
+PRINT "ok"
+PREOF
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP MKP' >/dev/null 2>&1
+(cd "$PRA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MKP >/dev/null 2>&1)
+
+# Sentences in order; comments and blank lines skipped; NOT echoed.
+p1="$(MVXPRIV=developer "$TCL" -a "$PRA" -c 'PTWO' 2>/dev/null)"
+if [ "$p1" = "hi
+hi" ]; then
+  PASS=$((PASS + 1)); echo "  a paragraph runs its sentences, and does not echo them"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/run: [$p1]"
+fi
+
+# A sentence that fails does not stop the paragraph, and the message names it.
+p2="$(MVXPRIV=developer "$TCL" -a "$PRA" -c 'PERR' 2>&1)"
+case "$p2" in
+  *"In paragraph PERR"*) p2named=1 ;;
+  *) p2named=0 ;;
+esac
+p2hi="$(printf '%s\n' "$p2" | grep -c '^hi$')"
+if [ "$p2named" = 1 ] && [ "$p2hi" = 2 ]; then
+  PASS=$((PASS + 1)); echo "  a failing sentence is named and the rest still runs"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/err: named=$p2named hi=$p2hi [$p2]"
+fi
+
+# <<prompt>> asks once and substitutes everywhere it appeared.
+p3="$(printf 'FRED\n' | MVXPRIV=developer "$TCL" -a "$PRA" -c 'PASK' 2>/dev/null)"
+case "$p3" in
+  *"got: FRED and FRED"*) p3ok=1 ;;
+  *) p3ok=0 ;;
+esac
+if [ "$p3ok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  <<prompt>> is asked once and substituted everywhere"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/ask: [$p3]"
+fi
+
+# EXECUTE reaches one, which is what makes a paragraph LOGIN work.
+printf 'PRINT "before"\nEXECUTE "PTWO"\nPRINT "after"\n' > "$PRA/BP/CALLP"
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP CALLP' >/dev/null 2>&1
+p4="$(cd "$PRA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CALLP 2>/dev/null)"
+if [ "$p4" = "before
+hi
+hi
+after" ]; then
+  PASS=$((PASS + 1)); echo "  EXECUTE runs a paragraph, and the caller carries on"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/execute: [$p4]"
+fi
+
+# AND A LOGIN MAY BE ONE (mvx#264 + mvx#269).  On UniData that is the only way
+# to have a LOGIN at all, so the hook had to be type-agnostic -- it executes
+# the SENTENCE `LOGIN', and this is the proof that buys.
+cat > "$PRA/BP/MKL" <<'PLEOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+L = "" ; L<1> = "PA" ; L<2> = "SAYHI"
+WRITE L ON V, "LOGIN"
+PLEOF
+MVXPRIV=developer "$TCL" -a "$PRA" -c 'CATALOG BP MKL' >/dev/null 2>&1
+(cd "$PRA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MKL >/dev/null 2>&1)
+p5="$(MVXPRIV=developer "$TCL" -a "$PRA" -c 'WHO' 2>/dev/null | head -1)"
+if [ "$p5" = "hi" ]; then
+  PASS=$((PASS + 1)); echo "  a LOGIN that is a paragraph runs on entering the account"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL para/login: [$p5]"
+fi
+
+# ---------------------------------------------------------------------------
+# @LEVEL -- HOW MANY PROGRAMS ARE ABOVE ME (mvx#270).
+#
+# A program could not tell.  SYSTEM(2)/SYSTEM(3) answer whether there is a
+# terminal, which a program three EXECUTEs deep still has, and @USER.TYPE
+# answers the same question -- so a shared routine that prompts had no way to
+# decline when it did not come from the operator.  mvx#264 made that urgent:
+# an account's LOGIN now runs from a LOGTO inside a running program, whose
+# screen and keyboard it would otherwise take over.
+#
+# The numbering is UniData 8.3's and UniVerse 14.2.1's, which agree exactly:
+# from TCL 0, through an EXECUTE 1.  MVX's shell runs every verb as a level,
+# so the prompt marks itself not-a-program or the first verb typed would
+# answer 1 where they answer 0.
+echo "== @LEVEL"
+LVA="$TESTROOT/lvlacct"
+"$ROOT/scripts/mkaccount.sh" "$LVA" >/dev/null 2>&1
+"$ROOT/scripts/mkaccount.sh" "$LVA.b" >/dev/null 2>&1
+mkdir -p "$LVA/BP" "$LVA.b/BP"
+printf 'PRINT "inner=":@LEVEL\n' > "$LVA/BP/LVL"
+printf 'PRINT "outer=":@LEVEL\nEXECUTE "LVL"\n' > "$LVA/BP/LVLOUT"
+MVXPRIV=developer "$TCL" -a "$LVA" -c 'CATALOG BP LVL'    >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$LVA" -c 'CATALOG BP LVLOUT' >/dev/null 2>&1
+
+lv1="$(MVXPRIV=developer "$TCL" -a "$LVA" -c 'LVLOUT' 2>/dev/null)"
+lv2="$(cd "$LVA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/LVLOUT 2>/dev/null)"
+if [ "$lv1" = "outer=0
+inner=1" ] && [ "$lv2" = "outer=0
+inner=1" ]; then
+  PASS=$((PASS + 1))
+  echo "  0 from the prompt and from Unix, 1 through an EXECUTE"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL level: prompt=[$lv1] unix=[$lv2]"
+fi
+
+# AND THE CASE IT EXISTS FOR: a LOGIN can tell whether it owns the screen.
+printf 'PRINT "login=":@LEVEL\n' > "$LVA/BP/LOGIN"
+MVXPRIV=developer "$TCL" -a "$LVA" -c 'CATALOG BP LOGIN' >/dev/null 2>&1
+cat > "$LVA.b/BP/MENU" <<LVEOF
+IF LOGTO("$LVA") THEN NULL ELSE PRINT "refused"
+LVEOF
+MVXPRIV=developer "$TCL" -a "$LVA.b" -c 'CATALOG BP MENU' >/dev/null 2>&1
+lv3="$(MVXPRIV=developer "$TCL" -a "$LVA" -c 'WHO' 2>/dev/null | head -1)"
+lv4="$(cd "$LVA.b" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MENU 2>/dev/null | head -1)"
+if [ "$lv3" = "login=0" ] && [ "$lv4" = "login=1" ]; then
+  PASS=$((PASS + 1))
+  echo "  a LOGIN sees 0 at startup and 1 when a running program moved here"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL level/login: startup=[$lv3] logto=[$lv4]"
+fi
+
+# ---------------------------------------------------------------------------
+# PROCS (mvx#271).
+#
+# The companion to mvx#269.  Where a paragraph IS a list of sentences, a PROC
+# BUILDS a command and then runs it -- the older Pick mechanism, still carried
+# by accounts ported from UniData or OpenQM.
+#
+# Every opcode below was measured on UniData 8.3 AND ScarletDME 2.6-6, which
+# agree exactly, so this is the language rather than one system's reading.
+# Word 1 of the sentence is the VERB, so a PROC's first argument is word 2 --
+# `S2' is the common opening line.
+echo "== procs"
+PQA="$TESTROOT/procacct"
+"$ROOT/scripts/mkaccount.sh" "$PQA" >/dev/null 2>&1
+mkdir -p "$PQA/BP"
+printf 'PRINT "got: ":FIELD(SENTENCE(), " ", 2, 99)\n' > "$PQA/BP/ECHOARG"
+MVXPRIV=developer "$TCL" -a "$PQA" -c 'CATALOG BP ECHOARG' >/dev/null 2>&1
+cat > "$PQA/BP/MKPQ" <<'PQEOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+A = "" ; A<1> = "PQ" ; A<2> = "Oliteral" ; A<3> = "X"
+WRITE A ON V, "P1"
+B = "" ; B<1> = "PQ" ; B<2> = "HECHOARG built" ; B<3> = "P" ; B<4> = "Oafter" ; B<5> = "X"
+WRITE B ON V, "P2"
+C = "" ; C<1> = "PQ" ; C<2> = "S2" ; C<3> = "HECHOARG " ; C<4> = "A" ; C<5> = "P" ; C<6> = "X"
+WRITE C ON V, "P3"
+D = "" ; D<1> = "PQ" ; D<2> = "IF A2 = YES GO 10" ; D<3> = "Ono match" ; D<4> = "X"
+D<5> = "10 Omatched" ; D<6> = "X"
+WRITE D ON V, "P5"
+E = "" ; E<1> = "PQ" ; E<2> = "IF # A2 Ono argument" ; E<3> = "X"
+WRITE E ON V, "P7"
+F = "" ; F<1> = "PQ" ; F<2> = "Obefore" ; F<3> = "ZZNOSUCHOPCODE" ; F<4> = "Oafter" ; F<5> = "X"
+WRITE F ON V, "P8"
+G = "" ; G<1> = "PQ" ; G<2> = "Oproc-login" ; G<3> = "X"
+WRITE G ON V, "LOGIN"
+PQEOF
+MVXPRIV=developer "$TCL" -a "$PQA" -c 'CATALOG BP MKPQ' >/dev/null 2>&1
+(cd "$PQA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/MKPQ >/dev/null 2>&1)
+
+# O outputs, H builds, P executes AND RETURNS, X stops.
+q1="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P1' 2>/dev/null | grep -v proc-login)"
+q2="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P2' 2>/dev/null | grep -v proc-login)"
+if [ "$q1" = "literal" ] && [ "$q2" = "got: built
+after" ]; then
+  PASS=$((PASS + 1)); echo "  O writes, H builds, P runs it and the proc carries on"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/core: p1=[$q1] p2=[$q2]"
+fi
+
+# S puts the pointer on a word, A copies it into the buffer.
+q3="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P3 HELLO' 2>/dev/null | grep -v proc-login)"
+if [ "$q3" = "got: HELLO" ]; then
+  PASS=$((PASS + 1)); echo "  S positions the input pointer and A copies the argument"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/args: [$q3]"
+fi
+
+# IF with a numeric label and GO, both ways, plus the absent-argument form.
+q4="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P5 YES' 2>/dev/null | grep -v proc-login)"
+q5="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P5 NO' 2>/dev/null | grep -v proc-login)"
+q6="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P7' 2>/dev/null | grep -v proc-login)"
+if [ "$q4" = "matched" ] && [ "$q5" = "no match" ] && [ "$q6" = "no argument" ]; then
+  PASS=$((PASS + 1)); echo "  IF branches, GO reaches its label, and # tests absence"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/if: yes=[$q4] no=[$q5] absent=[$q6]"
+fi
+
+# AN UNKNOWN OPCODE SAYS SO.  Skipping it silently would run half the proc and
+# report success, which is the failure this whole file exists to prevent.
+q7="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'P8' 2>&1 | grep -v proc-login)"
+case "$q7" in
+  *"unknown opcode"*"ZZNOSUCHOPCODE"*) q7ok=1 ;;
+  *) q7ok=0 ;;
+esac
+if [ "$q7ok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  an opcode it does not know is named, not skipped"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/unknown: [$q7]"
+fi
+
+# EXECUTE reaches one, and a LOGIN may be a PROC -- the hook never cared what
+# the record was (mvx#264), and this is the second proof of that.
+printf 'PRINT "before"\nEXECUTE "P1"\nPRINT "after"\n' > "$PQA/BP/CALLQ"
+MVXPRIV=developer "$TCL" -a "$PQA" -c 'CATALOG BP CALLQ' >/dev/null 2>&1
+q8="$(cd "$PQA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CALLQ 2>/dev/null)"
+q9="$(MVXPRIV=developer "$TCL" -a "$PQA" -c 'WHO' 2>/dev/null | head -1)"
+if [ "$q8" = "before
+literal
+after" ] && [ "$q9" = "proc-login" ]; then
+  PASS=$((PASS + 1)); echo "  EXECUTE runs a proc, and a LOGIN may be one"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL proc/execute: exec=[$q8] login=[$q9]"
+fi
+
+# ---------------------------------------------------------------------------
+# A LOGIN A CHECKOUT BRINGS MAY NOT BE ONE HERE (mvx#272).
+#
+# UniVerse honours a VOC record named after the ACCOUNT as its login and
+# prefers it over LOGIN -- measured on 14.2.1, where with both present only
+# the account-named one ran.  UniData, ScarletDME and MVX all key on LOGIN and
+# ignore an account-named record entirely (8.3, 2.6-6, and mvx#264 here).
+#
+# So an account authored on UniVerse arrives with a login MVX will never run,
+# and nothing said so: it simply stopped setting itself up.  The import says
+# so now.  It does NOT rewrite the record -- a checkout that quietly edits
+# account content is worse than one that explains itself.
+echo "== a login that will not run here"
+LGC="$TESTROOT/logincheck"
+mklgc() {                       # $1 = account name
+  rm -rf "$LGC/$1"; mkdir -p "$LGC/$1/VOC" "$LGC/$1/VOC.DICT"
+  printf '# MVX account descriptor\nname = %s\nversion = 1\nopenaccount = 1\n' \
+    "$1" > "$LGC/$1/.mv-account"
+  printf 'D\n' > "$LGC/$1/VOC.DICT/%FILE%"
+}
+mklgc uvstyle; printf 'PA\nDISPLAY setting up\n' > "$LGC/uvstyle/VOC/uvstyle"
+mklgc bothway; printf 'PA\nDISPLAY a\n' > "$LGC/bothway/VOC/bothway"
+               printf 'PA\nDISPLAY b\n' > "$LGC/bothway/VOC/LOGIN"
+mklgc plainlg; printf 'PA\nDISPLAY b\n' > "$LGC/plainlg/VOC/LOGIN"
+mklgc verbnam; printf 'V\nCATALOG/verbnam\n' > "$LGC/verbnam/VOC/verbnam"
+
+lc1="$(MVXPRIV=developer "$CONV" "$LGC/uvstyle" 2>&1 | grep -c "named")"
+lc2="$(MVXPRIV=developer "$CONV" "$LGC/bothway" 2>&1 | grep -c "BOTH")"
+lc3="$(MVXPRIV=developer "$CONV" "$LGC/plainlg" 2>&1 | grep -c "mvx-convert-acct:")"
+lc4="$(MVXPRIV=developer "$CONV" "$LGC/verbnam" 2>&1 | grep -c "mvx-convert-acct:")"
+
+if [ "$lc1" -ge 1 ]; then
+  PASS=$((PASS + 1)); echo "  a UniVerse-style account-named login is reported"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL logincheck/uv: said nothing about it"
+fi
+if [ "$lc2" -ge 1 ]; then
+  PASS=$((PASS + 1)); echo "  and so is an account carrying both, which differ per system"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL logincheck/both: said nothing"
+fi
+# AND IT DOES NOT CRY WOLF.  A plain LOGIN is right, and a `V' record that
+# happens to share the account's name is a VERB, not a login.
+if [ "$lc3" = 0 ] && [ "$lc4" = 0 ]; then
+  PASS=$((PASS + 1)); echo "  a plain LOGIN, or a verb sharing the name, says nothing"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL logincheck/quiet: login=$lc3 verb=$lc4 (both must be 0)"
+fi
+
+# ---------------------------------------------------------------------------
+# AN ACCOUNT'S DATABASE IS ITS OWN, ACROSS A LOGTO (mvx#278).
+#
+# The lmdb driver cached ONE global env with no key -- `if (g_env) return
+# g_env;' -- so it belonged to whichever account opened a file first in the
+# process, and every account after it silently used that one.  Measured before
+# the fix: a program that opened a file in A, LOGTO'd to B and wrote there
+# WROTE INTO A'S DATABASE, and B never saw the record:
+#
+#     *** A HOLDS B S WRITE: B WROTE THIS TOO
+#     *** B LOST ITS OWN WRITE
+#
+# That is the menu-switching-company case mvx#258 and mvx#264 exist to serve.
+# ORDER MATTERS, which is why it hid: a program that moves BEFORE opening
+# anything gets the right env, and that is what most fixtures do.  This one
+# opens first, deliberately.
+if ls "$ROOT"/build/lib/libmvxdrv_lmdb.* >/dev/null 2>&1; then
+  echo "== an account's database is its own, across a LOGTO"
+  XA="$TESTROOT/xacct"
+  "$ROOT/scripts/mkaccount.sh" "$XA/a" >/dev/null 2>&1
+  "$ROOT/scripts/mkaccount.sh" "$XA/b" >/dev/null 2>&1
+  for x in a b; do
+    echo "LM lmdb" >> "$XA/$x/BINDINGS"
+    MVXPRIV=developer "$TCL" -a "$XA/$x" -c 'CREATE-FILE LM' >/dev/null 2>&1
+    mkdir -p "$XA/$x/BP"
+    printf 'OPEN "LM" TO F ELSE STOP\nWRITE "in %s" ON F, "K"\n' "$x" \
+      > "$XA/$x/BP/SEED"
+    MVXPRIV=developer "$TCL" -a "$XA/$x" -c 'CATALOG BP SEED' >/dev/null 2>&1
+    (cd "$XA/$x" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/SEED >/dev/null 2>&1)
+  done
+  cat > "$XA/a/BP/CROSS" <<XAEOF
+OPEN "LM" TO F ELSE STOP "no LM in A"
+READ R FROM F, "K" THEN PRINT "A:":R ELSE PRINT "A:empty"
+IF LOGTO("$XA/b") THEN NULL ELSE STOP "no move"
+OPEN "LM" TO G ELSE STOP "no LM in B"
+READ R2 FROM G, "K" THEN PRINT "B:":R2 ELSE PRINT "B:empty"
+WRITE "from B" ON G, "BONLY"
+XAEOF
+  MVXPRIV=developer "$TCL" -a "$XA/a" -c 'CATALOG BP CROSS' >/dev/null 2>&1
+  xout="$(cd "$XA/a" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CROSS 2>/dev/null)"
+  if [ "$xout" = "A:in a
+B:in b" ]; then
+    PASS=$((PASS + 1)); echo "  a read after the move comes from the new account"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL xacct/read: [$xout] (B:in a means the env leaked)"
+  fi
+
+  # AND THE WRITE LANDED WHERE THE PROGRAM THOUGHT IT DID -- the half that
+  # destroys data rather than merely misreporting it.
+  printf 'OPEN "LM" TO F ELSE STOP\nREAD R FROM F, "BONLY" THEN PRINT "leaked" ELSE PRINT "clean"\n' \
+    > "$XA/a/BP/CHK"
+  printf 'OPEN "LM" TO F ELSE STOP\nREAD R FROM F, "BONLY" THEN PRINT "kept" ELSE PRINT "lost"\n' \
+    > "$XA/b/BP/CHK"
+  MVXPRIV=developer "$TCL" -a "$XA/a" -c 'CATALOG BP CHK' >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$XA/b" -c 'CATALOG BP CHK' >/dev/null 2>&1
+  xa="$(cd "$XA/a" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CHK 2>/dev/null)"
+  xb="$(cd "$XA/b" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/CHK 2>/dev/null)"
+  if [ "$xa" = "clean" ] && [ "$xb" = "kept" ]; then
+    PASS=$((PASS + 1)); echo "  and the write landed in the new account, not the old one"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL xacct/write: old=[$xa] new=[$xb] (want clean/kept)"
+  fi
+else
+  echo "  (cross-account database test skipped — lmdb driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# TWO PACKAGES CLAIMING ONE SUBROUTINE (mvx#266).
+#
+# CALL resolves with dlsym(RTLD_DEFAULT, ...), which takes the first
+# definition loaded and cannot see there were others -- and load_dir walks LIB
+# with readdir, whose order is arbitrary.  So an account holding two builds of
+# the same subroutine ran whichever the loader met first, silently.
+#
+# Not hypothetical: mvpkg bundles its own build of cmd's CMD.RUN while the cmd
+# package ships another, and THEY DIFFER -- one calls GETOPT.SENTENCE and one
+# does not.  The same install therefore worked or failed by filesystem chance,
+# which is what made mvx#266 look intermittent.
+echo "== two libraries claiming one subroutine"
+DUP="$TESTROOT/dupacct"
+"$ROOT/scripts/mkaccount.sh" "$DUP" >/dev/null 2>&1
+mkdir -p "$DUP/BP"
+printf 'SUBROUTINE SHARED(X)\nPRINT "version ONE"\nRETURN\n' > "$DUP/BP/SHARED"
+printf 'CALL SHARED(0)\n' > "$DUP/BP/USER"
+MVXPRIV=developer "$TCL" -a "$DUP" -c 'CATALOG BP SHARED' >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$DUP" -c 'CATALOG BP USER'   >/dev/null 2>&1
+
+# One provider: nothing to say.
+d1="$(cd "$DUP" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/USER 2>&1)"
+if [ "$d1" = "version ONE" ]; then
+  PASS=$((PASS + 1)); echo "  one library providing it says nothing"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL dup/single: [$d1]"
+fi
+
+# A SECOND, DIFFERENT build of the same subroutine, under a name that sorts
+# first.  Compiled rather than copied: macOS dedupes dylibs by install name,
+# so a `cp' is not a second library at all and would prove nothing.
+case "$(uname -s)" in Darwin) dsfx=.dylib ;; *) dsfx=.so ;; esac
+printf 'SUBROUTINE SHARED(X)\nPRINT "version TWO"\nRETURN\n' > "$DUP/shared2.b"
+if MVXPRIV=developer "$MVX" -shared "$DUP/shared2.b" \
+     -o "$DUP/LIB/AAOTHER$dsfx" >/dev/null 2>&1; then
+  d2="$(cd "$DUP" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/USER 2>&1)"
+  case "$d2" in *"defined by more than one library"*) dnamed=1 ;; *) dnamed=0 ;; esac
+  # ORDER-INDEPENDENT ON PURPOSE.  Which of the two is named first is decided
+  # by readdir -- the very thing this feature exists to report -- so asserting
+  # a sequence would be a test that assumes what it is testing against.  It
+  # passed here and on one CI run by luck, then failed on the next.
+  dboth=0
+  if printf '%s\n' "$d2" | grep -q "AAOTHER$dsfx" \
+     && printf '%s\n' "$d2" | grep -q "SHARED$dsfx"; then dboth=1; fi
+  case "$d2" in *"in use"*"shadowed"*) dwhich=1 ;; *) dwhich=0 ;; esac
+  if [ "$dnamed" = 1 ] && [ "$dboth" = 1 ] && [ "$dwhich" = 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  two libraries are reported, both named, and which one is in use"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL dup/report: named=$dnamed both=$dboth which=$dwhich"
+    printf '%s\n' "$d2" | sed 's/^/    | /' | head -6
+  fi
+else
+  echo "  (second-provider test skipped — could not build the library)"
+fi
+
+# ---------------------------------------------------------------------------
+# A LITERAL TOO BIG TO HOLD IS A SOURCE ERROR, NOT A CRASH (mvx#241).
+#
+# `X = 9223372036854775808' aborted mvx-basic with an uncaught C++ exception
+# (std::out_of_range from stoll/stod) and named neither the file nor the line
+# -- the one input that could not be diagnosed from the diagnostic.  The
+# `BASIC' verb parses `item:line: message' from stderr, so an abort is also
+# invisible to the thing that reports compile errors.
+#
+# WHAT THE OTHER SYSTEMS DO, measured, because they do not agree: UniData 8.3
+# accepts it and is EXACT (99999999999999999999 + 1 prints all 21 digits, so
+# it is decimal, far wider than a double); UniVerse 14.2.1 accepts it and
+# silently rounds to a double (-9223372036854775808 printed as
+# -9223372036854780000); ScarletDME refuses to compile it.  MVX reports it --
+# UniData's answer needs arbitrary precision the numeric tier does not have,
+# and UniVerse's is a silent wrong answer.
+echo "== a numeric literal too big to hold"
+LITA="$TESTROOT/litacct"; mkdir -p "$LITA"
+litok=1
+# INT64_MAX still compiles and prints itself.
+printf 'X = 9223372036854775807\nPRINT X\n' > "$LITA/max.b"
+if "$MVX" "$LITA/max.b" -o "$LITA/max" >/dev/null 2>&1; then
+  [ "$("$LITA/max" 2>/dev/null)" = "9223372036854775807" ] || litok=0
+else
+  litok=0
+fi
+if [ "$litok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  the largest integer still compiles and prints itself"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL literal/max: INT64_MAX no longer works"
+fi
+
+# Past it, and a float past DBL_MAX: reported as item:line, never an abort.
+# A signal death shows up as rc >= 128, which is what this is really watching.
+litbad=0
+for lit in '9223372036854775808' '99999999999999999999' '-9223372036854775808'; do
+  printf 'X = %s\nPRINT X\n' "$lit" > "$LITA/b.b"
+  msg="$("$MVX" "$LITA/b.b" -o "$LITA/b" 2>&1)"; rc=$?
+  case "$msg" in *"b.b:1: numeric literal out of range"*) ;; *) litbad=1 ;; esac
+  [ "$rc" -lt 128 ] || litbad=1
+done
+printf 'X = %s.5\nPRINT X\n' "$(printf '9%.0s' $(seq 400))" > "$LITA/f.b"
+fmsg="$("$MVX" "$LITA/f.b" -o "$LITA/f" 2>&1)"; frc=$?
+case "$fmsg" in *"f.b:1: numeric literal out of range"*) ;; *) litbad=1 ;; esac
+[ "$frc" -lt 128 ] || litbad=1
+# And it must not quote all 400 digits back at you.
+[ "${#fmsg}" -lt 120 ] || litbad=1
+if [ "$litbad" = 0 ]; then
+  PASS=$((PASS + 1))
+  echo "  past it, and a float past DBL_MAX, name the line instead of aborting"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL literal/range: [$fmsg]"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
@@ -4358,6 +6272,17 @@ sd_is() {        # sd_is <label> <got> <want>
 sd_syms() {      # sd_syms <file> -> symbol count, 0 when stripped bare
   nm -a "$1" 2>/dev/null | wc -l | tr -d ' '
 }
+# WHICH FILE HOLDS THE PROGRAM (mvx#248).  A cataloged program is not always
+# the file the VOC record names: where an executable cannot also be loaded,
+# that file is a small loader with no program in it and the program is the
+# library beside it.  Counting symbols in the loader measures the loader --
+# which is a fixed prebuilt copy, identical whether STRIP was asked for or
+# not, so a strip test against it compares a file with itself.  Resolve the
+# same way the runtime does: the library suffix first, then the plain path.
+sd_prog() {      # sd_prog <base> -> the artifact carrying the program
+  case "$(uname -s)" in Darwin) _sfx=.dylib ;; *) _sfx=.so ;; esac
+  if [ -f "$1$_sfx" ]; then printf '%s' "$1$_sfx"; else printf '%s' "$1"; fi
+}
 cat > "$SD/hello.b" <<'EOF'
 PRINT "hello ":2 + 2
 EOF
@@ -4421,9 +6346,9 @@ mkdir -p "$SDA/BP" "$SDA/BP.DICT"
 printf 'FILE\375dir\n' > "$SDA/BP.DICT/%FILE%"
 cp "$SD/hello.b" "$SDA/BP/HELLO"
 MVXPRIV=developer "$TCL" -a "$SDA" -c 'CATALOG BP HELLO' >/dev/null 2>&1
-SDPLAIN="$(sd_syms "$SDA/CATALOG/HELLO")"
+SDPLAIN="$(sd_syms "$(sd_prog "$SDA/CATALOG/HELLO")")"
 MVXPRIV=developer "$TCL" -a "$SDA" -c 'CATALOG BP HELLO NODEBUG STRIP' >/dev/null 2>&1
-SDTHIN="$(sd_syms "$SDA/CATALOG/HELLO")"
+SDTHIN="$(sd_syms "$(sd_prog "$SDA/CATALOG/HELLO")")"
 sd_is "a verb cataloged with NODEBUG STRIP still runs" \
   "$(MVXPRIV=developer "$TCL" -a "$SDA" -c 'HELLO' 2>&1)" "hello 4"
 if [ "$SDTHIN" -lt "$SDPLAIN" ]; then

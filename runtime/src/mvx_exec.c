@@ -36,6 +36,7 @@
  */
 #include "mvx_runtime.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -446,7 +447,8 @@ void mvx_tmpnam(mv_value *dst) {
 /* --- compile — the narrow primitive (developer+) -----------------------
    Takes structured arguments and builds the argv itself: there is
    nothing to inject (8.2). mode: "c" object, "exe" executable,
-   "shared" subroutine library. */
+   "shared" subroutine library, "catalog" publish a cataloged main
+   program. */
 
 int64_t mvx_compile(mvx_ctx *ctx, const mv_value *mode,
                     const mv_value *src, const mv_value *out) {
@@ -464,7 +466,7 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
     }
     char mb[40], sb[40], ob[40];
     const char *mp, *sp, *op;
-    mv_val_chars(mode, mb, sizeof mb, &mp);
+    int64_t ml = mv_val_chars(mode, mb, sizeof mb, &mp);
     int64_t sl = mv_val_chars(src, sb, sizeof sb, &sp);
     int64_t ol = mv_val_chars(out, ob, sizeof ob, &op);
     if (sl == 0 || ol == 0) return -1;
@@ -528,7 +530,15 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
     char *argv[10];
     int n = 0;
     argv[n++] = mvx;
-    if (mp[0] == 'c' || mp[0] == 'C') argv[n++] = "-c";
+    /* "catalog" is tested before "c", because the modes are otherwise
+       matched on their first letter and it would answer to that one.  It
+       publishes a main program the way the platform needs it -- one file, or
+       a library plus a loader -- and the driver owns that rule so the four
+       things that catalog a program do not each carry a copy of it
+       (mvx#248). */
+    if (ml == 7 && strncasecmp(mp, "catalog", 7) == 0)
+        argv[n++] = "--catalog";
+    else if (mp[0] == 'c' || mp[0] == 'C') argv[n++] = "-c";
     else if (mp[0] == 's' || mp[0] == 'S') argv[n++] = "-shared";
     if (want_g0) argv[n++] = "-g0";
     if (want_strip) argv[n++] = "-s";
@@ -543,17 +553,178 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
    Dispatch stays in one place: spawn mvx -c <sentence>.  A `!` in
    the sentence is gated inside the child by this same module. */
 
+/* EXECUTE RUNS THE PROGRAM IN THIS PROCESS (mvx#248).
+ *
+ * It used to spawn `mvx -c <sentence>`, which kept every bit of dispatch in
+ * the shell and cost nothing while a program reached that way was meant to be
+ * a stranger.  It is not: an EXECUTE'd program is part of the same session,
+ * and as a separate process it could not be.  It reopened every file, took
+ * its own locks, could not see the caller's select list except through a file
+ * handed sideways, and -- measured -- sat OUTSIDE the caller's transaction
+ * looking at a stale view of what the caller had just written, with nothing
+ * reported.
+ *
+ * So it resolves the verb, loads the program and runs it at a LEVEL: its own
+ * unnamed COMMON, STATUS and sentence, sharing the caller's open files,
+ * locks, select list and transaction.  A STOP inside it comes back here; an
+ * ABORT or a fault passes through and takes the caller too, which is what
+ * UniData does.
+ *
+ * ANYTHING IT CANNOT DO IN-PROCESS FALLS BACK TO SPAWNING, which is what
+ * makes this safe to land: a verb with no loadable form -- an account
+ * cataloged before mvx#248 -- or one that does not resolve at all behaves
+ * exactly as it did, including how the failure is reported. */
+
+#ifdef __APPLE__
+#define MVX_LIB_SUFFIX ".dylib"
+#else
+#define MVX_LIB_SUFFIX ".so"
+#endif
+
+/* The program at `path`, if there is a loadable one.  Resolved the way the
+   whole system resolves it: the platform's library suffix first, then the
+   plain path, which on macOS is the executable and is also loadable. */
+static mvx_program_fn exec_load(const char *path) {
+    char p[4200];
+    snprintf(p, sizeof p, "%s%s", path, MVX_LIB_SUFFIX);
+    void *h = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) return NULL;
+    return (mvx_program_fn)dlsym(h, "mvx_main");
+}
+
+/* Run it with stdout going somewhere we can read back.  A TEMPORARY FILE and
+   not a pipe: nothing is draining the other end while the program runs, so a
+   pipe deadlocks the moment the program writes more than its buffer holds --
+   which for a report verb is the ordinary case, not the edge. */
+static int64_t exec_capture(mvx_ctx *ctx, mvx_program_fn fn, const char *sent,
+                            mv_value *capture, int *aborted) {
+    FILE *tmp = tmpfile();
+    if (!tmp)                                        /* capture nothing */
+        return aborted ? mvx_level_run_at_prompt(ctx, fn, sent, aborted)
+                       : mvx_level_run(ctx, fn, sent);
+    fflush(stdout);
+    int saved = dup(1);
+    dup2(fileno(tmp), 1);
+
+    int64_t st = aborted ? mvx_level_run_at_prompt(ctx, fn, sent, aborted)
+                         : mvx_level_run(ctx, fn, sent);
+
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+
+    long n = ftell(tmp);
+    rewind(tmp);
+    char *buf = n > 0 ? malloc((size_t)n) : NULL;
+    size_t got = (buf && n > 0) ? fread(buf, 1, (size_t)n, tmp) : 0;
+    fclose(tmp);
+    while (got > 0 && buf[got - 1] == '\n') got--;
+    for (size_t i = 0; i < got; i++)
+        if (buf[i] == '\n') buf[i] = AM;
+    mv_set_str(capture, buf ? buf : "", (int64_t)got);
+    free(buf);
+    return st;
+}
+
+/* EXECUTE ... ON ERROR (mvx#256).
+ *
+ * An ABORT or a runtime fault in a program reached by EXECUTE takes its
+ * caller with it.  That is UniData's behaviour and it is right for ordinary
+ * code -- a program whose work has just failed half way through should not
+ * carry on as though it had not.
+ *
+ * A SHELL is the exception.  A login and menu written in BASIC, which is what
+ * a site replaces TCL with, has to survive the option it just ran: an abort
+ * there means "that screen gave up", not "log the operator out".  On UniData
+ * the abort is caught by TCL, so a site that removes TCL loses the only thing
+ * that was catching one.
+ *
+ * So a caller can say it will handle it, and only then does the abort stop.
+ * Everything without the clause is unchanged. */
+static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
+                            mv_value *capture, mv_value *rc, int *aborted);
+
 int64_t mvx_execute(mvx_ctx *ctx, const mv_value *sentence,
                     mv_value *capture, mv_value *rc) {
-    (void)ctx;
+    return execute_core(ctx, sentence, capture, rc, NULL);
+}
+
+/* The same, but an abort in the program it runs comes back here instead of
+   passing through: *aborted says so, and the caller's ON ERROR body runs. */
+int64_t mvx_execute_trapping(mvx_ctx *ctx, const mv_value *sentence,
+                             mv_value *capture, mv_value *rc, int *aborted) {
+    if (aborted) *aborted = 0;
+    return execute_core(ctx, sentence, capture, rc, aborted);
+}
+
+static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
+                            mv_value *capture, mv_value *rc, int *aborted) {
     char nb[40];
     const char *sp;
     int64_t sl = mv_val_chars(sentence, nb, sizeof nb, &sp);
 
-    char tcl[4096], sent[4096];
-    snprintf(tcl, sizeof tcl, "%s/mvx", bin_dir());
+    char sent[4096];
     snprintf(sent, sizeof sent, "%.*s", (int)sl, sp);
 
+    /* A raw Unix command is the runtime's own gate, not a verb: it has never
+       gone through VOC and must not start doing so. */
+    if (sent[0] == '!') {
+        int64_t st = mvx_unix_cmd(ctx, sent + 1);
+        if (rc) mv_set_int(rc, st);
+        return st == 0;
+    }
+
+    /* The verb is the first word. */
+    char verb[256];
+    size_t vi = 0;
+    const char *q = sent;
+    while (*q == ' ' || *q == '\t') q++;
+    while (*q && *q != ' ' && *q != '\t' && vi + 1 < sizeof verb)
+        verb[vi++] = *q++;
+    verb[vi] = '\0';
+
+    /* LOGTO IS THE RUNTIME'S, NOT A VERB (mvx#258).  It changes the account
+       this process is in, so a separate program cannot do it -- and that is
+       exactly what used to happen: no VOC entry meant the fallback below
+       spawned `mvx -c "LOGTO ..."`, a CHILD moved and exited, and the caller
+       stayed where it was without a word.  UniData and UniVerse both move the
+       calling program (measured), and this is the spelling ported code uses,
+       so it goes to the same place the intrinsic does. */
+    if (vi > 0 && strcasecmp(verb, "LOGTO") == 0) {
+        const char *arg = q;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        int64_t ok = mvx_logto(ctx, arg);
+        if (rc) mv_set_int(rc, ok ? 0 : 2);
+        return ok;
+    }
+
+    char path[2048];
+    mvx_program_fn fn = NULL;
+    if (vi > 0 && mvx_voc_lookup(ctx, verb, path, sizeof path) == 1)
+        fn = exec_load(path);
+
+    /* A PARAGRAPH IS A VERB WITH NO PROGRAM BEHIND IT (mvx#269).  Looked for
+       only once the `V' lookup has failed, so a cataloged program still wins
+       -- and before the spawn below, which would hand the sentence to a child
+       that cannot resolve it either. */
+    if (!fn && vi > 0 && mvx_voc_exec(ctx, verb, sent, 0)) {
+        if (rc) mv_set_int(rc, 0);
+        return 1;
+    }
+
+    if (fn) {
+        int64_t st = capture ? exec_capture(ctx, fn, sent, capture, aborted)
+                             : (aborted ? mvx_level_run_at_prompt(ctx, fn, sent,
+                                                                  aborted)
+                                        : mvx_level_run(ctx, fn, sent));
+        if (rc) mv_set_int(rc, st);
+        return st == 0 && !(aborted && *aborted);
+    }
+
+    /* Nothing loadable: the old way, unchanged. */
+    char tcl[4096];
+    snprintf(tcl, sizeof tcl, "%s/mvx", bin_dir());
     char *argv[5];
     argv[0] = tcl;
     argv[1] = "-c";

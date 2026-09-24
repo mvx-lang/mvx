@@ -61,9 +61,18 @@ const mvx_ext *mvx_ext_entry(int abi);
    is loaded, so a package cannot shadow a built-in name. */
 const mvx_ext *mvx_json_builtin(void);  /* JSONENCODE / JSONDECODE */
 const mvx_ext *mvx_msg_builtin(void);   /* MSGWHO / MSGSTATUS (mvx#226) */
+const mvx_ext *mvx_logto_builtin(void); /* LOGTO (mvx#258) */
 
 /* Runtime side (mvx_ext.c), linked into libmvxrt. */
 void mvx_ext_load_libs(void);           /* dlopen package LIB/ libs (shared with CALL) */
+/* Forget which libraries the scan has seen, so the next one walks the new
+   account's chain (mvx#258).  Nothing is unloaded -- a library already open
+   may have pointers into it -- so this makes the scan repeat, not undo. */
+void mvx_ext_reset_libs(void);
+/* How many loaded libraries define `sym', with the file whose definition is in
+   use and one that is shadowed.  For reporting a subroutine two packages both
+   claim (mvx#266). */
+int  mvx_ext_providers(const char *sym, const char **winner, const char **other);
 int  mvx_ext_has(const char *name);     /* is `name` a registered extension function? */
 void mvx_ext_invoke(mvx_ctx *ctx, const char *name, mv_value *ret,
                     int32_t argc, mv_value **argv);   /* fatal on unknown / bad arity */

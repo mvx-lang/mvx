@@ -31,6 +31,7 @@ static const std::unordered_map<std::string, Tok> kKeywords = {
     {"LOCATE", Tok::KwLocate}, {"INPUT", Tok::KwInput}, {"MAT", Tok::KwMat},
     {"COMMON", Tok::KwCommon}, {"COM", Tok::KwCommon},
     {"OPEN", Tok::KwOpen},     {"READ", Tok::KwRead},
+    {"CLOSE", Tok::KwClose},
     {"READU", Tok::KwReadu},   {"WRITE", Tok::KwWrite},
     {"WRITEU", Tok::KwWriteu}, {"DELETE", Tok::KwDelete},
     {"READV", Tok::KwReadv},   {"READVU", Tok::KwReadvu},
@@ -99,8 +100,38 @@ std::vector<Token> lex(const std::string &src, const std::string &item) {
             }
             std::string text = src.substr(start, i - start);
             Token t{isFloat ? Tok::FltLit : Tok::IntLit, line, text, 0, 0.0};
-            if (isFloat) t.fval = std::stod(text);
-            else         t.ival = std::stoll(text);
+            /* A LITERAL TOO BIG TO HOLD IS A SOURCE ERROR, NOT A CRASH
+               (mvx#241).  Both of these throw std::out_of_range on overflow
+               and nothing caught it, so `X = 9223372036854775808' aborted the
+               compiler with an uncaught C++ exception and named neither the
+               file nor the line -- the one input that could not be diagnosed
+               from the diagnostic.
+Measured on the systems that have an opinion, and they do not agree: UniData
+               8.3 accepts it and is EXACT (`99999999999999999999 + 1' prints
+               all 21 digits, so it is decimal and far wider than a double);
+               UniVerse 14.2.1 accepts it and silently rounds to a double
+               (`-9223372036854775808' prints as -9223372036854780000);
+               ScarletDME refuses to compile it.
+               MVX reports it, which is ScarletDME's answer.  UniData's needs
+               arbitrary precision the numeric tier does not have (documented
+               exact to 2^53), and UniVerse's is a silent wrong answer, which
+               is the one outcome worth avoiding: a literal that cannot be
+               held should say so rather than quietly become a different
+               number. */
+            try {
+                if (isFloat) t.fval = std::stod(text);
+                else         t.ival = std::stoll(text);
+            } catch (const std::out_of_range &) {
+                /* Show enough of it to find on the line, not all of it: a
+                   400-digit float literal quoted in full buries the message
+                   it is attached to. */
+                std::string shown = text.size() > 24
+                    ? text.substr(0, 24) + "..." : text;
+                throw CompileError(item, line,
+                    "numeric literal out of range: " + shown +
+                    (isFloat ? "" :
+                     " (the largest is 9223372036854775807)"));
+            }
             out.push_back(t);
             atStmtStart = false;
             continue;

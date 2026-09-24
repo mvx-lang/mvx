@@ -60,6 +60,83 @@ typedef struct mvx_ctx  mvx_ctx;
 /* --- context ----------------------------------------------------------- */
 mvx_ctx *mvx_ctx_create(void);
 void     mvx_ctx_destroy(mvx_ctx *ctx);
+/* ENVIRONMENT LEVELS (mvx#248).  A level is one running program.  It shares
+   the session -- open files, locks, the select list, the transaction, and the
+   terminal's print column -- with the program that started it, and has its
+   own unnamed COMMON, STATUS and sentence.  COMMON /NAME/ spans levels;
+   COMMON with no name does not.  This is what an in-process EXECUTE pushes;
+   a CALL pushes nothing, because a subroutine runs inside its caller. */
+mvx_ctx *mvx_level_push(mvx_ctx *parent, const char *sentence);
+void     mvx_level_pop(mvx_ctx *level);
+/* The entry point every compiled main program exports. */
+typedef void (*mvx_program_fn)(mvx_ctx *);
+/* Run one at a new level and catch how it ended: 0 for falling off the end,
+   else what STOP asked for.  An ABORT or a runtime fault is NOT caught here
+   -- it passes through and settles at the next catcher, ending the process if
+   there is none, which is what UniData does.  STOP returns to the caller;
+   ABORT takes the caller with it. */
+int64_t  mvx_level_run(mvx_ctx *parent, mvx_program_fn entry,
+                       const char *sentence);
+/* The same, but an ABORT stops HERE rather than passing through.  An abort
+   takes a calling PROGRAM with it and does not pass the prompt: on UniData
+   an ABORT in a verb returns you to TCL, it does not log you out.  *aborted
+   says which way it ended. */
+int64_t  mvx_level_run_at_prompt(mvx_ctx *parent, mvx_program_fn entry,
+                                 const char *sentence, int *aborted);
+/* End the running program from anywhere: STOP, ABORT and the fatal path all
+   come through here.  aborting = 0 stops at the level that ran this program,
+   1 passes through it. */
+void     mvx_level_end(int64_t code, int aborting) __attribute__((noreturn));
+/* Resolve a verb to the cataloged program that is it: the account's VOC
+   first, then each linked package in PACKAGES order, then the system
+   account -- the same three-tier walk the runtime does for subroutines.
+   1 found, 0 no such verb, -1 no VOC at all to ask.  It lives here rather
+   than in the shell because a compiled program can EXECUTE with no shell
+   above it (mvx#248). */
+int      mvx_voc_lookup(mvx_ctx *ctx, const char *verb, char *path,
+                        size_t cap);
+/* Forget the cached resolution chain: anything that changes account must,
+   or verbs keep resolving against the one just left. */
+void     mvx_voc_reset(void);
+/* The account's own VOC only, with nothing behind it -- for LOGIN (mvx#264),
+   which must not be inherited from a package or the system account. */
+int      mvx_voc_lookup_local(mvx_ctx *ctx, const char *verb, char *path,
+                              size_t cap);
+/* Run the account's VOC LOGIN, if it has one.  Called on entering an
+   account: `mvx` startup, and every LOGTO. */
+void     mvx_login_run(mvx_ctx *ctx);
+/* The raw VOC record for an id; `local_only' asks the account's own VOC and
+   nothing behind it.  1 found, 0 not (mvx#269). */
+int      mvx_voc_record(mvx_ctx *ctx, const char *id, mv_value *rec,
+                        int local_only);
+/* Run `verb' when its VOC record is one the runtime executes itself: a
+   paragraph (PA, mvx#269) or a PROC (PQ/PQN, mvx#271).  `sentence' is what
+   invoked it -- a PROC takes its arguments from it.  1 handled, 0 not ours. */
+int      mvx_voc_exec(mvx_ctx *ctx, const char *verb, const char *sentence,
+                      int local_only);
+/* The PROC interpreter (mvx_proc.c), called by the above. */
+void     mvx_proc_exec(mvx_ctx *ctx, const char *name, const mv_value *rec,
+                       const char *sentence);
+/* Leave the current account: close its files, drop its locks, and release the
+   connections they were on, so a session that moves between accounts stops
+   accumulating them (mvx#251).  Refused, returning 0, while a transaction is
+   open -- it belongs to a connection in the account being left, so the
+   program has to commit it or ABORT first.  Every file variable opened before
+   this says so rather than reading freed memory. */
+int64_t  mvx_store_leave(mvx_ctx *ctx);
+/* Change account (mvx#258): leave this one, enter `acct`, and forget
+   everything resolved per account.  Returns 1 when the session moved and 0
+   when it did not, with the reason in STATUS() -- 1 the account cannot be
+   entered, 2 a transaction is open.  The program CONTINUES either way, which
+   is what UniData and UniVerse both do; re-opening what it needs is its own
+   business, since the handles it held belonged to the account just left. */
+int64_t  mvx_logto(mvx_ctx *ctx, const char *acct);
+/* CLOSE fvar -- release one open file, and the connection under it when it
+   was the last one on that location.  Without this a file opened stays open
+   for the life of the session (mvx#251).  The variable stops being a file
+   variable, so using it afterwards says so rather than reading a gone
+   handle. */
+void     mvx_close(mvx_ctx *ctx, mv_value *fvar);
 
 /* Directory of the loaded libmvxrt; the anchor for relocatable installs
    (drivers beside it, ../bin, ../share/mvx/system).  "" if unknown. */
@@ -175,6 +252,13 @@ int64_t mvx_iso_date_intern(const char *in, int64_t len, char *out, size_t cap);
 int64_t mvx_iso_time_intern(const char *in, int64_t len, char *out, size_t cap);
 void    mv_fmt(mv_value *dst, const mv_value *src, const mv_value *mask);
 int64_t mvx_status(mvx_ctx *ctx);
+void    mvx_ctx_set_status(mvx_ctx *ctx, int64_t s);
+/* @LEVEL: how many programs are above this one -- 0 from the prompt or
+   straight from Unix, 1 for one an EXECUTE reached (mvx#270). */
+int64_t mvx_level(mvx_ctx *ctx);
+/* The shell marks its own context as not-a-program (-1), so the first verb it
+   runs answers 0 the way UniData and UniVerse do. */
+void    mvx_ctx_set_base_level(mvx_ctx *ctx, int64_t d);
 
 /* --- COMMON blocks ------------------------------------------------------ */
 mv_value *mvx_common_scalar(mvx_ctx *ctx, const char *block, int64_t idx);
@@ -358,7 +442,13 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
                          const mv_value *src, const mv_value *out,
                          const mv_value *opts); /* developer */
 int64_t mvx_execute(mvx_ctx *ctx, const mv_value *sentence,
-                    mv_value *capture, mv_value *rc);   /* any tier */
+                    mv_value *capture, mv_value *rc);
+/* EXECUTE ... ON ERROR (mvx#256): the same, but an ABORT or a fault in the
+   program it runs is CAUGHT here rather than taking this program too.  A
+   shell written in BASIC needs it -- an option that gives up must not log the
+   operator out -- and nothing else should use it. */
+int64_t mvx_execute_trapping(mvx_ctx *ctx, const mv_value *sentence,
+                             mv_value *capture, mv_value *rc, int *aborted);   /* any tier */
 int64_t mvx_editfile(mvx_ctx *ctx, const mv_value *path); /* unrestricted */
 void    mvx_tmpnam(mv_value *dst);
 
@@ -416,6 +506,18 @@ const char *mvx_id_csname(int cs);
 int64_t mvx_id_encode(const char *id, int64_t idlen, int cs, char *out,
                       size_t cap);
 int64_t mvx_id_decode(const char *txt, int64_t txtlen, char *out, size_t cap);
+
+/* --- Language transactions (see mvx_store.c, mvx#247) ------------------
+   Several writes bracketed so they commit or roll back as one unit.  Start
+   and commit answer whether they worked, so the statement's THEN/ELSE has
+   something to test; abort has no answer, which is why UniData and UniVerse
+   both refuse a clause on it.  The transaction is scoped to a CONNECTION,
+   not to a program: the first write inside one enrols a (driver, location)
+   and a write to any other is refused. */
+int64_t     mvx_txn_start(mvx_ctx *ctx);
+int64_t     mvx_txn_commit(mvx_ctx *ctx);
+void        mvx_txn_abort(mvx_ctx *ctx);
+int64_t     mvx_txn_depth(mvx_ctx *ctx);   /* @TRANSACTION */
 
 /* --- Sessions and messaging (see mvx_msg.c, mvx#226) -------------------
    The session registry lives in mvx-msgd; every call here degrades to a

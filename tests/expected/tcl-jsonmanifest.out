@@ -1,0 +1,9 @@
+--- links, and pulls the dependency that applies
+linked @TESTROOT@/jsonpkg
+linked @TESTROOT@/jdep
+--- name, version and systems all came from the JSON
+jsonpkg@VER broken @TESTROOT@/jsonpkg requires jdep, jopt [mvx udt]
+jdep@VER ok     @TESTROOT@/jdep 
+2 package(s) linked
+--- and a package with neither manifest is still refused
+@TESTROOT@/nomanifest is not a package (no PKG or mvpkg.json manifest)

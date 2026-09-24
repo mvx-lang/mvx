@@ -343,6 +343,43 @@ typedef struct mvx_driver {
        this to refuse MAP-MODE native rather than let the switch quietly
        shorten, or drop, a record (mvx#174). */
     int64_t (*map_text_cap)(mvx_file *f);
+
+    /* Which connection this file is talking to, as a value that CHANGES when
+       that connection is replaced, reset or lost (may be NULL, meaning there
+       is no connection to lose -- the local backends).
+       
+       A TRANSACTION IS BOUND TO A CONNECTION, and the backend can take that
+       connection away without telling anybody.  MySQL reconnects silently
+       when an idle session outlives wait_timeout: the server rolls the open
+       transaction back, later writes autocommit one at a time, and COMMIT
+       succeeds against a connection that has no transaction on it -- so the
+       program is told its work committed when half of it was discarded.  An
+       MV session idles across user think-time for far longer than
+       wait_timeout, and the transaction pattern this serves is the one that
+       stays open longest, so this is ordinary operation rather than a fault.
+       
+       The runtime samples it when a transaction enrols the connection and
+       again before committing.  A change means the transaction that was open
+       is gone, however the backend arranged that, and the commit must not be
+       allowed to report success.
+       
+       Nothing backend-specific crosses the contract: the driver reports
+       identity, the runtime owns what to do about it.  Return 0 for "no
+       usable connection", which differs from any live one. */
+    uint64_t (*conn_epoch)(mvx_file *f);
+
+    /* Release any connection held for `loc` (may be NULL: nothing is held).
+       
+       A SESSION MOVES BETWEEN ACCOUNTS and nothing released what it left.
+       Every connection-holding driver caches by location with a small fixed
+       cap and no eviction, so a session that logged to nine accounts, each
+       with its own database, met "too many open databases" at the ninth and
+       could not open anything else for the rest of its life (mvx#251).
+       
+       Called when a session stops using a location -- a LOGTO away from the
+       account that named it, or the session ending.  The runtime closes that
+       location's files first, so a driver may assume none are open on it. */
+    void (*release_conn)(const char *loc);
 } mvx_driver;
 
 /* map_backfill sentinel: the transform is not expressible in this backend, so
@@ -385,7 +422,7 @@ typedef struct mvx_file_base {
  * has no note either. */
 #define MVX_FILE_FORMAT 3
 
-#define MVX_DRIVER_ABI 14
+#define MVX_DRIVER_ABI 16
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

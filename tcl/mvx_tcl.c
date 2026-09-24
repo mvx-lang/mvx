@@ -36,6 +36,7 @@
 #include "mvx_driver.h"
 
 #include <ctype.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +153,9 @@ static void account_refresh(void) {
     setenv("MVXACCTPATH", g_acct_path, 1);
 }
 
+/* Open a file by spec into `voc`.  The shell keeps this because it opens the
+   account's VOC for its OWN purposes -- `.C` macros live there, and `.X` can
+   name any file -- which is a shell concern and not resolution. */
 static int voc_open(mv_value *voc, const char *spec) {
     mv_value s;
     mv_init(&s);
@@ -162,116 +166,16 @@ static int voc_open(mv_value *voc, const char *spec) {
     return ok;
 }
 
-/* Read a V-record from the given VOC; path receives attribute 2. */
-static int voc_read(mv_value *voc, const char *verb, char *path,
-                    size_t cap) {
-    mv_value id, rec, a1, a2;
-    mv_init(&id); mv_init(&rec); mv_init(&a1); mv_init(&a2);
-    mv_set_str(&id, verb, (int64_t)strlen(verb));
-    int found = 0;
-    if (mvx_read(g_ctx, &rec, voc, &id, 0)) {
-        mv_extract_fn(&a1, &rec, 1, 0, 0);
-        mv_extract_fn(&a2, &rec, 2, 0, 0);
-        char nb[40];
-        const char *p;
-        int64_t n = mv_val_chars(&a1, nb, sizeof nb, &p);
-        if (n >= 1 && (p[0] == 'V' || p[0] == 'v')) {
-            n = mv_val_chars(&a2, nb, sizeof nb, &p);
-            if (n > 0 && (size_t)n < cap) {
-                memcpy(path, p, (size_t)n);
-                path[n] = '\0';
-                found = 1;
-            }
-        }
-    }
-    mv_clear(&id); mv_clear(&rec); mv_clear(&a1); mv_clear(&a2);
-    return found;
-}
+static mv_value g_voc;
+static int g_voc_state;
 
-/* Linked packages: the account's PACKAGES record (one path per line,
-   maintained by LINK-PKG / UNLINK-PKG) names package directories whose
-   VOCs join the resolution chain.  Reloaded when the file changes, so
-   a LINK-PKG takes effect in the same session. */
-#define MAX_PKGS 16
-static char g_pkgs[MAX_PKGS][1024];
-static mv_value g_pkgvoc[MAX_PKGS];
-static int g_pkgvoc_state[MAX_PKGS];
-static int g_npkgs;
-static long long g_pkg_stamp = -1;
-
-static void pkgs_reload(void) {
-    struct stat sb;
-    long long mt = 0;
-    if (stat("PACKAGES", &sb) == 0) {
-        /* Nanosecond stamp + size: whole-second mtime misses a LINK-PKG
-           landing in the same second as the previous reload. */
-#ifdef __APPLE__
-        mt = (long long)sb.st_mtimespec.tv_sec * 1000000000LL +
-             sb.st_mtimespec.tv_nsec + sb.st_size;
-#else
-        mt = (long long)sb.st_mtim.tv_sec * 1000000000LL +
-             sb.st_mtim.tv_nsec + sb.st_size;
-#endif
-    }
-    if (mt == g_pkg_stamp) return;
-    g_pkg_stamp = mt;
-    for (int i = 0; i < g_npkgs; i++)
-        if (g_pkgvoc_state[i] > 0) mv_clear(&g_pkgvoc[i]);
-    g_npkgs = 0;
-    FILE *fp = fopen("PACKAGES", "r");
-    if (!fp) return;
-    char ln[1024];
-    while (fgets(ln, sizeof ln, fp) && g_npkgs < MAX_PKGS) {
-        size_t n = strlen(ln);
-        while (n && (ln[n - 1] == '\n' || ln[n - 1] == '\r' ||
-                     ln[n - 1] == ' '))
-            ln[--n] = '\0';
-        if (n == 0) continue;
-        snprintf(g_pkgs[g_npkgs], sizeof g_pkgs[0], "%s", ln);
-        g_pkgvoc_state[g_npkgs] = 0;
-        g_npkgs++;
-    }
-    fclose(fp);
-}
-
-/* Resolution: account VOC (local overrides), then linked packages in
-   listed order, then the system account's master VOC.  Foreign verbs
-   execute by path from their own CATALOG but run in the user's
-   account (cwd). */
+/* RESOLUTION IS THE RUNTIME'S (mvx_voc_lookup, mvx#248).  It used to live
+   here, and had to move when EXECUTE stopped spawning a shell to do it: a
+   compiled program can EXECUTE with nothing above it, so the runtime has to
+   be able to resolve a verb by itself, or EXECUTE would work under `mvx` and
+   nowhere else.  One implementation, two callers. */
 static int voc_lookup(const char *verb, char *path, size_t cap) {
-    if (g_voc_state == 0) g_voc_state = voc_open(&g_voc, "VOC");
-    if (g_voc_state > 0 && voc_read(&g_voc, verb, path, cap))
-        return 1;
-
-    pkgs_reload();
-    for (int i = 0; i < g_npkgs; i++) {
-        if (g_pkgvoc_state[i] == 0) {
-            char pv[1152];
-            snprintf(pv, sizeof pv, "%s/VOC", g_pkgs[i]);
-            g_pkgvoc_state[i] = voc_open(&g_pkgvoc[i], pv);
-        }
-        if (g_pkgvoc_state[i] > 0) {
-            char rel[1024];
-            if (voc_read(&g_pkgvoc[i], verb, rel, sizeof rel)) {
-                snprintf(path, cap, "%s/%s", g_pkgs[i], rel);
-                return 1;
-            }
-        }
-    }
-
-    if (g_sysvoc_state == 0) {
-        char sysvoc[4096];
-        snprintf(sysvoc, sizeof sysvoc, "%s/VOC", system_dir());
-        g_sysvoc_state = voc_open(&g_sysvoc, sysvoc);
-    }
-    if (g_sysvoc_state > 0) {
-        char rel[1024];
-        if (voc_read(&g_sysvoc, verb, rel, sizeof rel)) {
-            snprintf(path, cap, "%s/%s", system_dir(), rel);
-            return 1;
-        }
-    }
-    return (g_voc_state < 0 && g_sysvoc_state < 0) ? -1 : 0;
+    return mvx_voc_lookup(g_ctx, verb, path, cap);
 }
 
 /* Run a cataloged verb and return its process exit status, so a verb (e.g.
@@ -289,7 +193,44 @@ static int voc_lookup(const char *verb, char *path, size_t cap) {
  * Costs nothing when no registry is running: mvx_msg_pending() answers -1
  * without talking to anything. */
 
+/* RUN A VERB IN THIS PROCESS (mvx#248).
+ *
+ * The prompt used to fork and exec, which made every verb a stranger to the
+ * session it was typed into: it reopened every file, took its own locks, and
+ * could only be handed the select list sideways through a file.  A
+ * TRANSACTION typed at the prompt could not span two verbs at all, because
+ * the second one was a different process with a different store.
+ *
+ * Now the verb runs at a LEVEL on the session: its own unnamed COMMON, STATUS
+ * and sentence, sharing everything the session owns.  So a select list simply
+ * persists, a transaction spans as many verbs as it takes to finish, and a
+ * program that opened files into COMMON has them still open for the next verb
+ * -- which is how MV sites have always been laid out.
+ *
+ * THE ABORT STOPS HERE.  A fault takes a calling PROGRAM with it, but not the
+ * prompt: on UniData an ABORT in a verb returns you to TCL rather than
+ * logging you out, so this level catches one instead of passing it on.
+ * Without that, every ABORT and every runtime fault would end the session.
+ *
+ * A verb with no loadable form -- any account cataloged before mvx#248 --
+ * still forks and execs, exactly as before. */
 static int run_verb(const char *path, const char *line) {
+#ifdef __APPLE__
+    static const char *libsfx = ".dylib";
+#else
+    static const char *libsfx = ".so";
+#endif
+    char lp[4200];
+    snprintf(lp, sizeof lp, "%s%s", path, libsfx);
+    void *h = dlopen(lp, RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    mvx_program_fn fn = h ? (mvx_program_fn)dlsym(h, "mvx_main") : NULL;
+    if (fn) {
+        int aborted = 0;
+        int64_t rc = mvx_level_run_at_prompt(g_ctx, fn, line, &aborted);
+        return (int)rc;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         perror("mvx: fork");
@@ -1032,19 +973,16 @@ static int command(char *line) {
             fprintf(stderr, "usage: LOGTO account-directory\n");
             return 2;
         }
-        if (chdir(arg) != 0) {
-            fprintf(stderr, "LOGTO: cannot enter account %s\n", arg);
-            return 2;
-        }
+        /* THE RUNTIME OWNS THE MOVE (mvx#258).  It has to: a BASIC shell that
+           replaces this one calls LOGTO() and an EXECUTE "LOGTO ..." from a
+           program reaches the same entry point, so a copy here would be a
+           second implementation of the hard part -- letting the old account
+           go before entering the new one, and forgetting everything resolved
+           per account.  What is left is the shell's own: its VOC handle for
+           macros, and telling the operator where they now are. */
+        if (!mvx_logto(g_ctx, arg)) return 2;   /* which runs its LOGIN */
         account_refresh();
-        g_voc_state = 0;                /* re-resolve in the new account */
-        g_pkg_stamp = -1;
-        g_npkgs = 0;
-        const char *sess = getenv("MVXSESSION");
-        if (sess && sess[0]) {          /* select lists don't cross LOGTO */
-            FILE *fp = fopen(sess, "wb");
-            if (fp) fclose(fp);
-        }
+        g_voc_state = 0;                /* the shell's own VOC, for .C macros */
         printf("now in account %s (%s)\n", g_acct_base, g_acct_path);
         fflush(stdout);
         return 0;
@@ -1054,6 +992,12 @@ static int command(char *line) {
     int r = voc_lookup(verb, path, sizeof path);
     if (r > 0)
         return run_verb(path, line);
+
+    /* A PARAGRAPH IS TYPED LIKE A VERB (mvx#269) -- a VOC record with no
+       program behind it, so the lookup above cannot see one.  After the verb,
+       so a cataloged program still wins; before the macro below, which is a
+       different record type and cannot collide. */
+    if (mvx_voc_exec(g_ctx, verb, line, 0)) return 0;
 
     /* Not a verb -- but the same VOC name may be a macro, which is how a
        macro is activated in D3: you type its name.  D3 additionally makes
@@ -1186,6 +1130,11 @@ int main(int argc, char **argv) {
     }
 
     g_ctx = mvx_ctx_create();
+    /* THE PROMPT IS NOT A PROGRAM (mvx#270).  Every verb the shell runs is
+       pushed as a level, so without this the first one typed would answer
+       @LEVEL = 1 where UniData and UniVerse both answer 0 -- and every
+       `IF @LEVEL THEN' ported from them would fire when it must not. */
+    mvx_ctx_set_base_level(g_ctx, -1);
     account_refresh();
 
     /* Register with the session registry, if one is running (mvx#226).  This
@@ -1210,6 +1159,12 @@ int main(int argc, char **argv) {
     if (!has_descriptor() && has_markers())
         write_descriptor(g_acct_base);
     voc_backend_settle();     /* and say which backend holds its VOC (#187) */
+
+    /* THE ACCOUNT SETS ITSELF UP (mvx#264).  Entering an account runs its own
+       VOC LOGIN, which is what UniData and UniVerse both do -- here and in
+       mvx_logto, the two places a session enters one. Before the stack loads
+       and before any -c command, so a LOGIN can prepare what they use. */
+    mvx_login_run(g_ctx);
 
     /* Resolve and load the stack before anything runs.  Not gated on a
        terminal: .L and .X have to work down a pipe too, or the feature is
@@ -1301,6 +1256,7 @@ int main(int argc, char **argv) {
                prompt in turn so it can be edited before it goes, which is
                what the M type is for (#177). */
             drain_messages();
+            account_refresh();   /* a verb may have LOGTO'd (mvx#258) */
             int pushed = 0;
             if (g_mqi < g_mqn) { el_push(g_el, g_mqueue[g_mqi++]); pushed = 1; }
             else if (g_mqn) { for (int i = 0; i < g_mqn; i++) free(g_mqueue[i]);
@@ -1328,6 +1284,7 @@ int main(int argc, char **argv) {
 #else
         if (tty) {
             drain_messages();
+            account_refresh();   /* a verb may have LOGTO'd (mvx#258) */
             printf("%s> ", g_acct_base);
             fflush(stdout);
         }

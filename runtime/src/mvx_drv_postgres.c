@@ -2098,6 +2098,29 @@ static int pg_migrate_docs(const char *loc, char *err, size_t errlen) {
     return done;
 }
 
+/* WHICH CONNECTION THIS IS (mvx#253).  PQbackendPID is the server-side
+   process serving this session, so it changes if the connection is ever
+   replaced -- and a connection that has DIED reads 0 here, which differs from
+   every live one and is the case that matters today: PQstatus is checked when
+   connecting and never again, so a connection dropped under an open
+   transaction is currently noticed by nothing.  Postgres does not idle out a
+   session by default, but a pooler in front of it will. */
+static uint64_t pg_conn_epoch(mvx_file *fh) {
+    PGconn *c = ((pg_file *)fh)->conn;
+    if (!c || PQstatus(c) != CONNECTION_OK) return 0;
+    return (uint64_t)PQbackendPID(c);
+}
+
+/* Release the connection held for this location (mvx#251). */
+static void pg_release_conn(const char *loc) {
+    for (int i = 0; i < g_nconns; i++) {
+        if (strcmp(g_conns[i].loc, loc) != 0) continue;
+        if (g_conns[i].conn) PQfinish(g_conns[i].conn);
+        g_conns[i] = g_conns[--g_nconns];
+        return;
+    }
+}
+
 static const mvx_driver mvx_driver_postgres = {
     "postgres",
     pg_open, pg_close,
@@ -2127,6 +2150,9 @@ static const mvx_driver mvx_driver_postgres = {
     pg_select_join_order,                 /* co-located TRANS() ORDER BY */
     pg_rollback,                          /* abort a failed logical write */
     pg_migrate_docs,                      /* pre-#157 blob -> document */
+    NULL,                                 /* map_text_cap: no bound here */
+    pg_conn_epoch,                        /* which connection, for mvx#253 */
+    pg_release_conn,                      /* let a left account go (mvx#251) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {
