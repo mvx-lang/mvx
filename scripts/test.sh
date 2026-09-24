@@ -609,6 +609,48 @@ EOF
   "$MVX" "$httpsrc" -o "$TESTROOT/httpbin" 2>/dev/null
   check tcl-http "$("$TESTROOT/httpbin"; echo "downloaded: [$(cat "$HDL" 2>/dev/null)]")"
   { kill "$HPID" && wait "$HPID"; } 2>/dev/null
+
+  # HTTPPOST (#286).  The name used to live ONLY in the mvx-lang/curl package,
+  # so it existed on a machine that had installed curl and nowhere else -- and a
+  # plain checkout could not compile mv_package, whose MVPKG.TRACK calls it on
+  # the stated rule that the thing reporting an install must not depend on the
+  # install having happened.  Asserting the round trip, not just the symbol:
+  # a bodyless server would answer 501 and a status check alone would not care.
+  #
+  # python3 -m http.server refuses POST, so this one echoes what it received --
+  # which is what makes the body and the Content-Type observable.
+  POSTSRV="$TESTROOT/postsrv.py"
+  cat > "$POSTSRV" <<'PYEOF'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(n)
+        out = b'type=' + (self.headers.get('Content-Type') or '').encode() + \
+              b' len=' + str(n).encode() + b' body=' + body
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *a): pass
+HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+PYEOF
+  PPORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  python3 "$POSTSRV" "$PPORT" >/dev/null 2>&1 &
+  PPID_=$!
+  sleep 1
+  PDL="$TESTROOT/post.dl"
+  postsrc="$TESTROOT/post.b"
+  cat > "$postsrc" <<EOF
+S = HTTPPOST("http://127.0.0.1:$PPORT/installs/x", "application/json", '{"a":1}', "$PDL")
+PRINT "post status=":S
+* a connect error is -1, the same as the other two report it
+PRINT "unreachable=":HTTPPOST("http://127.0.0.1:1/x", "text/plain", "hi", "$PDL.no")
+EOF
+  "$MVX" "$postsrc" -o "$TESTROOT/postbin" 2>/dev/null
+  check tcl-httppost "$("$TESTROOT/postbin"; echo "echoed: [$(cat "$PDL" 2>/dev/null)]")"
+  { kill "$PPID_" && wait "$PPID_"; } 2>/dev/null
 else
   echo "  (http test skipped — python3 not found)"
 fi
