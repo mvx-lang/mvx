@@ -5594,7 +5594,13 @@ if MVXPRIV=developer "$MVX" -shared "$DUP/shared2.b" \
      -o "$DUP/LIB/AAOTHER$dsfx" >/dev/null 2>&1; then
   d2="$(cd "$DUP" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/USER 2>&1)"
   case "$d2" in *"defined by more than one library"*) dnamed=1 ;; *) dnamed=0 ;; esac
-  case "$d2" in *"AAOTHER$dsfx"*"SHARED$dsfx"*) dboth=1 ;; *) dboth=0 ;; esac
+  # ORDER-INDEPENDENT ON PURPOSE.  Which of the two is named first is decided
+  # by readdir -- the very thing this feature exists to report -- so asserting
+  # a sequence would be a test that assumes what it is testing against.  It
+  # passed here and on one CI run by luck, then failed on the next.
+  dboth=0
+  if printf '%s\n' "$d2" | grep -q "AAOTHER$dsfx" \
+     && printf '%s\n' "$d2" | grep -q "SHARED$dsfx"; then dboth=1; fi
   case "$d2" in *"in use"*"shadowed"*) dwhich=1 ;; *) dwhich=0 ;; esac
   if [ "$dnamed" = 1 ] && [ "$dboth" = 1 ] && [ "$dwhich" = 1 ]; then
     PASS=$((PASS + 1))
