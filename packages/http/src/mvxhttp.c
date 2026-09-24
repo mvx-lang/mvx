@@ -12,16 +12,28 @@
 
 /* HTTP client as a language-extension package (#68), on the mvx_ext ABI.
  *
- * Adds two BASIC-callable functions — the transport the mv package manager
+ * Adds three BASIC-callable functions — the transport the mv package manager
  * uses on MVX to reach the registry and pull release tarballs:
  *   HTTPGET(url)          -> the response body (binary-safe; "" on error)
  *   HTTPGETFILE(url,path) -> the HTTP status (-1 connect error, -2 write
  *                            error), writing a 2xx body to `path`
+ *   HTTPPOST(url,type,body,path)
+ *                         -> the HTTP status, the same way, for a request
+ *                            that carries a body
  *
  * Plain HTTP/1.1 over POSIX sockets, so the package has no external
  * dependency and builds/loads everywhere the runtime does.  HTTPS (TLS) is a
  * follow-up.  HTTPGET composes with JSONDECODE (the json package) for registry
  * metadata.
+ *
+ * WHY POST IS HERE AND NOT ONLY IN curl (#286).  The mvx-lang/curl package
+ * supersedes this one where TLS is needed, and it published HTTPPOST while
+ * this package did not — so the NAME existed only once curl was installed, and
+ * a plain checkout could not compile a source that called it.  mv_package's
+ * MVPKG.TRACK is written on the stated rule that the thing reporting an install
+ * cannot depend on the install having happened; that rule was quietly broken on
+ * mvx.  The signature matches curl's published one exactly (4 args, status
+ * back), so the two remain interchangeable and superseding stays invisible.
  */
 #include "mvx_ext.h"
 
@@ -72,10 +84,15 @@ static int parse_url(const char *url, char *host, size_t hcap, char *port,
     return 0;
 }
 
-/* GET `url`.  On success returns 0, sets *status to the HTTP status code and
+/* Send `method` to `url`, with `body` (and its Content-Type) when there is
+   one.  On success returns 0, sets *status to the HTTP status code and
    out/blen to the malloc'd (binary-safe) response body.  Returns -1 on a URL,
-   DNS, connect, or I/O error. */
-static int http_get(const char *url, char **out, size_t *blen, int *status) {
+   DNS, connect, or I/O error.  The response is read the same way whatever the
+   method, so GET and POST differ only in the request line and those two
+   headers. */
+static int http_req(const char *method, const char *url, const char *ctype,
+                    const char *reqbody, size_t reqlen, char **out,
+                    size_t *blen, int *status) {
     *out = NULL;
     *blen = 0;
     *status = 0;
@@ -101,13 +118,35 @@ static int http_get(const char *url, char **out, size_t *blen, int *status) {
     if (fd < 0) return -1;
 
     char req[3072];
-    int rl = snprintf(req, sizeof req,
-                      "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: mvx-http/1.0"
-                      "\r\nAccept: */*\r\nConnection: close\r\n\r\n", path, host);
+    int rl;
+    if (reqbody) {
+        rl = snprintf(req, sizeof req,
+                      "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: mvx-http/1.0"
+                      "\r\nAccept: */*\r\nContent-Type: %s"
+                      "\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                      method, path, host, ctype ? ctype : "application/octet-stream",
+                      reqlen);
+    } else {
+        rl = snprintf(req, sizeof req,
+                      "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: mvx-http/1.0"
+                      "\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+                      method, path, host);
+    }
+    /* A header block that did not fit is a truncated request, which a server
+       answers in its own way -- so refuse it here rather than send half of
+       one. */
+    if (rl < 0 || (size_t)rl >= sizeof req) { close(fd); return -1; }
     for (int off = 0; off < rl;) {
         ssize_t w = send(fd, req + off, (size_t)(rl - off), 0);
         if (w <= 0) { close(fd); return -1; }
         off += (int)w;
+    }
+    /* THE BODY IS SENT SEPARATELY, not composed into req: it is caller data of
+       any length, and the header buffer is fixed. */
+    for (size_t off = 0; off < reqlen;) {
+        ssize_t w = send(fd, reqbody + off, reqlen - off, 0);
+        if (w <= 0) { close(fd); return -1; }
+        off += (size_t)w;
     }
 
     buf raw = {0, 0, 0};
@@ -183,13 +222,25 @@ static void ext_httpget(mvx_ctx *ctx, mv_value *ret, int32_t argc,
     char *body;
     size_t blen;
     int status;
-    if (http_get(url, &body, &blen, &status) == 0 && body &&
+    if (http_req("GET", url, NULL, NULL, 0, &body, &blen, &status) == 0 && body &&
         status >= 200 && status < 300) {
         mv_set_str(ret, body, (int64_t)blen);
     } else {
         mv_set_str(ret, "", 0);
     }
     free(body);
+}
+
+/* Write a 2xx body to `path`, answering -2 when it cannot be opened.  Shared
+   by HTTPGETFILE and HTTPPOST so both report a write failure the same way. */
+static int body_to_file(const char *path, const char *body, size_t blen,
+                        int status) {
+    if (status < 200 || status >= 300) return status;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -2;
+    if (blen) fwrite(body, 1, blen, f);
+    fclose(f);
+    return status;
 }
 
 /* HTTPGETFILE(url, path) -> HTTP status (-1 connect, -2 write); a 2xx body is
@@ -205,16 +256,40 @@ static void ext_httpgetfile(mvx_ctx *ctx, mv_value *ret, int32_t argc,
     size_t blen;
     int status;
     char num[16];
-    if (http_get(url, &body, &blen, &status) == 0) {
-        if (status >= 200 && status < 300) {
-            FILE *f = fopen(path, "wb");
-            if (f) {
-                if (blen) fwrite(body, 1, blen, f);
-                fclose(f);
-            } else {
-                status = -2;
-            }
-        }
+    if (http_req("GET", url, NULL, NULL, 0, &body, &blen, &status) == 0) {
+        status = body_to_file(path, body, blen, status);
+        free(body);
+        snprintf(num, sizeof num, "%d", status);
+    } else {
+        snprintf(num, sizeof num, "-1");
+    }
+    mv_set_str(ret, num, (int64_t)strlen(num));
+}
+
+/* HTTPPOST(url, content-type, body, path) -> HTTP status (-1 connect, -2
+   write); a 2xx body is written to `path`.  The signature mvx-lang/curl
+   publishes, so a caller cannot tell which of the two answered (#286).
+   The request body is taken with its own length, not as a C string, so a
+   payload holding a NUL still goes out whole. */
+static void ext_httppost(mvx_ctx *ctx, mv_value *ret, int32_t argc,
+                         mv_value **argv) {
+    (void)ctx;
+    (void)argc;
+    char url[2048], ctype[256], path[2048];
+    arg_str(argv[0], url, sizeof url);
+    arg_str(argv[1], ctype, sizeof ctype);
+    char nb[40];
+    const char *reqbody;
+    int64_t reqlen = mv_val_chars(argv[2], nb, sizeof nb, &reqbody);
+    if (reqlen < 0) reqlen = 0;
+    arg_str(argv[3], path, sizeof path);
+    char *body;
+    size_t blen;
+    int status;
+    char num[16];
+    if (http_req("POST", url, ctype, reqbody, (size_t)reqlen, &body, &blen,
+                 &status) == 0) {
+        status = body_to_file(path, body, blen, status);
         free(body);
         snprintf(num, sizeof num, "%d", status);
     } else {
@@ -226,8 +301,9 @@ static void ext_httpgetfile(mvx_ctx *ctx, mv_value *ret, int32_t argc,
 static const mvx_extfn http_fns[] = {
     {"HTTPGET", 1, 1, ext_httpget},
     {"HTTPGETFILE", 2, 2, ext_httpgetfile},
+    {"HTTPPOST", 4, 4, ext_httppost},
 };
-static const mvx_ext http_ext = {"http", 2, http_fns};
+static const mvx_ext http_ext = {"http", 3, http_fns};
 
 const mvx_ext *mvx_ext_entry(int abi) {
     return abi == MVX_EXT_ABI ? &http_ext : NULL;
