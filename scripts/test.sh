@@ -4325,11 +4325,14 @@ if command -v cc >/dev/null 2>&1; then
   "$ROOT/scripts/mkaccount.sh" "$CLA" >/dev/null 2>&1
   mkdir -p "$CLA/BP"
   printf 'PRINT "level=":@LEVEL\n' > "$CLA/BP/LVL"
-  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP LVL' >/dev/null 2>&1
+  printf 'SUBROUTINE DOUBLE.IT(IN, OUT)\nOUT = IN * 2\nRETURN\n' > "$CLA/BP/DOUBLE.IT"
+  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP LVL'       >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP DOUBLE.IT' >/dev/null 2>&1
   "$TCL" -a "$CLA" -c "CREATE-FILE PARTS" >/dev/null 2>&1
   cat > "$TESTROOT/client.c" <<'CLEOF'
 #include <mvxc.h>
 #include <stdio.h>
+#include <string.h>
 int main(int argc, char **argv) {
     mvxc_status st;
     mvxc_session *s = mvxc_connect(argv[1], &st);
@@ -4387,6 +4390,34 @@ int main(int argc, char **argv) {
 
     printf("delete=%d\n", mvxc_delete(f, "W1"));
     mvxc_close(f);
+
+    /* --- a real subroutine, in and out ------------------------------- */
+    printf("cataloged=%d %d\n", mvxc_cataloged(s, "DOUBLE.IT"),
+                                mvxc_cataloged(s, "NO.SUCH.SUB"));
+    mvxc_val *in = mvxc_new_str("21"), *out = mvxc_new();
+    mvxc_val *av[2]; av[0] = in; av[1] = out;
+    mvxc_status cs = mvxc_call(s, "DOUBLE.IT", 2, av);
+    printf("call=%d out=%s\n", cs, mvxc_str(out));
+    mvxc_free(in); mvxc_free(out);
+
+    /* --- file administration ------------------------------------------
+       The default hash type is the ACCOUNT'S (sqlite here, lmdb elsewhere),
+       so only the name is asserted for it; DIR is asked for by name and can
+       be. */
+    printf("create=%d %d\n", mvxc_create_file(s, "ZZTEMP", NULL),
+                             mvxc_create_file(s, "ZZDIR", "DIR"));
+    mvxc_val *fl = mvxc_files(s);
+    int nf = mvxc_dcount(fl, 0), hash = 0, dir = 0;
+    for (int i = 1; i <= nf; i++) {
+        const char *nm = mvxc_val_at(fl, i, 1);
+        if (!strcmp(nm, "ZZTEMP")) hash = 1;
+        if (!strcmp(nm, "ZZDIR") && !strcmp(mvxc_val_at(fl, i, 2), "dir")) dir = 1;
+    }
+    printf("listed hash=%d dir=%d\n", hash, dir);
+    mvxc_free(fl);
+    printf("dropfile=%d missing=%d\n", mvxc_delete_file(s, "ZZTEMP"),
+                                       mvxc_delete_file(s, "NOSUCHFILE"));
+    mvxc_delete_file(s, "ZZDIR");
     mvxc_disconnect(s);
     return 0;
 }

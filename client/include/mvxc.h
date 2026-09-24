@@ -124,6 +124,26 @@ mvxc_status mvxc_write (mvxc_file *f, const char *id, mvxc_val *rec);
 mvxc_status mvxc_delete(mvxc_file *f, const char *id);
 void        mvxc_release(mvxc_file *f, const char *id);
 
+/* --- file administration -------------------------------------------------
+ * `type` is NULL for the account's default hashed file, or "DIR" for a
+ * directory file -- the two CREATE-FILE itself offers.
+ *
+ * mvxc_files answers with the account's files as an ORDINARY VALUE: one
+ * attribute per file, the name and the type as its first two values.  It
+ * needs no cursor and no new type, because the thing a caller already has --
+ * mvxc_attr, mvxc_val_at, mvxc_dcount -- reads it exactly as it reads a
+ * record.  The caller owns it and frees it with mvxc_free. */
+mvxc_status mvxc_create_file(mvxc_session *s, const char *name,
+                             const char *type);
+mvxc_status mvxc_delete_file(mvxc_session *s, const char *name);
+mvxc_val   *mvxc_files(mvxc_session *s);
+
+/* Would CALL <name> resolve in this account?  mvxc_call asks this before it
+ * calls; it is here separately because a caller usually wants to CHOOSE rather
+ * than be told afterwards -- and on jBASE an unresolved CALL traps into the
+ * debugger rather than returning, so asking first is the portable habit. */
+int mvxc_cataloged(mvxc_session *s, const char *name);
+
 /* --- the select list -----------------------------------------------------
  * mvxc_next returns NULL at the end.  The id is owned by the SESSION and is
  * replaced by the next call, because that is what a remote cursor can
