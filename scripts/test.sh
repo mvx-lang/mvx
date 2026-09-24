@@ -4326,8 +4326,12 @@ if command -v cc >/dev/null 2>&1; then
   mkdir -p "$CLA/BP"
   printf 'PRINT "level=":@LEVEL\n' > "$CLA/BP/LVL"
   printf 'SUBROUTINE DOUBLE.IT(IN, OUT)\nOUT = IN * 2\nRETURN\n' > "$CLA/BP/DOUBLE.IT"
+  # AND THE ACCOUNT'S LOGIN, which connecting runs -- at @LEVEL 1, so a LOGIN
+  # that prompts can tell it does not own the screen (mvx#264).
+  printf 'PRINT "login=":@LEVEL\n' > "$CLA/BP/LOGIN"
   MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP LVL'       >/dev/null 2>&1
   MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP DOUBLE.IT' >/dev/null 2>&1
+  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP LOGIN'     >/dev/null 2>&1
   "$TCL" -a "$CLA" -c "CREATE-FILE PARTS" >/dev/null 2>&1
   cat > "$TESTROOT/client.c" <<'CLEOF'
 #include <mvxc.h>
