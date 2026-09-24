@@ -1,0 +1,9 @@
+write=0
+read=0 Widget 9.99
+mv=2 [red,blue] attrs=3
+edited=2 [blue,green]
+miss=1 null=1
+select=1
+nosub=1
+exec=0 [level=1]
+delete=0
