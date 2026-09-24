@@ -1263,24 +1263,13 @@ CALL GETOPT.NARGS(NA) ; PRINT "nargs=" : NA
 RETURN
 EOF
 printf 'V\nCATALOG/CFTEST' > "$CFP/VOC/CFTEST"
-# DROP THE DUPLICATE-SUBROUTINE WARNING HERE, and only here (mvx#266).  The
-# published git package bundles cmd's CMD.ADD/CMD.INIT/CMD.RUN alongside the
-# cmd package's own, both in the system account's LIB -- `nm -gU
-# build/system/LIB/libgit.dylib | grep mvx_sub_CMD' shows all three -- so the
-# runtime rightly says which one is in use.  This test is about flag parsing,
-# not library loading, and baking the warning into its expected output would
-# record a packaging bug as correct.  Filed against the git package; when that
-# lands this filter stops matching and can go.
-nodupwarn() {
-  grep -vE "is defined by more than one library|the order LIB was read:|\(in use\)$|\(shadowed\)$|They are not required to agree"
-}
 check tcl-cmdflags "$( \
-  printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | nodupwarn | normalise; \
+  printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
   printf '%s\n' "LINK-PKG $PKG_GETOPT" "LINK-PKG $PKG_CMD" "LINK-PKG $CFP" \
     'CFTEST COMMIT -m "hello world" --all f1 f2' \
     'CFTEST COMMIT --help' \
     'CFTEST COMMIT -z' \
-    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun | nodupwarn)"
+    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun)"
 
 # native package build: BUILD-PKG compiles a package's BP -> CATALOG/LIB
 # through the runtime (no shell, no mkpkg on PATH), needing only developer
@@ -5605,7 +5594,13 @@ if MVXPRIV=developer "$MVX" -shared "$DUP/shared2.b" \
      -o "$DUP/LIB/AAOTHER$dsfx" >/dev/null 2>&1; then
   d2="$(cd "$DUP" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/USER 2>&1)"
   case "$d2" in *"defined by more than one library"*) dnamed=1 ;; *) dnamed=0 ;; esac
-  case "$d2" in *"AAOTHER$dsfx"*"SHARED$dsfx"*) dboth=1 ;; *) dboth=0 ;; esac
+  # ORDER-INDEPENDENT ON PURPOSE.  Which of the two is named first is decided
+  # by readdir -- the very thing this feature exists to report -- so asserting
+  # a sequence would be a test that assumes what it is testing against.  It
+  # passed here and on one CI run by luck, then failed on the next.
+  dboth=0
+  if printf '%s\n' "$d2" | grep -q "AAOTHER$dsfx" \
+     && printf '%s\n' "$d2" | grep -q "SHARED$dsfx"; then dboth=1; fi
   case "$d2" in *"in use"*"shadowed"*) dwhich=1 ;; *) dwhich=0 ;; esac
   if [ "$dnamed" = 1 ] && [ "$dboth" = 1 ] && [ "$dwhich" = 1 ]; then
     PASS=$((PASS + 1))
