@@ -385,6 +385,7 @@ private:
     BasicBlock *retBB_ = nullptr;
 
     StructType *valTy_ = nullptr;
+    StructType *arrTy_ = nullptr;   // { i64 d1, i64 d2, [0 x mv_value] elems }
     PointerType *ptrTy_ = nullptr;
     Type *i64Ty_ = nullptr, *i32Ty_ = nullptr, *dblTy_ = nullptr,
          *voidTy_ = nullptr;
@@ -900,12 +901,14 @@ private:
                  * every integer pair, and the banked sieve computes a bank
                  * number this way on every element it marks.
                  *
-                 * ONLY FOR A SAFE CONSTANT DIVISOR.  sdiv by zero is
-                 * undefined in LLVM where fdiv gives infinity and the
-                 * saturating convert clamps it, and INT64_MIN / -1 overflows;
-                 * a literal that is neither leaves nothing to check for at
-                 * run time.  A variable divisor keeps the float path rather
-                 * than buy a branch in the loop to avoid one. */
+                 * THE TWO UNSAFE PAIRS ARE BRANCHED AROUND, not
+                 * excluded: sdiv by zero is undefined in LLVM where fdiv
+                 * gives infinity and the saturating convert clamps it, and
+                 * INT64_MIN / -1 overflows.  intDivTrunc tests for both and
+                 * keeps the float path for them, under an unlikely-branch
+                 * hint, so a VARIABLE divisor gets the integer divide too --
+                 * which is what the banked sieve needs, since it divides by
+                 * CHUNK rather than by a literal. */
                 const Expr &arg = *e.args[0];
                 if (arg.kind == Expr::K::Bin && arg.op == BinOp::Div &&
                     num_.kindOf(*arg.lhs) == NK::Int &&
@@ -1001,8 +1004,61 @@ private:
         Value *i = numIndex(*e.args[0]);
         Value *j = e.args.size() == 2 ? numIndex(*e.args[1])
                                       : ConstantInt::get(i64Ty_, 0);
+        if (e.args.size() == 1)
+            return arrElem1D(arr, i, j);
         return callRt("mv_arr_elem", ptrTy_, {ptrTy_, i64Ty_, i64Ty_},
                       {arr, i, j});
+    }
+
+    /* A ONE-SUBSCRIPT ELEMENT IS A BOUNDS CHECK AND AN OFFSET (mvx#183).
+     *
+     * `mv_arr_elem' is a call into the runtime on every element access, and
+     * for a shared library that is a PLT crossing as well.  Measured on the
+     * banked sieve: mv_arr_elem 139 samples and DYLD-STUB$$mv_arr_elem 95, a
+     * tenth of the benchmark, to do two comparisons and add an offset.
+     *
+     * The 1-D body is exactly that -- `i < 1 || i > d1 || j != 0' then
+     * `&elems[i-1]' -- so it is emitted here instead.  THE ERROR PATH STILL
+     * CALLS THE RUNTIME: the message names the bound and the subscript, and
+     * having one copy of it matters more than the branch it costs on a path
+     * that ends in mvx_fatal anyway.  That also keeps 2-D and j != 0 correct
+     * without restating their rules here.
+     *
+     * Not done for two subscripts: the multiply makes it longer, and nothing
+     * measured spends its time there. */
+    Value *arrElem1D(Value *arr, Value *i, Value *j) {
+        Value *zero = ConstantInt::get(i64Ty_, 0);
+        Value *one  = ConstantInt::get(i64Ty_, 1);
+        Value *d1 = b_.CreateLoad(i64Ty_, b_.CreateStructGEP(arrTy_, arr, 0));
+        Value *d2 = b_.CreateLoad(i64Ty_, b_.CreateStructGEP(arrTy_, arr, 1));
+        Value *ok = b_.CreateAnd(
+            b_.CreateICmpEQ(d2, zero),
+            b_.CreateAnd(b_.CreateICmpSGE(i, one), b_.CreateICmpSLE(i, d1)));
+
+        BasicBlock *fastBB = newBB("arr.fast");
+        BasicBlock *slowBB = newBB("arr.slow");
+        BasicBlock *joinBB = newBB("arr.join");
+        b_.CreateCondBr(ok, fastBB, slowBB,
+                        MDBuilder(llctx_).createLikelyBranchWeights());
+
+        b_.SetInsertPoint(fastBB);
+        Value *p = b_.CreateInBoundsGEP(
+            arrTy_, arr, {zero, ConstantInt::get(i32Ty_, 2),
+                          b_.CreateSub(i, one)});
+        b_.CreateBr(joinBB);
+        BasicBlock *fastEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(slowBB);
+        Value *q = callRt("mv_arr_elem", ptrTy_, {ptrTy_, i64Ty_, i64Ty_},
+                          {arr, i, j});       /* names the bound, then fatals */
+        b_.CreateBr(joinBB);
+        BasicBlock *slowEnd = b_.GetInsertBlock();
+
+        b_.SetInsertPoint(joinBB);
+        PHINode *phi = b_.CreatePHI(ptrTy_, 2);
+        phi->addIncoming(p, fastEnd);
+        phi->addIncoming(q, slowEnd);
+        return phi;
     }
 
     // Pointer to an mv_value holding the expression's value.  Lvalues are
@@ -2765,6 +2821,11 @@ void CodeGen::run(const std::string &outPath) {
     ptrTy_ = PointerType::get(llctx_, 0);
     valTy_ = StructType::create(llctx_, {i64Ty_, i64Ty_, dblTy_, ptrTy_},
                                 "mv_value");
+    /* mv_array: { int64 d1, int64 d2, mv_value elems[] } -- so an element
+       address is a GEP the DataLayout computes rather than an offset spelled
+       here (mvx#183). */
+    arrTy_ = StructType::create(llctx_,
+        {i64Ty_, i64Ty_, ArrayType::get(valTy_, 0)}, "mv_array");
 
     mod_.addModuleFlag(Module::Warning, "Debug Info Version",
                        DEBUG_METADATA_VERSION);
