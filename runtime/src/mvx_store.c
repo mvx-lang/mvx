@@ -2075,8 +2075,28 @@ int64_t mvx_write(mvx_ctx *ctx, const mv_value *rec, const mv_value *fvar,
         else b->driver->bulk_commit(f);   /* no rollback offered: best effort */
     }
     if (need_old) mv_clear(&old);
-    if (!mok) txn_poison(ctx, "a mapped write could not be projected");
-    if (!mok && onerr) return -2;
+    /* A ROLLED-BACK WRITE IS A FAILED WRITE (mvx#245).
+     *
+     * This used to return 0 -- success -- to a program with no ON ERROR, so a
+     * program believed it had written a record that the rollback above had
+     * just taken back out, and nothing said otherwise.  Ten lines up, the
+     * record-write failure takes the opposite view and is fatal without a
+     * handler: two failures of one WRITE, one fatal and one silent, and the
+     * silent one was the case where the write did not happen at all.
+     *
+     * `mok' is false ONLY for a structural failure -- map_apply or
+     * map_child_project, both driver calls, returning 0.  The best-effort
+     * mirror behaviour the docs promise is a different thing and never gets
+     * here: a value that will not convert is written as NULL by map_project
+     * (`if (vl < 0) { vl = 0; ps[nchg][0] = 0; }') and leaves `ok' alone.  So
+     * there is nothing here to be lenient about. */
+    if (!mok) {
+        txn_poison(ctx, "a mapped write could not be projected");
+        if (onerr) return -2;
+        mvx_fatal("WRITE failed on %s id %.*s: the record was rolled back "
+                  "because its mapping could not be written",
+                  b->spec, (int)idlen, ip);
+    }
     if (!keep_lock) {                   /* WRITE releases; WRITEU keeps */
         char *key = lock_key(f, ip, idlen);
         lock_drop(st, key);
