@@ -166,6 +166,17 @@ add_library(mvxrt SHARED
   runtime/src/mvx_acct.c
   daemon/sha256.c)
 target_include_directories(mvxrt PUBLIC runtime/include)
+
+# --- the client library (#289) ------------------------------------------
+# One API for a program outside MVX -- and, through mv-connect, a language
+# binding -- to use an account: records, the values in them, subroutines and
+# sentences.  Separate from mvxrt on purpose: this is the surface with an ABI
+# PROMISE, while mvx_runtime.h is internal that happens to be installed, and
+# keeping them apart is what lets mv_value keep changing (mvx#183) without
+# breaking anything built against mvxc.h.
+add_library(mvxc SHARED client/mvxc.c)
+target_include_directories(mvxc PUBLIC client/include)
+target_link_libraries(mvxc PRIVATE mvxrt)
 target_include_directories(mvxrt PRIVATE daemon)   # sha256.h for program identity
 # The runtime calls libm (sin/pow/sqrt/... for the numeric intrinsics);
 # glibc keeps libm separate, so link it explicitly (a no-op on macOS,
@@ -542,7 +553,7 @@ if(MVX_WITH_DAEMON)
 endif()
 install(TARGETS ${MVX_INSTALL_BINS} RUNTIME DESTINATION bin)
 
-set(MVX_INSTALL_DRIVERS mvxrt mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
+set(MVX_INSTALL_DRIVERS mvxrt mvxc mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
 if(MVX_MQTT_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxmsg_mqtt)
 endif()
@@ -566,6 +577,10 @@ install(FILES ${CMAKE_BINARY_DIR}/lib/mvx_crt.o DESTINATION lib)
 # source tree: its build finds them at <prefix>/include, the install-prefix
 # counterpart of the source tree's runtime/include.
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/runtime/include/
+        DESTINATION include FILES_MATCHING PATTERN "*.h")
+
+# The client library's header, the one external contract with an ABI promise.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/client/include/
         DESTINATION include FILES_MATCHING PATTERN "*.h")
 
 # --- configuration summary ---------------------------------------------

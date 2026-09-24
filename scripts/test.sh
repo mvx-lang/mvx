@@ -4313,6 +4313,98 @@ if [ "$QUICK" = 0 ]; then
   fi
 fi
 
+# the client library (#289): an external C program driving an account through
+# mvxc.h -- the surface mv-connect and any language binding is built on.
+#
+# COMPILED AND RUN, not just built.  The point of the library is that someone
+# OUTSIDE the tree links it, so a check that only builds it would miss the
+# things that actually break a consumer: a header that needs an internal one,
+# a symbol that is not exported, a string that dies before the caller reads it.
+if command -v cc >/dev/null 2>&1; then
+  CLA="$TESTROOT/clacct"
+  "$ROOT/scripts/mkaccount.sh" "$CLA" >/dev/null 2>&1
+  mkdir -p "$CLA/BP"
+  printf 'PRINT "level=":@LEVEL\n' > "$CLA/BP/LVL"
+  MVXPRIV=developer "$TCL" -a "$CLA" -c 'CATALOG BP LVL' >/dev/null 2>&1
+  "$TCL" -a "$CLA" -c "CREATE-FILE PARTS" >/dev/null 2>&1
+  cat > "$TESTROOT/client.c" <<'CLEOF'
+#include <mvxc.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    mvxc_status st;
+    mvxc_session *s = mvxc_connect(argv[1], &st);
+    if (!s) { printf("connect failed\n"); return 1; }
+    mvxc_file *f = mvxc_open(s, "PARTS", NULL, &st);
+    if (!f) { printf("open failed: %s\n", mvxc_error(s)); return 1; }
+
+    mvxc_val *r = mvxc_new();
+    mvxc_set_attr(r, 1, "Widget");
+    mvxc_set_attr(r, 2, "9.99");
+    mvxc_set_val (r, 3, 1, "red");
+    mvxc_set_val (r, 3, 2, "blue");
+    printf("write=%d\n", mvxc_write(f, "W1", r));
+    mvxc_free(r);
+
+    /* two accessors live at once is the contract, so assert it */
+    r = mvxc_read(f, "W1", &st);
+    printf("read=%d %s %s\n", st, mvxc_attr(r, 1), mvxc_attr(r, 2));
+    printf("mv=%d [%s,%s] attrs=%d\n", mvxc_dcount(r, 3),
+           mvxc_val_at(r, 3, 1), mvxc_val_at(r, 3, 2), mvxc_dcount(r, 0));
+
+    mvxc_ins_val(r, 3, 3, "green");
+    mvxc_del_val(r, 3, 1);
+    mvxc_write(f, "W1", r);
+    mvxc_free(r);
+    r = mvxc_read(f, "W1", &st);
+    printf("edited=%d [%s,%s]\n", mvxc_dcount(r, 3),
+           mvxc_val_at(r, 3, 1), mvxc_val_at(r, 3, 2));
+    mvxc_free(r);
+
+    /* a miss is a status, not an error */
+    r = mvxc_read(f, "NOSUCH", &st);
+    printf("miss=%d null=%d\n", st, r == NULL);
+
+    mvxc_select(f);
+    int n = 0; while (mvxc_next(s)) n++;
+    printf("select=%d\n", n);
+
+    /* an uncataloged CALL returns; it must not trap or abort */
+    printf("nosub=%d\n", mvxc_call(s, "NO.SUCH.SUB", 0, NULL));
+
+    /* AND THE ONE THAT IS NOT OBVIOUS: a sentence run through the library
+       answers @LEVEL 1, never 0.  0 means "nothing is above me, I own the
+       screen", which is false here and would let an interactive routine
+       prompt a caller that has no terminal. */
+    mvxc_val *cap = mvxc_new();
+    /* SEQUENCED, NOT NESTED.  Putting mvxc_execute and mvxc_str in one
+       argument list is unspecified evaluation order, and on gcc/x86-64 the
+       read ran FIRST and execute then released the string printf was about to
+       use.  The rule is doing its job -- a mutating call invalidates -- but it
+       is easy to break by accident, which is why it says so in mvxc.h. */
+    mvxc_status es = mvxc_execute(s, "LVL", cap);
+    printf("exec=%d [%s]\n", es, mvxc_str(cap));
+    mvxc_free(cap);
+
+    printf("delete=%d\n", mvxc_delete(f, "W1"));
+    mvxc_close(f);
+    mvxc_disconnect(s);
+    return 0;
+}
+CLEOF
+  if cc -I"$ROOT/client/include" -o "$TESTROOT/clientbin" "$TESTROOT/client.c" \
+        -L"$ROOT/build" -lmvxc -Wl,-rpath,"$ROOT/build" \
+        > "$TESTROOT/client.cc.log" 2>&1; then
+    check tcl-client "$( \
+      cd "$CLA" && MVXPRIV=developer "$TESTROOT/clientbin" "$CLA" 2>&1 | normalise)"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL client: the library does not link from outside the tree"
+    sed -n 's/^/    | /p' "$TESTROOT/client.cc.log" | head -6
+  fi
+else
+  echo "  (client library test skipped — no cc)"
+fi
+
 # -------------------------------------------------------- phase 4: install
 # Install to a throwaway prefix and drive it with every MVX_* override
 # unset, proving the binaries locate the runtime, drivers, and system
