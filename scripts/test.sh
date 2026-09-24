@@ -3416,6 +3416,27 @@ SQTEOF
       'SELECT COUNT(*) FROM "ORD" WHERE id IN ('"'"'T2'"'"','"'"'T3'"'"');' 2>/dev/null)"
     tornc="$(sqlite3 "$SQA/acct.sqlite" \
       'SELECT COUNT(*) FROM "ORD__LINES" WHERE id IN ('"'"'T2'"'"','"'"'T3'"'"');' 2>/dev/null)"
+    # AND THE PROGRAM IS TOLD (mvx#245).  The rollback above was always right;
+    # what was wrong was returning 0 -- success -- to a program with no ON
+    # ERROR, so it believed it had written a record that had just been taken
+    # back out.  The record-write failure beside it was fatal without a
+    # handler all along; these are two failures of one WRITE and only one of
+    # them spoke.
+    t4err="$(cd "$SQA" && MVXACCOUNT=. TORNID=T4 MVX_FAULT=mapchild \
+       "$TESTROOT/sqtorn" 2>&1 >/dev/null)"
+    t4rc=$?
+    t4gone="$(sqlite3 "$SQA/acct.sqlite" \
+      'SELECT COUNT(*) FROM "ORD" WHERE id = '"'"'T4'"'"';' 2>/dev/null)"
+    case "$t4err" in *"rolled back"*) t4said=1 ;; *) t4said=0 ;; esac
+    if [ "$t4rc" != 0 ] && [ "$t4said" = 1 ] && [ "$t4gone" = 0 ]; then
+      PASS=$((PASS + 1))
+      echo "  a rolled-back mapped write fails the program, and says why"
+    else
+      FAIL=$((FAIL + 1))
+      echo "FAIL map/rollback-reported: rc=$t4rc said=$t4said left=$t4gone"
+      printf '%s\n' "$t4err" | sed 's/^/    | /' | head -3
+    fi
+
     if [ "$crashrc" = 97 ] && [ "$good" = 1 ] && [ "$goodc" = 3 ] \
        && [ "$torn" = 0 ] && [ "$tornc" = 0 ]; then
       PASS=$((PASS+1))
@@ -3749,8 +3770,7 @@ COMMIT SUCCEEDED" ]; then
   cat > "$TESTROOT/txfail.b" <<'TXFEOF'
 OPEN "ORD" TO F ELSE PRINT "no ORD" ; STOP
 TRANSACTION START ELSE PRINT "no transaction" ; STOP
-WRITE "GOOD":@AM:"1":@VM:"2" ON F, "OK1"
-PRINT "wrote OK1"
+WRITE "GOOD":@AM:"1":@VM:"2" ON F, "OK1" ON ERROR PRINT "the first write failed"
 WRITE "BAD":@AM:"3":@VM:"4" ON F, "BAD1" ON ERROR PRINT "the second write failed"
 TRANSACTION COMMIT THEN PRINT "COMMIT SUCCEEDED" ELSE PRINT "commit refused"
 TXFEOF
@@ -3760,7 +3780,12 @@ TXFEOF
     tfrows="$(sqlite3 "$TXA/acct.sqlite" \
       'SELECT COUNT(*) FROM "ORD" WHERE id IN ('"'"'OK1'"'"','"'"'BAD1'"'"');' \
       2>/dev/null)"
-    tfwant="wrote OK1
+    # BOTH WRITES NEED THE CLAUSE NOW (mvx#245).  MVX_FAULT=mapchild fails
+    # every projection, and a rolled-back mapped write is a real failure
+    # rather than a silent success -- so a write without ON ERROR ends the
+    # program, as the record-write failure beside it always did.  This test
+    # used to reach COMMIT only because the first write lied about working.
+    tfwant="the first write failed
 the second write failed
 commit refused"
     if [ "$tfout" = "$tfwant" ] && [ "$tfrows" = 0 ]; then
