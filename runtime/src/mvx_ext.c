@@ -70,6 +70,7 @@ static void register_ext(const mvx_ext *e) {
    mind, but the registry would grow a duplicate for every rescan. */
 typedef struct loaded_lib {
     struct loaded_lib *next;
+    void *h;                            /* NULL when the dlopen failed */
     char path[1];
 } loaded_lib;
 static loaded_lib *g_libs;
@@ -80,14 +81,64 @@ static int already_loaded(const char *path) {
     return 0;
 }
 
-static void remember_loaded(const char *path) {
+static loaded_lib *remember_loaded(const char *path) {
     size_t n = strlen(path);
     loaded_lib *l = malloc(sizeof *l + n);
-    if (!l) return;                     /* forgetting costs a duplicate, not
+    if (!l) return NULL;                /* forgetting costs a duplicate, not
                                            correctness */
+    l->h = NULL;
     memcpy(l->path, path, n + 1);
     l->next = g_libs;
     g_libs = l;
+    return l;
+}
+
+/* TWO LIBRARIES IN ONE DIRECTORY CLAIMING THE SAME SUBROUTINE (mvx#266)
+ *
+ * CALL resolves with dlsym(RTLD_DEFAULT, ...), which takes the first
+ * definition loaded and cannot see that there were others.
+ *
+ * SHADOWING ACROSS TIERS IS THE POINT, not a fault: the account's LIB/ beats
+ * a linked package's, which beats the system account's, and that is how an
+ * account replaces a subroutine it does not want.  The same package present
+ * at two tiers is that mechanism working, and warning about it would be noise
+ * on every install.
+ *
+ * WITHIN ONE DIRECTORY there is no such intent.  Nothing ordered those files
+ * but readdir, so which definition wins is filesystem chance -- and they need
+ * not agree: mvpkg bundles its own build of cmd's CMD.RUN while the cmd
+ * package ships another, one calling GETOPT.SENTENCE and one not, so the same
+ * install worked or failed at random with nothing said.
+ *
+ * Reports only that case.  Fills *winner with the file in use and *other with
+ * the one it shadows; returns how many share a directory with it. */
+int mvx_ext_providers(const char *sym, const char **winner, const char **other) {
+    void *in_use = dlsym(RTLD_DEFAULT, sym);
+    const char *paths[16];
+    int n = 0;
+    for (loaded_lib *l = g_libs; l && n < 16; l = l->next) {
+        if (!l->h || !dlsym(l->h, sym)) continue;
+        paths[n++] = l->path;
+    }
+    for (int i = 0; i < n; i++) {
+        const char *si = strrchr(paths[i], '/');
+        for (int j = i + 1; j < n; j++) {
+            const char *sj = strrchr(paths[j], '/');
+            size_t di = si ? (size_t)(si - paths[i]) : 0;
+            size_t dj = sj ? (size_t)(sj - paths[j]) : 0;
+            if (di != dj || strncmp(paths[i], paths[j], di) != 0)
+                continue;                       /* different tiers: intended */
+            /* Same directory.  Name the one actually in use first. */
+            int iw = 0;
+            for (loaded_lib *l = g_libs; l; l = l->next)
+                if (l->h && strcmp(l->path, paths[i]) == 0 &&
+                    dlsym(l->h, sym) == in_use) iw = 1;
+            if (winner) *winner = iw ? paths[i] : paths[j];
+            if (other)  *other  = iw ? paths[j] : paths[i];
+            return 2;
+        }
+    }
+    return n > 1 ? 1 : n;          /* only cross-tier shadowing: not a clash */
 }
 
 static void load_dir(const char *dir) {
@@ -109,8 +160,9 @@ static void load_dir(const char *dir) {
         char real[4096];
         const char *key = realpath(path, real) ? real : path;
         if (already_loaded(key)) continue;
-        remember_loaded(key);
+        loaded_lib *ent = remember_loaded(key);
         void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);   /* GLOBAL: CALL sees mvx_sub_ */
+        if (ent) ent->h = h;
         if (!h) {
             /* SAY WHY (#117).  This used to fail silently, so a library built
                against a newer runtime just never loaded and the user met it

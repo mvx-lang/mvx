@@ -1263,13 +1263,24 @@ CALL GETOPT.NARGS(NA) ; PRINT "nargs=" : NA
 RETURN
 EOF
 printf 'V\nCATALOG/CFTEST' > "$CFP/VOC/CFTEST"
+# DROP THE DUPLICATE-SUBROUTINE WARNING HERE, and only here (mvx#266).  The
+# published git package bundles cmd's CMD.ADD/CMD.INIT/CMD.RUN alongside the
+# cmd package's own, both in the system account's LIB -- `nm -gU
+# build/system/LIB/libgit.dylib | grep mvx_sub_CMD' shows all three -- so the
+# runtime rightly says which one is in use.  This test is about flag parsing,
+# not library loading, and baking the warning into its expected output would
+# record a packaging bug as correct.  Filed against the git package; when that
+# lands this filter stops matching and can go.
+nodupwarn() {
+  grep -vE "is defined by more than one library|the order LIB was read:|\(in use\)$|\(shadowed\)$|They are not required to agree"
+}
 check tcl-cmdflags "$( \
-  printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
+  printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | nodupwarn | normalise; \
   printf '%s\n' "LINK-PKG $PKG_GETOPT" "LINK-PKG $PKG_CMD" "LINK-PKG $CFP" \
     'CFTEST COMMIT -m "hello world" --all f1 f2' \
     'CFTEST COMMIT --help' \
     'CFTEST COMMIT -z' \
-    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun)"
+    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun | nodupwarn)"
 
 # native package build: BUILD-PKG compiles a package's BP -> CATALOG/LIB
 # through the runtime (no shell, no mkpkg on PATH), needing only developer
@@ -5554,6 +5565,58 @@ B:in b" ]; then
   fi
 else
   echo "  (cross-account database test skipped — lmdb driver not built)"
+fi
+
+# ---------------------------------------------------------------------------
+# TWO PACKAGES CLAIMING ONE SUBROUTINE (mvx#266).
+#
+# CALL resolves with dlsym(RTLD_DEFAULT, ...), which takes the first
+# definition loaded and cannot see there were others -- and load_dir walks LIB
+# with readdir, whose order is arbitrary.  So an account holding two builds of
+# the same subroutine ran whichever the loader met first, silently.
+#
+# Not hypothetical: mvpkg bundles its own build of cmd's CMD.RUN while the cmd
+# package ships another, and THEY DIFFER -- one calls GETOPT.SENTENCE and one
+# does not.  The same install therefore worked or failed by filesystem chance,
+# which is what made mvx#266 look intermittent.
+echo "== two libraries claiming one subroutine"
+DUP="$TESTROOT/dupacct"
+"$ROOT/scripts/mkaccount.sh" "$DUP" >/dev/null 2>&1
+mkdir -p "$DUP/BP"
+printf 'SUBROUTINE SHARED(X)\nPRINT "version ONE"\nRETURN\n' > "$DUP/BP/SHARED"
+printf 'CALL SHARED(0)\n' > "$DUP/BP/USER"
+MVXPRIV=developer "$TCL" -a "$DUP" -c 'CATALOG BP SHARED' >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$DUP" -c 'CATALOG BP USER'   >/dev/null 2>&1
+
+# One provider: nothing to say.
+d1="$(cd "$DUP" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/USER 2>&1)"
+if [ "$d1" = "version ONE" ]; then
+  PASS=$((PASS + 1)); echo "  one library providing it says nothing"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL dup/single: [$d1]"
+fi
+
+# A SECOND, DIFFERENT build of the same subroutine, under a name that sorts
+# first.  Compiled rather than copied: macOS dedupes dylibs by install name,
+# so a `cp' is not a second library at all and would prove nothing.
+case "$(uname -s)" in Darwin) dsfx=.dylib ;; *) dsfx=.so ;; esac
+printf 'SUBROUTINE SHARED(X)\nPRINT "version TWO"\nRETURN\n' > "$DUP/shared2.b"
+if MVXPRIV=developer "$MVX" -shared "$DUP/shared2.b" \
+     -o "$DUP/LIB/AAOTHER$dsfx" >/dev/null 2>&1; then
+  d2="$(cd "$DUP" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/USER 2>&1)"
+  case "$d2" in *"defined by more than one library"*) dnamed=1 ;; *) dnamed=0 ;; esac
+  case "$d2" in *"AAOTHER$dsfx"*"SHARED$dsfx"*) dboth=1 ;; *) dboth=0 ;; esac
+  case "$d2" in *"in use"*"shadowed"*) dwhich=1 ;; *) dwhich=0 ;; esac
+  if [ "$dnamed" = 1 ] && [ "$dboth" = 1 ] && [ "$dwhich" = 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  two libraries are reported, both named, and which one is in use"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL dup/report: named=$dnamed both=$dboth which=$dwhich"
+    printf '%s\n' "$d2" | sed 's/^/    | /' | head -6
+  fi
+else
+  echo "  (second-provider test skipped — could not build the library)"
 fi
 
 echo "== records as documents"
