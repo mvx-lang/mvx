@@ -139,7 +139,16 @@ const char *mvxc_version(void) { return mvx_version(); }
 
 mvxc_val *mvxc_new(void) {
     mvxc_val *v = calloc(1, sizeof *v);
-    if (v) mv_init(&v->v);
+    if (!v) return NULL;
+    /* EMPTY STRING, NOT UNASSIGNED.  mv_init leaves MV_UNASSIGNED, which the
+     * runtime warns about and coerces the first time anything reads it -- and
+     * compiled BASIC never hands one out, because its variables are assigned
+     * before use.  A caller of this library creates values constantly and then
+     * passes them straight in (a fresh record to fill, a capture to receive
+     * output), so unassigned is the normal case here and must not be.  "" is
+     * also what a new MV value means. */
+    mv_init(&v->v);
+    mv_set_str(&v->v, "", 0);
     return v;
 }
 
@@ -401,7 +410,7 @@ mvxc_status mvxc_execute(mvxc_session *s, const char *sentence,
     if (!s || !sentence) return MVXC_ERROR;
     mv_value sent, rc;
     tmp_str(&sent, sentence);
-    mv_init(&rc);
+    tmp_str(&rc, "");            /* assigned, for the same reason */
     if (capture) drop_held(capture);
     /* The sentence runs a level above the session, so anything it reaches
      * answers @LEVEL >= 1 and an interactive routine knows to decline.  That

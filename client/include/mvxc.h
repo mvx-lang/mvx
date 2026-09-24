@@ -78,7 +78,16 @@ const char   *mvxc_error(mvxc_session *s);
  *
  * -- which is the point; an accessor that invalidated the previous one would
  * be unusable for exactly the thing callers do most.  A set_* or ins_* call
- * releases them all. */
+ * releases them all, and so does any call that WRITES a value -- mvxc_execute
+ * into its capture, mvxc_call into its arguments.
+ *
+ * SO DO NOT MIX A READ AND A WRITE OF THE SAME VALUE IN ONE EXPRESSION.  C
+ * does not specify argument evaluation order, so
+ *
+ *     printf("%d %s", mvxc_execute(s, "X", cap), mvxc_str(cap));   // WRONG
+ *
+ * may read the capture before the execute fills it -- and then free that
+ * string when the execute runs.  Sequence them. */
 mvxc_val *mvxc_new(void);
 mvxc_val *mvxc_new_str(const char *s);
 mvxc_val *mvxc_from_bytes(const char *p, size_t n);

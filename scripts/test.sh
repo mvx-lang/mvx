@@ -4376,7 +4376,13 @@ int main(int argc, char **argv) {
        screen", which is false here and would let an interactive routine
        prompt a caller that has no terminal. */
     mvxc_val *cap = mvxc_new();
-    printf("exec=%d [%s]\n", mvxc_execute(s, "LVL", cap), mvxc_str(cap));
+    /* SEQUENCED, NOT NESTED.  Putting mvxc_execute and mvxc_str in one
+       argument list is unspecified evaluation order, and on gcc/x86-64 the
+       read ran FIRST and execute then released the string printf was about to
+       use.  The rule is doing its job -- a mutating call invalidates -- but it
+       is easy to break by accident, which is why it says so in mvxc.h. */
+    mvxc_status es = mvxc_execute(s, "LVL", cap);
+    printf("exec=%d [%s]\n", es, mvxc_str(cap));
     mvxc_free(cap);
 
     printf("delete=%d\n", mvxc_delete(f, "W1"));
