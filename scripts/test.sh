@@ -1263,24 +1263,13 @@ CALL GETOPT.NARGS(NA) ; PRINT "nargs=" : NA
 RETURN
 EOF
 printf 'V\nCATALOG/CFTEST' > "$CFP/VOC/CFTEST"
-# DROP THE DUPLICATE-SUBROUTINE WARNING HERE, and only here (mvx#266).  The
-# published git package bundles cmd's CMD.ADD/CMD.INIT/CMD.RUN alongside the
-# cmd package's own, both in the system account's LIB -- `nm -gU
-# build/system/LIB/libgit.dylib | grep mvx_sub_CMD' shows all three -- so the
-# runtime rightly says which one is in use.  This test is about flag parsing,
-# not library loading, and baking the warning into its expected output would
-# record a packaging bug as correct.  Filed against the git package; when that
-# lands this filter stops matching and can go.
-nodupwarn() {
-  grep -vE "is defined by more than one library|the order LIB was read:|\(in use\)$|\(shadowed\)$|They are not required to agree"
-}
 check tcl-cmdflags "$( \
-  printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | nodupwarn | normalise; \
+  printf 'BUILD-PKG %s\n' "$CFP" | MVXPRIV=developer "$TCL" -a "$ACCT" 2>&1 | normalise; \
   printf '%s\n' "LINK-PKG $PKG_GETOPT" "LINK-PKG $PKG_CMD" "LINK-PKG $CFP" \
     'CFTEST COMMIT -m "hello world" --all f1 f2' \
     'CFTEST COMMIT --help' \
     'CFTEST COMMIT -z' \
-    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun | nodupwarn)"
+    "UNLINK-PKG $CFP" "UNLINK-PKG $PKG_CMD" "UNLINK-PKG $PKG_GETOPT" | tclrun)"
 
 # native package build: BUILD-PKG compiles a package's BP -> CATALOG/LIB
 # through the runtime (no shell, no mkpkg on PATH), needing only developer
