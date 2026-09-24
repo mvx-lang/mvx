@@ -348,6 +348,54 @@ void mvxc_release(mvxc_file *f, const char *id) {
     mv_clear(&i);
 }
 
+/* --- file administration -------------------------------------------------- */
+
+mvxc_status mvxc_create_file(mvxc_session *s, const char *name,
+                             const char *type) {
+    if (!s || !name) return MVXC_ERROR;
+    mv_value sp, ty;
+    tmp_str(&sp, name);
+    int64_t ok;
+    if (type && *type) {
+        tmp_str(&ty, type);
+        ok = mvx_createfile(s->ctx, &sp, &ty);
+        mv_clear(&ty);
+    } else {
+        ok = mvx_createfile(s->ctx, &sp, NULL);
+    }
+    mv_clear(&sp);
+    if (!ok) { set_err(s, "the file could not be created"); return MVXC_ERROR; }
+    return MVXC_OK;
+}
+
+mvxc_status mvxc_delete_file(mvxc_session *s, const char *name) {
+    if (!s || !name) return MVXC_ERROR;
+    mv_value sp;
+    tmp_str(&sp, name);
+    int64_t ok = mvx_deletefile(s->ctx, &sp);
+    mv_clear(&sp);
+    if (!ok) { set_err(s, "no such file"); return MVXC_NOTFOUND; }
+    return MVXC_OK;
+}
+
+mvxc_val *mvxc_files(mvxc_session *s) {
+    if (!s) return NULL;
+    mvxc_val *v = mvxc_new();
+    if (!v) return NULL;
+    mvx_filelist(s->ctx, &v->v);
+    return v;
+}
+
+int mvxc_cataloged(mvxc_session *s, const char *name) {
+    (void)s;
+    if (!name) return 0;
+    mv_value nm;
+    tmp_str(&nm, name);
+    int64_t r = mv_cataloged_fn(&nm);
+    mv_clear(&nm);
+    return r ? 1 : 0;
+}
+
 /* --- the select list ------------------------------------------------------ */
 
 mvxc_status mvxc_select(mvxc_file *f) {
@@ -379,14 +427,13 @@ const char *mvxc_next(mvxc_session *s) {
 mvxc_status mvxc_call(mvxc_session *s, const char *name, int argc,
                       mvxc_val **argv) {
     if (!s || !name) return MVXC_ERROR;
-    mv_value nm;
-    tmp_str(&nm, name);
-    int64_t here = mv_cataloged_fn(&nm);
-    mv_clear(&nm);
     /* ASK BEFORE CALLING.  An unresolved CALL is a runtime error on mvx and
      * traps into the DEBUGGER on jBASE (mv_package#54); from a library it must
      * be a return value either way. */
-    if (!here) { set_err(s, "subroutine is not cataloged"); return MVXC_NOTFOUND; }
+    if (!mvxc_cataloged(s, name)) {
+        set_err(s, "subroutine is not cataloged");
+        return MVXC_NOTFOUND;
+    }
 
     mv_value **av = NULL;
     if (argc > 0) {

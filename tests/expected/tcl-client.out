@@ -7,3 +7,8 @@ select=1
 nosub=1
 exec=0 [level=1]
 delete=0
+cataloged=1 0
+call=0 out=42
+create=0 0
+listed hash=1 dir=1
+dropfile=0 missing=1
