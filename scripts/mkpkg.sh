@@ -37,7 +37,29 @@ case "$(uname)" in
   *)      EXT=so ; UNDEF="" ;;
 esac
 
+# THE MANIFEST IS PKG *OR* mvpkg.json (mvx#285).  mv_package carries only the
+# latter -- "PKG is gone; mvpkg.json is the manifest" is one of its own tests --
+# and reading PKG alone made its name and dependencies invisible here.  PKG is
+# read first: mvx's own packages/http has one and no mvpkg.json.
+#
+# The two spell names differently: PKG holds short ones (`cmd` depending on
+# `getopt`), mvpkg.json owner-qualified ones (`mvx-lang/cmd` depending on
+# `mvx-lang/getopt`).  A dependency is resolved below as a SIBLING DIRECTORY, so
+# anything taken from the JSON is cut back to its last path segment.
+json_str() {  # json_str <file> <key> -> the flat "key":"value" string
+  sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -1
+}
+json_arr() {  # json_arr <file> <key> -> one array entry per line
+  tr -d '\n' < "$1" \
+    | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' \
+    | tr ',' '\n' | sed -n 's/.*"\([^"]*\)".*/\1/p'
+}
+basename_of() { printf '%s' "${1##*/}"; }
+
 PKGNAME="$(head -1 "$PKG/PKG" 2>/dev/null)"
+if [ -z "$PKGNAME" ] && [ -f "$PKG/mvpkg.json" ]; then
+  PKGNAME="$(basename_of "$(json_str "$PKG/mvpkg.json" name)")"
+fi
 [ -n "$PKGNAME" ] || PKGNAME="$(basename "$PKG")"
 
 # Dependency EXPORTS visibility.  A package's programs may call functions
@@ -57,9 +79,23 @@ PKGNAME="$(head -1 "$PKG/PKG" 2>/dev/null)"
 DEPACCT="$(mktemp -d "${TMPDIR:-/tmp}/mkpkg.deps.XXXXXX")"
 trap 'rm -rf "$DEPACCT"' EXIT
 : > "$DEPACCT/PACKAGES"
-if [ -f "$PKG/PKG" ]; then
+if [ -f "$PKG/PKG" ] || [ -f "$PKG/mvpkg.json" ]; then
   PKGPARENT="$(cd "$PKG/.." && pwd)"
-  DEPS="$(awk 'NR>=5 && NF { print $1 }' "$PKG/PKG")"
+  if [ -f "$PKG/PKG" ]; then
+    DEPS="$(awk 'NR>=5 && NF { print $1 }' "$PKG/PKG")"
+  else
+    # dependencies keep their ?/!/+ prefix, which sits outside the name;
+    # devDependencies are build-only, which is what '+' means in PKG.
+    DEPS="$(json_arr "$PKG/mvpkg.json" dependencies | while IFS= read -r d; do
+              [ -n "$d" ] || continue
+              pfx=""
+              case "$d" in [\?!+]*) pfx="${d%"${d#?}"}"; d="${d#?}" ;; esac
+              printf '%s%s\n' "$pfx" "$(basename_of "$d")"
+            done
+            json_arr "$PKG/mvpkg.json" devDependencies | while IFS= read -r d; do
+              [ -n "$d" ] && printf '+%s\n' "$(basename_of "$d")"
+            done)"
+  fi
   if [ -n "$DEPS" ]; then
     for dep in $DEPS; do
       # a '?' prefix marks an optional dependency (LINK-PKG semantics): the
