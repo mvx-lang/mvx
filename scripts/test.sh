@@ -1214,6 +1214,46 @@ check tcl-pkgfunction "$( \
   echo '--- and a DEFFUN call resolves across the boundary'; \
   (cd "$FNACC" && MVXACCOUNT=. ./CATALOG/USEFN) 2>&1 | normalise)"
 
+# THE MANIFEST CAN BE mvpkg.json (mvx#285).  mv_package dropped PKG -- "PKG is
+# gone; mvpkg.json is the manifest" is one of its own tests -- and every reader
+# on this side looked only for PKG, so linking it answered "is not a package".
+# Nothing here had ever linked a package without a PKG, which is how a package
+# manager became unlinkable by the thing that links packages.
+#
+# The dependency grammars differ and that is the part worth asserting: PKG holds
+# short names, mvpkg.json owner-qualified ones with an optional @system filter
+# and :constraint.  `json@!mvx` means NOT on mvx, so it must be skipped here
+# while curl and cmd are still demanded -- a bare strip of the prefix would
+# demand the one dependency this platform excludes.
+JPKG="$TESTROOT/jsonpkg"; rm -rf "$JPKG"; mkdir -p "$JPKG/BP"
+printf '# MVX account descriptor\nname=jsonpkg\nversion=1\n' > "$JPKG/.mvx"
+cat > "$JPKG/mvpkg.json" <<'JEOF'
+{ "name": "mvx-lang/jsonpkg", "version": "3.1.4",
+  "systems": ["mvx", "udt"],
+  "dependencies": ["mvx-lang/jdep", "mvx-lang/jskip@!mvx:^1.5", "?mvx-lang/jopt"],
+  "devDependencies": ["mvx-lang/jbuild"] }
+JEOF
+printf 'SUBROUTINE JSONSUB(R)\nR = "json-manifest"\nRETURN\n' > "$JPKG/BP/JSONSUB"
+JDEP="$TESTROOT/jdep"; rm -rf "$JDEP"; mkdir -p "$JDEP/BP"
+printf '# MVX account descriptor\nname=jdep\nversion=1\n' > "$JDEP/.mvx"
+printf 'jdep\n1.0.0\na dependency named the PKG way\n' > "$JDEP/PKG"
+printf 'SUBROUTINE JDEPSUB(R)\nR = "dep"\nRETURN\n' > "$JDEP/BP/JDEPSUB"
+# 9200 recognises a sibling by its VOC, so a dependency has to look like an
+# account, not just a directory with the right name.
+mkdir -p "$JDEP/VOC"
+JACC="$TESTROOT/jacc"; rm -rf "$JACC"; mkdir -p "$JACC"
+"$ROOT/scripts/mkaccount.sh" "$JACC" >/dev/null 2>&1
+check tcl-jsonmanifest "$( \
+  MVXPRIV=developer "$TCL" -a "$JPKG" -c 'BUILD-PKG .' >/dev/null 2>&1; \
+  MVXPRIV=developer "$TCL" -a "$JDEP" -c 'BUILD-PKG .' >/dev/null 2>&1; \
+  echo '--- links, and pulls the dependency that applies'; \
+  "$TCL" -a "$JACC" -c "LINK-PKG $JPKG" 2>&1 | normalise; \
+  echo '--- name, version and systems all came from the JSON'; \
+  "$TCL" -a "$JACC" -c 'LIST-PKGS' 2>&1 | normalise; \
+  echo '--- and a package with neither manifest is still refused'; \
+  mkdir -p "$TESTROOT/nomanifest"; \
+  "$TCL" -a "$JACC" -c "LINK-PKG $TESTROOT/nomanifest" 2>&1 | normalise)"
+
 # THE SAME CLASSIFICATION, THE OTHER BUILDER.  The check above runs BUILD-PKG,
 # the verb; mkpkg.sh builds the same package shape from the shell, and it kept
 # the #101 bug for both of them -- it tested only SUBROUTINE, so a FUNCTION was

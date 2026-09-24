@@ -64,11 +64,15 @@ UNTIL QUEUE = "" DO
          PRINT CUR:" is not a package (cannot open ":CUR:")"
          STOP
       END
-      READ PKGREC FROM PV, "PKG" ELSE
-         PRINT CUR:" is not a package (no PKG manifest)"
+      * WHICH manifest is 9000's business, not this gate's.  This used to READ
+      * "PKG" itself and stop when it was missing, which is how a package that
+      * carries only mvpkg.json was told it is not a package (mvx#285).  9000
+      * reports what it found in PMAN; empty means neither manifest is there.
+      GOSUB 9000
+      IF PMAN = "" THEN
+         PRINT CUR:" is not a package (no PKG or mvpkg.json manifest)"
          STOP
       END
-      GOSUB 9000
       * the manifest's systems field (attr 4) lists the MV platforms the
       * package targets; refuse one that declares systems but not this one.
       * The declared runtime requirement, checked BEFORE anything is linked.
@@ -221,8 +225,10 @@ PVER = ""
 PSYS = ""
 PDEPS = ""
 PREQ = ""
+PMAN = ""
 OPEN CUR TO MPD THEN
    READ MF FROM MPD, "PKG" THEN
+      PMAN = "PKG"
       PNAME = MF<1>
       PVER = MF<2>
       PSYS = MF<4>
@@ -244,6 +250,11 @@ OPEN CUR TO MPD THEN
       NEXT MI
    END
 END
+* NO PKG?  THE OTHER MANIFEST (mvx#285).  mv_package dropped PKG -- "PKG is
+* gone; mvpkg.json is the manifest" is one of its own tests -- and every reader
+* here looked only for PKG, so linking it answered "is not a package".  PKG is
+* still tried FIRST: mvx's own packages/http carries one and no mvpkg.json.
+IF PMAN = "" THEN GOSUB 9500
 IF PNAME = "" THEN
    LS = 0
    FOR MI = 1 TO LEN(CUR)
@@ -251,6 +262,128 @@ IF PNAME = "" THEN
    NEXT MI
    PNAME = CUR[LS + 1, LEN(CUR)]
 END
+RETURN
+
+* ---- 9500: the same five fields out of mvpkg.json ----------------------
+* Scanned, not JSONDECODE'd.  JSONDECODE is an extension the json PACKAGE
+* provides, and a standard verb cannot depend on a package being installed --
+* the same bootstrap rule mvpkg follows for its own transport.  Five fields are
+* wanted, two flat strings and three string arrays, which is less code than the
+* dependency would be.
+*
+* THE TWO MANIFESTS NAME THINGS DIFFERENTLY, and this is the part to get right.
+* PKG holds short names (`cmd`, depending on `getopt`); mvpkg.json holds
+* owner-qualified ones (`mvx-lang/cmd`, depending on `mvx-lang/getopt`).  9200
+* resolves a dependency by looking for a SIBLING DIRECTORY of that name, so an
+* owner prefix would send it looking for `<parent>/mvx-lang/getopt`.  Every name
+* taken from here is reduced to its last path segment.
+9500
+MJ = OSREAD(CUR : "/mvpkg.json")
+IF STATUS() # 0 THEN RETURN
+PMAN = "mvpkg.json"
+* Self-contained: 9500 only runs when there was no PKG, so there is nothing to
+* clobber, and not every caller of 9000 initialises every field -- UNLINK-PKG
+* wants only the name and the dependencies, and read PSYS unassigned when this
+* block set it.
+PVER = "" ; PSYS = ""
+MJQ = CHAR(34)
+MJKEY = "name" ; GOSUB 9510 ; MJB = MJVAL ; GOSUB 9530 ; PNAME = MJB
+MJKEY = "version" ; GOSUB 9510 ; PVER = MJVAL
+MJKEY = "systems" ; GOSUB 9520
+MJN = DCOUNT(MJLIST, @AM)
+FOR MI = 1 TO MJN
+   IF PSYS = "" THEN PSYS = MJLIST<MI> ELSE PSYS := " " : MJLIST<MI>
+NEXT MI
+MJKEY = "dependencies" ; GOSUB 9520
+MJN = DCOUNT(MJLIST, @AM)
+FOR MI = 1 TO MJN
+   MJD = MJLIST<MI>
+   * the prefixes are the same grammar PKG uses, and they sit OUTSIDE the name,
+   * so strip them, reduce the name, then put them back.
+   MJPFX = ""
+   IF MJD[1, 1] = "?" THEN MJPFX = "?" ; MJD = MJD[2, LEN(MJD)]
+   IF MJD[1, 1] = "!" THEN
+      PREQ<-1> = MJD[2, LEN(MJD)]
+   END ELSE
+   * name[@sys,sys | @!sys,sys][:constraint].  PKG never carried either --
+   * mvpkg.json does, and neither is part of the directory name a dependency
+   * resolves to, so both come off before the name is used (mvx#285).
+   MJC = INDEX(MJD, ":", 1)
+   IF MJC > 0 THEN MJD = MJD[1, MJC - 1]
+   MJF = ""
+   MJA = INDEX(MJD, "@", 1)
+   IF MJA > 0 THEN
+      MJF = MJD[MJA + 1, LEN(MJD)]
+      MJD = MJD[1, MJA - 1]
+   END
+   GOSUB 9540
+      IF MJAPP THEN
+         MJB = MJD ; GOSUB 9530
+         IF MJB # "" THEN PDEPS<-1> = MJPFX : MJB
+      END
+   END
+NEXT MI
+* devDependencies are build-only, which is exactly what '+' means in PKG.
+MJKEY = "devDependencies" ; GOSUB 9520
+MJN = DCOUNT(MJLIST, @AM)
+FOR MI = 1 TO MJN
+   MJB = MJLIST<MI> ; GOSUB 9530
+   IF MJB # "" THEN PDEPS<-1> = "+" : MJB
+NEXT MI
+RETURN
+
+* 9510: MJVAL = the "MJKEY":"value" string in MJ, "" when there is none.
+9510
+MJVAL = ""
+MJP = INDEX(MJ, MJQ : MJKEY : MJQ, 1)
+IF MJP = 0 THEN RETURN
+MJT = MJ[MJP + LEN(MJKEY) + 2, LEN(MJ)]
+MJC = INDEX(MJT, ":", 1)
+IF MJC = 0 THEN RETURN
+MJT = MJT[MJC + 1, LEN(MJT)]
+MJA = INDEX(MJT, MJQ, 1)
+IF MJA = 0 THEN RETURN
+MJT = MJT[MJA + 1, LEN(MJT)]
+MJE = INDEX(MJT, MJQ, 1)
+IF MJE = 0 THEN RETURN
+MJVAL = MJT[1, MJE - 1]
+RETURN
+
+* 9520: MJLIST = the "MJKEY":[ ... ] array in MJ, one entry per attribute.
+9520
+MJLIST = ""
+MJP = INDEX(MJ, MJQ : MJKEY : MJQ, 1)
+IF MJP = 0 THEN RETURN
+MJT = MJ[MJP, LEN(MJ)]
+MJO = INDEX(MJT, "[", 1) ; MJE = INDEX(MJT, "]", 1)
+IF MJO = 0 OR MJE <= MJO THEN RETURN
+MJSEG = MJT[MJO, MJE - MJO + 1]
+MJDONE = 0
+LOOP UNTIL MJDONE DO
+   MJA = INDEX(MJSEG, MJQ, 1)
+   IF MJA = 0 THEN
+      MJDONE = 1
+   END ELSE
+      MJSEG = MJSEG[MJA + 1, LEN(MJSEG)]
+      MJE = INDEX(MJSEG, MJQ, 1)
+      IF MJE = 0 THEN
+         MJDONE = 1
+      END ELSE
+         MJV = TRIM(MJSEG[1, MJE - 1])
+         MJSEG = MJSEG[MJE + 1, LEN(MJSEG)]
+         IF MJV # "" THEN MJLIST<-1> = MJV
+      END
+   END
+REPEAT
+RETURN
+
+* 9530: MJB = its own last path segment ("mvx-lang/cmd" -> "cmd").
+9530
+MJS = 0
+FOR MJI = 1 TO LEN(MJB)
+   IF MJB[MJI, 1] = "/" THEN MJS = MJI
+NEXT MJI
+IF MJS > 0 THEN MJB = MJB[MJS + 1, LEN(MJB)]
 RETURN
 
 * ---- 9200: resolve dependency name D near CUR -> RPATH -----------------
@@ -277,4 +410,27 @@ FOR MI = 1 TO NSEG
       END
    END
 NEXT MI
+RETURN
+
+* 9540: MJAPP = 1 when the platform filter MJF admits mvx.  Empty admits
+* everything; "a,b" is a whitelist; "!a,b" a blacklist.  A dependency that does
+* not apply here is not a dependency -- mv_package declares
+* "mvx-lang/json@!mvx:^1.5", meaning json is needed everywhere EXCEPT mvx, and
+* without this it would be demanded on the one system that excludes it.
+9540
+MJAPP = 1
+IF MJF = "" THEN RETURN
+MJNEG = 0
+IF MJF[1, 1] = "!" THEN MJNEG = 1 ; MJF = MJF[2, LEN(MJF)]
+MJHIT = 0
+MJN2 = DCOUNT(MJF, ",")
+FOR MJJ = 1 TO MJN2
+   IF TRIM(FIELD(MJF, ",", MJJ)) = "mvx" THEN MJHIT = 1
+NEXT MJJ
+IF MJNEG THEN
+   MJAPP = 0
+   IF MJHIT = 0 THEN MJAPP = 1
+END ELSE
+   MJAPP = MJHIT
+END
 RETURN
