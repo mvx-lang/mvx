@@ -5639,6 +5639,61 @@ else
   echo "  (second-provider test skipped — could not build the library)"
 fi
 
+# ---------------------------------------------------------------------------
+# A LITERAL TOO BIG TO HOLD IS A SOURCE ERROR, NOT A CRASH (mvx#241).
+#
+# `X = 9223372036854775808' aborted mvx-basic with an uncaught C++ exception
+# (std::out_of_range from stoll/stod) and named neither the file nor the line
+# -- the one input that could not be diagnosed from the diagnostic.  The
+# `BASIC' verb parses `item:line: message' from stderr, so an abort is also
+# invisible to the thing that reports compile errors.
+#
+# WHAT THE OTHER SYSTEMS DO, measured, because they do not agree: UniData 8.3
+# accepts it and is EXACT (99999999999999999999 + 1 prints all 21 digits, so
+# it is decimal, far wider than a double); UniVerse 14.2.1 accepts it and
+# silently rounds to a double (-9223372036854775808 printed as
+# -9223372036854780000); ScarletDME refuses to compile it.  MVX reports it --
+# UniData's answer needs arbitrary precision the numeric tier does not have,
+# and UniVerse's is a silent wrong answer.
+echo "== a numeric literal too big to hold"
+LITA="$TESTROOT/litacct"; mkdir -p "$LITA"
+litok=1
+# INT64_MAX still compiles and prints itself.
+printf 'X = 9223372036854775807\nPRINT X\n' > "$LITA/max.b"
+if "$MVX" "$LITA/max.b" -o "$LITA/max" >/dev/null 2>&1; then
+  [ "$("$LITA/max" 2>/dev/null)" = "9223372036854775807" ] || litok=0
+else
+  litok=0
+fi
+if [ "$litok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  the largest integer still compiles and prints itself"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL literal/max: INT64_MAX no longer works"
+fi
+
+# Past it, and a float past DBL_MAX: reported as item:line, never an abort.
+# A signal death shows up as rc >= 128, which is what this is really watching.
+litbad=0
+for lit in '9223372036854775808' '99999999999999999999' '-9223372036854775808'; do
+  printf 'X = %s\nPRINT X\n' "$lit" > "$LITA/b.b"
+  msg="$("$MVX" "$LITA/b.b" -o "$LITA/b" 2>&1)"; rc=$?
+  case "$msg" in *"b.b:1: numeric literal out of range"*) ;; *) litbad=1 ;; esac
+  [ "$rc" -lt 128 ] || litbad=1
+done
+printf 'X = %s.5\nPRINT X\n' "$(printf '9%.0s' $(seq 400))" > "$LITA/f.b"
+fmsg="$("$MVX" "$LITA/f.b" -o "$LITA/f" 2>&1)"; frc=$?
+case "$fmsg" in *"f.b:1: numeric literal out of range"*) ;; *) litbad=1 ;; esac
+[ "$frc" -lt 128 ] || litbad=1
+# And it must not quote all 400 digits back at you.
+[ "${#fmsg}" -lt 120 ] || litbad=1
+if [ "$litbad" = 0 ]; then
+  PASS=$((PASS + 1))
+  echo "  past it, and a float past DBL_MAX, name the line instead of aborting"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL literal/range: [$fmsg]"
+fi
+
 echo "== records as documents"
 # Compiled here rather than by CMake: it is a test, not something to install,
 # and building it against build/lib is the same thing build-native.sh does.
