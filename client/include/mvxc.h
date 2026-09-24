@@ -61,7 +61,18 @@ typedef struct mvxc_val     mvxc_val;
 /* --- session ------------------------------------------------------------
  * `account` is the account directory.  NULL takes the process default, the
  * same one a verb would get ($MVXACCOUNT, else the working directory).
- * One session is one MV session: its select list, its locks, its account. */
+ * One session is one MV session: its select list, its locks, its account.
+ *
+ * CONNECTING ENTERS THE ACCOUNT, WHICH RUNS ITS LOGIN.  A VOC LOGIN entry is
+ * executed exactly as a LOGTO would run it, because that is what this is --
+ * an account's LOGIN is how it makes itself usable (pointers, a registry URL,
+ * whatever it needs), and a session that skipped it would be subtly different
+ * from every other way in.
+ *
+ * It runs at @LEVEL 1, never 0, for the reason in mvxc_connect: a LOGIN that
+ * prompts can tell it does not own the screen and decline (mvx#264, #270).
+ * A LOGIN that insists on reading the terminal anyway will block, the same as
+ * it would from a LOGTO inside a running program. */
 mvxc_session *mvxc_connect(const char *account, mvxc_status *st);
 void          mvxc_disconnect(mvxc_session *s);
 
