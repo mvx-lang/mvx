@@ -538,11 +538,11 @@ target_include_directories(mvx-basic PRIVATE runtime/include)
 # assumption on every platform.
 if(APPLE)
   set(MVX_INSTALL_RPATH "@loader_path/../lib")
+  set(MVX_INSTALL_RPATH_LIB "@loader_path")
 else()
   set(MVX_INSTALL_RPATH "\$ORIGIN/../lib")
+  set(MVX_INSTALL_RPATH_LIB "\$ORIGIN")
 endif()
-set_target_properties(mvx mvx-basic mvx-git-adopt PROPERTIES
-  INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 
 # mvx-launch is installed even though nothing invokes it by name: --catalog
 # copies it beside a cataloged program, so a tree without it cannot catalog
@@ -551,6 +551,17 @@ set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd mvx-launch)
 if(MVX_WITH_DAEMON)
   list(APPEND MVX_INSTALL_BINS mvx-lmdbd mvx-lmdbd-admin)
 endif()
+
+# EVERY INSTALLED BINARY, NOT THREE OF THEM (mvx#297).  The rpath used to name
+# mvx, mvx-basic and mvx-git-adopt, so the published v0.4.0 shipped an
+# mvx-launch that could not find libmvxrt.so and an mvx-lmdbd that could not
+# find liblmdb -- neither would start from an unpacked tarball.  mvx-launch got
+# away with it because libmvxrt's constructor puts the runtime directory on the
+# loader path for children (runtime/src/mvx_ctx.c) and mvx is what spawns it;
+# mvx-lmdbd has no parent to inherit from and simply failed.  A binary we
+# install into bin/ resolves ../lib, full stop.
+set_target_properties(${MVX_INSTALL_BINS} PROPERTIES
+  INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 install(TARGETS ${MVX_INSTALL_BINS} RUNTIME DESTINATION bin)
 
 set(MVX_INSTALL_DRIVERS mvxrt mvxc mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
@@ -569,6 +580,13 @@ endif()
 if(MVX_MYSQL_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxdrv_mysql)
 endif()
+# AND THE LIBRARIES BESIDE THEM (mvx#297).  A driver is dlopen'd by absolute
+# path, so the loader resolves ITS dependencies with ITS own rpath and not the
+# program's -- which is why libmvxdrv_lmdb could not see a liblmdb sitting in
+# the same directory, and why libmvxc could not see libmvxrt.  $ORIGIN is that
+# directory.
+set_target_properties(${MVX_INSTALL_DRIVERS} PROPERTIES
+  INSTALL_RPATH "${MVX_INSTALL_RPATH_LIB}")
 install(TARGETS ${MVX_INSTALL_DRIVERS} LIBRARY DESTINATION lib)
 install(FILES ${CMAKE_BINARY_DIR}/lib/mvx_crt.o DESTINATION lib)
 
