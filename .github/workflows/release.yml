@@ -143,6 +143,48 @@ jobs:
             zlib-devel libzstd-devel ncurses-devel git tar gzip
           llvm-config --version
 
+      # THE VERSION COMES FROM THE REF, NOT FROM GIT (mvx#299).  A tag says what
+      # it is; asking `git describe' inside the build container is what produced
+      # a v0.4.0 whose own binaries reported 0.0.0-dev.  git is only asked for
+      # the rolling `dev' tag, where there is no version in the ref to read --
+      # and that needs both the v* tags (the checkout is shallow) and git's
+      # permission to read a workspace it does not own (the container is root,
+      # the checkout belongs to the runner's user).  Neither was true before,
+      # which is why a dev build has always called itself 0.0.0-dev.
+      #
+      # The two outputs are not the same thing.  `asset' names the tarball and
+      # must stay exactly what the ref says, because setup-mvx builds the asset
+      # name from the tag it was asked for -- a dev build's asset is
+      # mvx-lang-dev-linux-<arch>.tar.gz and renaming it breaks every consumer.
+      # `version' is what goes inside the binaries.
+      - name: Resolve the version
+        id: ver
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          REF="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          ASSET="${REF#v}"
+
+          case "$REF" in
+            v[0-9]*)
+              # A release. Exact, and a failure here must stop the release.
+              VER="${REF#v}" ;;
+            *)
+              # The rolling dev tag: describe against the last real release.
+              git fetch --tags --force --depth=100 origin >/dev/null 2>&1 || true
+              VER="$(git describe --tags --match 'v*' --dirty 2>/dev/null | sed 's/^v//' || true)"
+              if [ -z "$VER" ]; then
+                # Vague is allowed for a dev build; silence is not.
+                echo "::warning::git could not describe '$REF'; stamping 0.0.0-dev"
+                VER=0.0.0-dev
+              fi ;;
+          esac
+          [ -n "$VER" ] || { echo "::error::no version for ref '$REF'"; exit 1; }
+
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "ref $REF -> version $VER, asset name $ASSET"
+
       - name: Build and install
         env:
           # The install asks GitHub which package versions exist (mvx#212);
@@ -155,7 +197,8 @@ jobs:
           # gcc-toolset-14 is not on PATH until its enable script is sourced;
           # EL8's stock gcc is 8.5 and does not do C++17 well enough.
           . /opt/rh/gcc-toolset-14/enable
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DMVX_VERSION="${{ steps.ver.outputs.version }}"
           cmake --build build
           cmake --install build --prefix "$PWD/stage/mvx-lang"
 
@@ -320,6 +363,22 @@ jobs:
           echo "$out"
           test "$out" = "install-ok 4"
 
+          # AND THAT IT KNOWS WHAT IT IS (mvx#299).  The version is a promise
+          # `requires' ranges are checked against, so a binary that misreports
+          # it is worse than one that admits 0.0.0-dev.  Asserted, because a
+          # wrong version breaks nothing at build time.
+          want="${{ steps.ver.outputs.version }}"
+          for b in mvx mvx-basic; do
+            got="$("$BIN/$b" --version)"
+            echo "$got"
+            # " $want " and not "$want": a prefix match would let 0.4.10 pass
+            # as 0.4.1.  --version prints "<name> <version> (driver ABI N)".
+            case "$got" in
+              *" $want "*) ;;
+              *) echo "::error::$b reports '$got', expected version $want"; exit 1 ;;
+            esac
+          done
+
       - name: Bundle the wiki docs
         run: |
           # Ship the current documentation (the GitHub wiki) inside the tarball
@@ -333,9 +392,7 @@ jobs:
       - name: Package tarball
         id: pkg
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          [ "${{ github.event_name }}" = workflow_dispatch ] && VER="${{ inputs.tag }}" && VER="${VER#v}"
-          NAME="mvx-lang-${VER}-linux-${{ matrix.arch }}.tar.gz"
+          NAME="mvx-lang-${{ steps.ver.outputs.asset }}-linux-${{ matrix.arch }}.tar.gz"
           tar -C stage -czf "$NAME" mvx-lang
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
@@ -413,8 +470,26 @@ jobs:
           [ -z "$bad" ] || { echo "::error::unresolved on a plain host:$bad"; exit 1; }
 
           # And then actually start them.  A NEEDED soname is resolved before
-          # main(), so this is the whole of mvx#297 in one line.
-          "$B/mvx" --version
+          # main(), so starting at all is the whole of mvx#297 -- and what it
+          # prints is mvx#299: a published release must say which release it is,
+          # because `requires' ranges are checked against that string.  v0.4.0
+          # shipped saying 0.0.0-dev.
+          REF="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          case "$REF" in
+            v[0-9]*)
+              want="${REF#v}"
+              for b in mvx mvx-basic; do
+                got="$("$B/$b" --version)"
+                echo "$b: $got"
+                case "$got" in
+                  *" $want "*) ;;
+                  *) echo "::error::$b reports '$got', not the released $want"; exit 1 ;;
+                esac
+              done ;;
+            *)
+              # A dev build has no version in its ref; it must still start.
+              echo "dev build: $("$B/mvx" --version)" ;;
+          esac
 
           printf 'PRINT "published-ok ":2+2\n' > prog.b
           "$B/mvx-basic" prog.b -o prog
@@ -448,15 +523,30 @@ jobs:
       - name: Resolve version
         id: v
         run: |
+          set -eu
           REF="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          # `tag' names the image and follows the ref; `version' is stamped into
+          # the binaries inside it.  The image build cannot work this out for
+          # itself -- .dockerignore excludes .git -- so every image ever built
+          # has reported 0.0.0-dev (mvx#299).
+          case "$REF" in
+            v[0-9]*) VER="${REF#v}" ;;
+            *)       git fetch --tags --force --depth=100 origin >/dev/null 2>&1 || true
+                     VER="$(git describe --tags --match 'v*' --dirty 2>/dev/null | sed 's/^v//' || true)"
+                     [ -n "$VER" ] || { echo "::warning::git could not describe '$REF'; stamping 0.0.0-dev"; VER=0.0.0-dev; } ;;
+          esac
           echo "tag=${REF#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "ref $REF -> image tag ${REF#v}, version $VER"
 
       - name: Base image (ghcr.io/mvx-lang/mvx)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile.base
-          build-args: LLVM_VERSION=${{ env.LLVM_VERSION }}
+          build-args: |
+            LLVM_VERSION=${{ env.LLVM_VERSION }}
+            MVX_VERSION=${{ steps.v.outputs.version }}
           # the install's release listing uses the rate-limited GitHub API
           # (mvx#212); a secret, so it never lands in an image layer
           secrets: |

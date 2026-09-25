@@ -7,22 +7,48 @@ project(mvx LANGUAGES C CXX)
 # checkout with no tags, or a source tarball, reports 0.0.0-dev, which no
 # `requires` range will satisfy: better to say "unknown" out loud than to
 # claim a version the binary may not have.
-find_package(Git QUIET)
-set(MVX_VERSION "0.0.0-dev")
-if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-  # --match v*: the release workflow keeps a rolling `dev` tag on develop's
-  # HEAD, and without this that tag is what describe finds -- so every develop
-  # build would report "unknown" instead of "newer than the last release".
-  execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
-                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-                  OUTPUT_VARIABLE MVX_GIT_DESC
-                  OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET)
-  if(MVX_GIT_DESC MATCHES "^v[0-9]")
-    string(REGEX REPLACE "^v" "" MVX_VERSION "${MVX_GIT_DESC}")
+# WHAT VERSION IS THIS BUILD?  What the builder says, then what git says, then
+# "we do not know".
+#
+# A RELEASE MUST NOT HAVE TO ASK GIT (mvx#299).  v0.4.0 published binaries that
+# reported 0.0.0-dev, because mvx#203 moved the release build into a container
+# that runs as root over a workspace owned by the runner's user -- so git
+# refused the repository outright ("detected dubious ownership") and the
+# ERROR_QUIET below threw the message away.  The release knows the tag it is
+# building; it passes -DMVX_VERSION=x.y.z and git is not consulted at all.  The
+# container images never had a chance either way: .dockerignore excludes .git.
+set(MVX_VERSION "" CACHE STRING "version to stamp in; empty means ask git")
+if(MVX_VERSION)
+  message(STATUS "MVX version ${MVX_VERSION} (given)")
+else()
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    # --match v*: the release workflow keeps a rolling `dev` tag on develop's
+    # HEAD, and without this that tag is what describe finds -- so every develop
+    # build would report "unknown" instead of "newer than the last release".
+    execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
+                    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                    OUTPUT_VARIABLE MVX_GIT_DESC
+                    ERROR_VARIABLE MVX_GIT_ERR
+                    RESULT_VARIABLE MVX_GIT_RC
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_STRIP_TRAILING_WHITESPACE)
+    if(MVX_GIT_DESC MATCHES "^v[0-9]")
+      string(REGEX REPLACE "^v" "" MVX_VERSION "${MVX_GIT_DESC}")
+    elseif(NOT MVX_GIT_RC EQUAL 0)
+      # SAY IT.  This was ERROR_QUIET, so a build that could not work out its
+      # own version said nothing and stamped 0.0.0-dev -- which is how a
+      # release shipped misreporting itself with every check green.
+      message(WARNING
+        "git describe could not name a version (rc=${MVX_GIT_RC}): ${MVX_GIT_ERR} -- "
+        "pass -DMVX_VERSION=x.y.z to stamp one")
+    endif()
   endif()
+  if(NOT MVX_VERSION)
+    set(MVX_VERSION "0.0.0-dev")
+  endif()
+  message(STATUS "MVX version ${MVX_VERSION}")
 endif()
-message(STATUS "MVX version ${MVX_VERSION}")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
