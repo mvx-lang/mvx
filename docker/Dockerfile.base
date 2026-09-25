@@ -52,6 +52,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       zlib1g-dev libzstd-dev libncurses-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# The version to stamp into the binaries.  .dockerignore excludes .git, so a
+# build here cannot ask git what it is and every image reported 0.0.0-dev until
+# this was passed in (mvx#299).  Empty falls back to that same answer.
+ARG MVX_VERSION=""
+
 COPY . /src
 WORKDIR /src
 # The install lists each package's releases through the GitHub API (mvx#212),
@@ -67,6 +72,7 @@ RUN --mount=type=secret,id=github_token \
     fi; \
     cmake -S . -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
+      -DMVX_VERSION="${MVX_VERSION}" \
       -DCMAKE_PREFIX_PATH=/usr/lib/llvm-${LLVM_VERSION} \
  && cmake --build build \
  && MVX_INSTALL_PROMPT=never cmake --install build --prefix /usr/local
