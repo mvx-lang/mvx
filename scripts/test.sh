@@ -4422,6 +4422,36 @@ int main(int argc, char **argv) {
     printf("dropfile=%d missing=%d\n", mvxc_delete_file(s, "ZZTEMP"),
                                        mvxc_delete_file(s, "NOSUCHFILE"));
     mvxc_delete_file(s, "ZZDIR");
+
+    /* --- reading into a value the caller keeps -------------------------
+       mvxc_read allocates one per record; a consumer walking an account wants
+       one value reused, which is the difference between a malloc per record
+       and none. */
+    mvxc_file *g = mvxc_open(s, "PARTS", NULL, &st);
+    for (int i = 1; i <= 3; i++) {
+        char rid[8]; snprintf(rid, sizeof rid, "R%d", i);
+        mvxc_val *w = mvxc_new(); mvxc_set_attr(w, 1, rid);
+        mvxc_write(g, rid, w); mvxc_free(w);
+    }
+    mvxc_val *rec = mvxc_new();
+    printf("into:");
+    for (int i = 1; i <= 3; i++) {
+        char rid[8]; snprintf(rid, sizeof rid, "R%d", i);
+        printf(" %d/%s", mvxc_read_into(g, rid, rec), mvxc_attr(rec, 1));
+    }
+    printf("\n");
+    /* A MISS LEAVES dst ALONE, which is the documented contract: a caller that
+       checks the status cannot read stale content by accident, and one that
+       forgets sees the last good record rather than something undefined. */
+    printf("into-miss=%d kept=%s\n", mvxc_read_into(g, "NOSUCH", rec),
+           mvxc_attr(rec, 1));
+    mvxc_free(rec);
+    mvxc_close(g);
+
+    /* --- what kind of account, what kind of VOC record ----------------- */
+    printf("openaccount=%d\n", mvxc_openaccount());
+    printf("vocclass V=%d PA=%d Q=%d\n", mvxc_voc_class("V"),
+           mvxc_voc_class("PA"), mvxc_voc_class("Q"));
     mvxc_disconnect(s);
     return 0;
 }
@@ -4430,7 +4460,10 @@ CLEOF
         -L"$ROOT/build" -lmvxc -Wl,-rpath,"$ROOT/build" \
         > "$TESTROOT/client.cc.log" 2>&1; then
     check tcl-client "$( \
-      cd "$CLA" && MVXPRIV=developer "$TESTROOT/clientbin" "$CLA" 2>&1 | normalise)"
+      cd "$CLA" && MVXPRIV=developer "$TESTROOT/clientbin" "$CLA" 2>&1 | normalise; \
+      echo '--- and the open-account answer follows the account, not a constant'; \
+      cd "$CLA" && MVXPRIV=developer MVX_OPENACCOUNT=1 "$TESTROOT/clientbin" "$CLA" \
+        2>&1 | grep '^openaccount=')"
   else
     FAIL=$((FAIL + 1))
     echo "FAIL client: the library does not link from outside the tree"

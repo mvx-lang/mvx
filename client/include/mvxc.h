@@ -130,6 +130,15 @@ void       mvxc_close(mvxc_file *f);
 /* The caller owns what mvxc_read returns and frees it with mvxc_free.  NULL
  * with *st = MVXC_NOTFOUND is a miss, which is not an error. */
 mvxc_val   *mvxc_read (mvxc_file *f, const char *id, mvxc_status *st);
+
+/* The same read, into a value the caller already has -- for a loop over many
+ * records, which is what a consumer walking an account does.  mvxc_read
+ * allocates one per record and the caller frees it; this reuses one, which is
+ * the difference between a malloc per record and none.  `dst` keeps whatever it
+ * held on a miss, so a caller that checks the status cannot read stale content
+ * by accident; the strings it handed out are released either way, because the
+ * value is about to mean something else. */
+mvxc_status mvxc_read_into(mvxc_file *f, const char *id, mvxc_val *dst);
 mvxc_val   *mvxc_readu(mvxc_file *f, const char *id, int wait, mvxc_status *st);
 mvxc_status mvxc_write (mvxc_file *f, const char *id, mvxc_val *rec);
 mvxc_status mvxc_delete(mvxc_file *f, const char *id);
@@ -148,6 +157,19 @@ mvxc_status mvxc_create_file(mvxc_session *s, const char *name,
                              const char *type);
 mvxc_status mvxc_delete_file(mvxc_session *s, const char *name);
 mvxc_val   *mvxc_files(mvxc_session *s);
+
+/* --- what kind of account, and what kind of VOC record --------------------
+ * mvxc_openaccount: is this account in the open (portable) format?  A consumer
+ * that walks or writes account structure has to know, because the two keep
+ * records differently.
+ *
+ * mvxc_voc_class classifies a master-VOC record TYPE for a tool deciding what
+ * belongs to the account and what belongs to the system: 0 keep (a user proc),
+ * 1 always drop (a system verb or keyword), 2 drop when interchanging an open
+ * account (a file pointer).  It answers about the type string alone and touches
+ * no session, which is why it takes none. */
+int mvxc_openaccount(void);
+int mvxc_voc_class(const char *type);
 
 /* Would CALL <name> resolve in this account?  mvxc_call asks this before it
  * calls; it is here separately because a caller usually wants to CHOOSE rather
