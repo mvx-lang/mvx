@@ -399,13 +399,6 @@ mvxc_val *mvxc_files(mvxc_session *s) {
     return v;
 }
 
-int mvxc_openaccount(void) { return mvx_openaccount(); }
-
-int mvxc_voc_class(const char *type) {
-    if (!type) return 0;
-    return mvx_voc_class(type, (int64_t)strlen(type));
-}
-
 int mvxc_cataloged(mvxc_session *s, const char *name) {
     (void)s;
     if (!name) return 0;

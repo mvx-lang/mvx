@@ -98,7 +98,11 @@ const char   *mvxc_error(mvxc_session *s);
  *     printf("%d %s", mvxc_execute(s, "X", cap), mvxc_str(cap));   // WRONG
  *
  * may read the capture before the execute fills it -- and then free that
- * string when the execute runs.  Sequence them. */
+ * string when the execute runs.  Sequence them.
+ *
+ * This has now caught the author of the rule twice, in two different tests, so
+ * treat it as a property of the API rather than a mistake someone else makes:
+ * if a value is written and read in one statement, split the statement. */
 mvxc_val *mvxc_new(void);
 mvxc_val *mvxc_new_str(const char *s);
 mvxc_val *mvxc_from_bytes(const char *p, size_t n);
@@ -157,19 +161,6 @@ mvxc_status mvxc_create_file(mvxc_session *s, const char *name,
                              const char *type);
 mvxc_status mvxc_delete_file(mvxc_session *s, const char *name);
 mvxc_val   *mvxc_files(mvxc_session *s);
-
-/* --- what kind of account, and what kind of VOC record --------------------
- * mvxc_openaccount: is this account in the open (portable) format?  A consumer
- * that walks or writes account structure has to know, because the two keep
- * records differently.
- *
- * mvxc_voc_class classifies a master-VOC record TYPE for a tool deciding what
- * belongs to the account and what belongs to the system: 0 keep (a user proc),
- * 1 always drop (a system verb or keyword), 2 drop when interchanging an open
- * account (a file pointer).  It answers about the type string alone and touches
- * no session, which is why it takes none. */
-int mvxc_openaccount(void);
-int mvxc_voc_class(const char *type);
 
 /* Would CALL <name> resolve in this account?  mvxc_call asks this before it
  * calls; it is here separately because a caller usually wants to CHOOSE rather

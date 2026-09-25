@@ -4437,21 +4437,22 @@ int main(int argc, char **argv) {
     printf("into:");
     for (int i = 1; i <= 3; i++) {
         char rid[8]; snprintf(rid, sizeof rid, "R%d", i);
-        printf(" %d/%s", mvxc_read_into(g, rid, rec), mvxc_attr(rec, 1));
+        /* SEQUENCED.  Putting the read and the accessor in one argument list is
+           unspecified evaluation order, and on gcc the READ ran second -- so
+           the accessor's string was released by the read that followed it.  The
+           rule in mvxc.h is doing its job; it has now caught its own author
+           twice, which is why that comment carries the broken line. */
+        mvxc_status rs = mvxc_read_into(g, rid, rec);
+        printf(" %d/%s", rs, mvxc_attr(rec, 1));
     }
     printf("\n");
     /* A MISS LEAVES dst ALONE, which is the documented contract: a caller that
        checks the status cannot read stale content by accident, and one that
        forgets sees the last good record rather than something undefined. */
-    printf("into-miss=%d kept=%s\n", mvxc_read_into(g, "NOSUCH", rec),
-           mvxc_attr(rec, 1));
+    mvxc_status ms = mvxc_read_into(g, "NOSUCH", rec);
+    printf("into-miss=%d kept=%s\n", ms, mvxc_attr(rec, 1));
     mvxc_free(rec);
     mvxc_close(g);
-
-    /* --- what kind of account, what kind of VOC record ----------------- */
-    printf("openaccount=%d\n", mvxc_openaccount());
-    printf("vocclass V=%d PA=%d Q=%d\n", mvxc_voc_class("V"),
-           mvxc_voc_class("PA"), mvxc_voc_class("Q"));
     mvxc_disconnect(s);
     return 0;
 }
@@ -4461,9 +4462,7 @@ CLEOF
         > "$TESTROOT/client.cc.log" 2>&1; then
     check tcl-client "$( \
       cd "$CLA" && MVXPRIV=developer "$TESTROOT/clientbin" "$CLA" 2>&1 | normalise; \
-      echo '--- and the open-account answer follows the account, not a constant'; \
-      cd "$CLA" && MVXPRIV=developer MVX_OPENACCOUNT=1 "$TESTROOT/clientbin" "$CLA" \
-        2>&1 | grep '^openaccount=')"
+)"
   else
     FAIL=$((FAIL + 1))
     echo "FAIL client: the library does not link from outside the tree"
