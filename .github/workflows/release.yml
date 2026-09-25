@@ -159,6 +159,93 @@ jobs:
           cmake --build build
           cmake --install build --prefix "$PWD/stage/mvx-lang"
 
+      # SHIP WHAT THE BUILD IMAGE HAPPENS TO CARRY (mvx#297).  v0.3.0 was built
+      # on the Ubuntu runner and linked libedit.so.2; since mvx#203 the build
+      # happens in manylinux_2_28 (AlmaLinux 8), whose libedit is soname 0.
+      # So every v0.4.0 binary asks its host for libedit.so.0 -- a soname no
+      # current distribution ships -- and mvx could not start anywhere except
+      # inside the image that built it.  Static linking is not open to us: the
+      # image has no libedit.a and EL8 packages none.
+      #
+      # RUNPATH IS NOT INHERITED, which is why each copy is patched.  bin/ is
+      # built with RUNPATH $ORIGIN/../lib, so the loader finds our libedit --
+      # but a RUNPATH applies only to the object that carries it, so libedit's
+      # own libtinfo.so.6 would be looked for in the system paths and nowhere
+      # else.  Give every copied library $ORIGIN and the closure holds.
+      - name: Bundle the libraries the host may not have
+        run: |
+          set -eu
+          LIB=stage/mvx-lang/lib
+
+          # Every soname anything we ship asks for.  Per file, because a
+          # non-ELF in the tree (mvx_crt.o's directory neighbours) must not
+          # take the whole listing down -- and because the loop below adds
+          # files to lib/ that this has to see on the next pass.
+          needed() {
+            for f in stage/mvx-lang/bin/* "$LIB"/*; do
+              [ -f "$f" ] || continue
+              objdump -p "$f" 2>/dev/null | awk '/NEEDED/ {print $2}'
+            done | sort -u
+          }
+
+          # Present on every glibc system, so never bundled and never a reason
+          # to rewrite a copied library.  Named once; the loop and the rpath
+          # decision below both read it.
+          universal() {
+            case "$1" in
+              libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1) return 0 ;;
+              libgcc_s.so.1|libstdc++.so.6|ld-linux*) return 0 ;;
+            esac
+            return 1
+          }
+
+          for pass in 1 2 3 4 5; do
+            added=
+            for so in $(needed); do
+              # Shipping our own copy of the universal set is what breaks a
+              # program, not what saves it.
+              universal "$so" && continue
+              case "$so" in
+                # dlopen'd backends, and the ONLY exception to the rule.
+                # Nothing that has to start may need a library we do not ship;
+                # a driver may, because a driver whose client library is absent
+                # is skipped and mvx runs on without that backend.  libpq in
+                # particular is coupled to somebody else's server version and
+                # is the host's to choose.  (liblmdb is not in this list:
+                # mvx-lmdbd links it and an executable does not degrade.)
+                libpq.so.*|libsqlite3.so.*) continue ;;
+                # Ours, installed above.
+                libmvx*) continue ;;
+              esac
+              [ -e "$LIB/$so" ] && continue
+
+              src=
+              for d in /usr/lib64 /lib64 /usr/lib /lib; do
+                [ -e "$d/$so" ] && { src="$d/$so"; break; }
+              done
+              [ -n "$src" ] || { echo "::error::$so is needed and is not in this image"; exit 1; }
+
+              cp -L "$src" "$LIB/$so"
+              chmod u+w "$LIB/$so"
+
+              # Only a library with a dependency of its own needs an rpath, and
+              # only then is it worth rewriting: patchelf pads the file to make
+              # room, which took libz from 99 KB to 2.1 MB.  libedit is the one
+              # that needs it (libtinfo.so.6); liblmdb, libz and libzstd need
+              # nothing but libc and are copied untouched.
+              for dep in $(objdump -p "$LIB/$so" 2>/dev/null | awk '/NEEDED/ {print $2}'); do
+                universal "$dep" && continue
+                patchelf --set-rpath '$ORIGIN' "$LIB/$so"
+                echo "  gave $so an rpath of \$ORIGIN for $dep"
+                break
+              done
+
+              echo "bundled $so from $src (pass $pass)"
+              added=1
+            done
+            [ -n "$added" ] || break
+          done
+
       # THE FLOOR IS AN ASSERTION, NOT A HOPE (mvx#203).  A release that
       # quietly needed a newer libc than it claims is exactly the failure this
       # issue is about, and it is invisible until somebody downloads it.
@@ -181,11 +268,48 @@ jobs:
           max=$(objdump -T stage/mvx-lang/bin/* stage/mvx-lang/lib/*.so 2>/dev/null \
                 | grep -oE 'GLIBC_2\.[0-9]+' | sort -t. -k2 -n | tail -1)
           echo "highest required: ${max:-none}"
-          case "${max:-GLIBC_2.0}" in
+          # An assertion that passes when its tool is missing asserts nothing:
+          # no objdump, no versioned symbols, and the case below says fine.
+          [ -n "$max" ] || { echo "::error::found no GLIBC_2.x at all -- objdump did not run"; exit 1; }
+          case "$max" in
             GLIBC_2.[0-9]|GLIBC_2.1[0-9]|GLIBC_2.2[0-8]) ;;
             *) echo "::error::floor rose to $max; mvx#203 pins it at GLIBC_2.28"
                exit 1 ;;
           esac
+
+      # THE SAME FAILURE, GENERALISED (mvx#297).  Bundling libedit fixes
+      # today's break; this is what stops the next one.  Every library a
+      # shipped binary needs must be on every glibc system or in our own
+      # lib/ -- and the exceptions are named here rather than discovered by
+      # whoever downloads the release.
+      - name: Assert nothing needs a library we do not ship
+        run: |
+          set -eu
+          # The same two lists as the bundling step, on purpose: if they ever
+          # disagree this step is what says so.
+          universal() {
+            case "$1" in
+              libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1) return 0 ;;
+              libgcc_s.so.1|libstdc++.so.6|ld-linux*) return 0 ;;
+            esac
+            return 1
+          }
+          bad=
+          for f in stage/mvx-lang/bin/* stage/mvx-lang/lib/*; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            for so in $(objdump -p "$f" 2>/dev/null | awk '/NEEDED/ {print $2}'); do
+              universal "$so" && continue
+              case "$so" in
+                libpq.so.*|libsqlite3.so.*)
+                  echo "advisory, dlopen'd driver: $b needs $so"; continue ;;
+              esac
+              [ -e "stage/mvx-lang/lib/$so" ] && { echo "shipped: $b needs $so"; continue; }
+              bad="$bad $b:$so"
+            done
+          done
+          ls -l stage/mvx-lang/lib/
+          [ -z "$bad" ] || { echo "::error::needed, not universal, not shipped:$bad"; exit 1; }
 
       - name: Smoke test the install
         run: |
@@ -215,10 +339,93 @@ jobs:
           tar -C stage -czf "$NAME" mvx-lang
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
+      # NOT ATTACHED TO THE RELEASE HERE (mvx#297).  Publishing from inside
+      # the build container is what let v0.4.0 out: every check it passed ran
+      # on the one machine where its libraries were guaranteed to exist.  The
+      # tarball is handed to the verify job below instead, and that job --
+      # running on the bare runner, which is not this image -- is the only
+      # thing that publishes.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: ${{ steps.pkg.outputs.name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---- run it somewhere that is not the image that built it ---------------
+  # THE LAST CHECK THAT COUNTS (mvx#297).  Every assertion in the binaries job
+  # is a claim about the tarball read off its own contents; this one starts the
+  # program on a different machine, and it is the step that attaches the asset.
+  # The runner is the same label that used to build these binaries before
+  # mvx#203, so it is an ordinary glibc host, and -- the point -- it does not
+  # carry libedit.so.0, which is asserted below rather than assumed.
+  verify:
+    needs: binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+
+      - name: This host is not the build image
+        run: |
+          set -eu
+          . /etc/os-release; echo "host: $PRETTY_NAME"; ldd --version | head -1
+          # A green run here means nothing if the runner happens to carry the
+          # library the release should not be asking for.  Say so out loud.
+          for d in /usr/lib64 /lib64 /usr/lib /lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+            [ -e "$d/libedit.so.0" ] && { echo "::error::$d/libedit.so.0 exists here, so this test proves nothing"; exit 1; }
+          done
+          echo "no libedit.so.0 on this host -- the pre-#297 tarball would fail below"
+
+      - name: Unpack and run the published tarball
+        run: |
+          set -eu
+          tar -xzf mvx-lang-*.tar.gz
+          B="$PWD/mvx-lang/bin"
+
+          # Nothing may resolve outside the tarball except the universal set.
+          # ldd answers "not found" for a missing soname without running the
+          # program, so this reports every break at once rather than the first.
+          # The postgres and sqlite drivers are dlopen'd and degrade when their
+          # client library is absent, so they are reported and not fatal.
+          bad=
+          for f in "$B"/* "$PWD"/mvx-lang/lib/*.so*; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            for so in $(ldd "$f" 2>/dev/null | awk '/not found/ {print $1}'); do
+              case "$b" in
+                libmvxdrv_postgres.so|libmvxdrv_sqlite.so)
+                  echo "dlopen'd driver, degrades here: $b needs $so" ;;
+                *) echo "::error::$b needs $so and nothing provides it"
+                   bad="$bad $b:$so" ;;
+              esac
+            done
+          done
+          [ -z "$bad" ] || { echo "::error::unresolved on a plain host:$bad"; exit 1; }
+
+          # And then actually start them.  A NEEDED soname is resolved before
+          # main(), so this is the whole of mvx#297 in one line.
+          "$B/mvx" --version
+
+          printf 'PRINT "published-ok ":2+2\n' > prog.b
+          "$B/mvx-basic" prog.b -o prog
+          out="$(./prog)"
+          echo "$out"
+          test "$out" = "published-ok 4"
+
       - name: Attach to release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ steps.pkg.outputs.name }}
+          files: mvx-lang-*.tar.gz
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           generate_release_notes: true
 
@@ -290,7 +497,7 @@ jobs:
   # dev build promoted to Latest is what anyone installing by name would get.
   # Say it once, at the end, when there is nothing left to race with.
   mark:
-    needs: [binaries, images]
+    needs: [verify, images]
     runs-on: ubuntu-latest
     steps:
       - name: Say what this release is
