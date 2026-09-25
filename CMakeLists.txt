@@ -7,22 +7,48 @@ project(mvx LANGUAGES C CXX)
 # checkout with no tags, or a source tarball, reports 0.0.0-dev, which no
 # `requires` range will satisfy: better to say "unknown" out loud than to
 # claim a version the binary may not have.
-find_package(Git QUIET)
-set(MVX_VERSION "0.0.0-dev")
-if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-  # --match v*: the release workflow keeps a rolling `dev` tag on develop's
-  # HEAD, and without this that tag is what describe finds -- so every develop
-  # build would report "unknown" instead of "newer than the last release".
-  execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
-                  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-                  OUTPUT_VARIABLE MVX_GIT_DESC
-                  OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET)
-  if(MVX_GIT_DESC MATCHES "^v[0-9]")
-    string(REGEX REPLACE "^v" "" MVX_VERSION "${MVX_GIT_DESC}")
+# WHAT VERSION IS THIS BUILD?  What the builder says, then what git says, then
+# "we do not know".
+#
+# A RELEASE MUST NOT HAVE TO ASK GIT (mvx#299).  v0.4.0 published binaries that
+# reported 0.0.0-dev, because mvx#203 moved the release build into a container
+# that runs as root over a workspace owned by the runner's user -- so git
+# refused the repository outright ("detected dubious ownership") and the
+# ERROR_QUIET below threw the message away.  The release knows the tag it is
+# building; it passes -DMVX_VERSION=x.y.z and git is not consulted at all.  The
+# container images never had a chance either way: .dockerignore excludes .git.
+set(MVX_VERSION "" CACHE STRING "version to stamp in; empty means ask git")
+if(MVX_VERSION)
+  message(STATUS "MVX version ${MVX_VERSION} (given)")
+else()
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    # --match v*: the release workflow keeps a rolling `dev` tag on develop's
+    # HEAD, and without this that tag is what describe finds -- so every develop
+    # build would report "unknown" instead of "newer than the last release".
+    execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
+                    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                    OUTPUT_VARIABLE MVX_GIT_DESC
+                    ERROR_VARIABLE MVX_GIT_ERR
+                    RESULT_VARIABLE MVX_GIT_RC
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_STRIP_TRAILING_WHITESPACE)
+    if(MVX_GIT_DESC MATCHES "^v[0-9]")
+      string(REGEX REPLACE "^v" "" MVX_VERSION "${MVX_GIT_DESC}")
+    elseif(NOT MVX_GIT_RC EQUAL 0)
+      # SAY IT.  This was ERROR_QUIET, so a build that could not work out its
+      # own version said nothing and stamped 0.0.0-dev -- which is how a
+      # release shipped misreporting itself with every check green.
+      message(WARNING
+        "git describe could not name a version (rc=${MVX_GIT_RC}): ${MVX_GIT_ERR} -- "
+        "pass -DMVX_VERSION=x.y.z to stamp one")
+    endif()
   endif()
+  if(NOT MVX_VERSION)
+    set(MVX_VERSION "0.0.0-dev")
+  endif()
+  message(STATUS "MVX version ${MVX_VERSION}")
 endif()
-message(STATUS "MVX version ${MVX_VERSION}")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -538,11 +564,11 @@ target_include_directories(mvx-basic PRIVATE runtime/include)
 # assumption on every platform.
 if(APPLE)
   set(MVX_INSTALL_RPATH "@loader_path/../lib")
+  set(MVX_INSTALL_RPATH_LIB "@loader_path")
 else()
   set(MVX_INSTALL_RPATH "\$ORIGIN/../lib")
+  set(MVX_INSTALL_RPATH_LIB "\$ORIGIN")
 endif()
-set_target_properties(mvx mvx-basic mvx-git-adopt PROPERTIES
-  INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 
 # mvx-launch is installed even though nothing invokes it by name: --catalog
 # copies it beside a cataloged program, so a tree without it cannot catalog
@@ -551,6 +577,17 @@ set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd mvx-launch)
 if(MVX_WITH_DAEMON)
   list(APPEND MVX_INSTALL_BINS mvx-lmdbd mvx-lmdbd-admin)
 endif()
+
+# EVERY INSTALLED BINARY, NOT THREE OF THEM (mvx#297).  The rpath used to name
+# mvx, mvx-basic and mvx-git-adopt, so the published v0.4.0 shipped an
+# mvx-launch that could not find libmvxrt.so and an mvx-lmdbd that could not
+# find liblmdb -- neither would start from an unpacked tarball.  mvx-launch got
+# away with it because libmvxrt's constructor puts the runtime directory on the
+# loader path for children (runtime/src/mvx_ctx.c) and mvx is what spawns it;
+# mvx-lmdbd has no parent to inherit from and simply failed.  A binary we
+# install into bin/ resolves ../lib, full stop.
+set_target_properties(${MVX_INSTALL_BINS} PROPERTIES
+  INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 install(TARGETS ${MVX_INSTALL_BINS} RUNTIME DESTINATION bin)
 
 set(MVX_INSTALL_DRIVERS mvxrt mvxc mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
@@ -569,6 +606,13 @@ endif()
 if(MVX_MYSQL_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxdrv_mysql)
 endif()
+# AND THE LIBRARIES BESIDE THEM (mvx#297).  A driver is dlopen'd by absolute
+# path, so the loader resolves ITS dependencies with ITS own rpath and not the
+# program's -- which is why libmvxdrv_lmdb could not see a liblmdb sitting in
+# the same directory, and why libmvxc could not see libmvxrt.  $ORIGIN is that
+# directory.
+set_target_properties(${MVX_INSTALL_DRIVERS} PROPERTIES
+  INSTALL_RPATH "${MVX_INSTALL_RPATH_LIB}")
 install(TARGETS ${MVX_INSTALL_DRIVERS} LIBRARY DESTINATION lib)
 install(FILES ${CMAKE_BINARY_DIR}/lib/mvx_crt.o DESTINATION lib)
 

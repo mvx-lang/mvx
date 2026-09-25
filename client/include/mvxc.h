@@ -98,7 +98,11 @@ const char   *mvxc_error(mvxc_session *s);
  *     printf("%d %s", mvxc_execute(s, "X", cap), mvxc_str(cap));   // WRONG
  *
  * may read the capture before the execute fills it -- and then free that
- * string when the execute runs.  Sequence them. */
+ * string when the execute runs.  Sequence them.
+ *
+ * This has now caught the author of the rule twice, in two different tests, so
+ * treat it as a property of the API rather than a mistake someone else makes:
+ * if a value is written and read in one statement, split the statement. */
 mvxc_val *mvxc_new(void);
 mvxc_val *mvxc_new_str(const char *s);
 mvxc_val *mvxc_from_bytes(const char *p, size_t n);
@@ -130,6 +134,15 @@ void       mvxc_close(mvxc_file *f);
 /* The caller owns what mvxc_read returns and frees it with mvxc_free.  NULL
  * with *st = MVXC_NOTFOUND is a miss, which is not an error. */
 mvxc_val   *mvxc_read (mvxc_file *f, const char *id, mvxc_status *st);
+
+/* The same read, into a value the caller already has -- for a loop over many
+ * records, which is what a consumer walking an account does.  mvxc_read
+ * allocates one per record and the caller frees it; this reuses one, which is
+ * the difference between a malloc per record and none.  `dst` keeps whatever it
+ * held on a miss, so a caller that checks the status cannot read stale content
+ * by accident; the strings it handed out are released either way, because the
+ * value is about to mean something else. */
+mvxc_status mvxc_read_into(mvxc_file *f, const char *id, mvxc_val *dst);
 mvxc_val   *mvxc_readu(mvxc_file *f, const char *id, int wait, mvxc_status *st);
 mvxc_status mvxc_write (mvxc_file *f, const char *id, mvxc_val *rec);
 mvxc_status mvxc_delete(mvxc_file *f, const char *id);

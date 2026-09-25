@@ -314,6 +314,19 @@ mvxc_val *mvxc_read(mvxc_file *f, const char *id, mvxc_status *st) {
     return read_common(f, id, 0, st);
 }
 
+mvxc_status mvxc_read_into(mvxc_file *f, const char *id, mvxc_val *dst) {
+    if (!f || !id || !dst) return MVXC_ERROR;
+    /* The strings dst handed out described what it used to hold, and it is
+     * about to hold something else -- release them before the read, not after,
+     * so a caller cannot see them survive a successful one. */
+    drop_held(dst);
+    mv_value i;
+    tmp_str(&i, id);
+    int64_t got = mvx_read(f->s->ctx, &dst->v, &f->fvar, &i, 0);
+    mv_clear(&i);
+    return got ? MVXC_OK : MVXC_NOTFOUND;
+}
+
 mvxc_val *mvxc_readu(mvxc_file *f, const char *id, int wait, mvxc_status *st) {
     return read_common(f, id, wait ? 1 : 2, st);
 }

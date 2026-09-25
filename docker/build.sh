@@ -24,6 +24,10 @@ cd "$ROOT"
 REGISTRY="${REGISTRY:-ghcr.io/mvx-lang}"
 TAG="${TAG:-latest}"
 LLVM_VERSION="${LLVM_VERSION:-21}"
+# The image cannot work out its own version -- .dockerignore excludes .git --
+# so pass it in, the way the release does (mvx#299).  Unset and undescribable
+# leaves the binaries saying 0.0.0-dev, which is at least honest.
+MVX_VERSION="${MVX_VERSION:-$(git describe --tags --match 'v*' --dirty 2>/dev/null | sed 's/^v//')}"
 
 BASE="${REGISTRY}/mvx"
 LMDBD="${REGISTRY}/mvx-lmdbd"
@@ -32,6 +36,7 @@ DEMO="${REGISTRY}/mvx-demo"
 echo "==> base  ${BASE}:${TAG}"
 docker build -f docker/Dockerfile.base \
   --build-arg "LLVM_VERSION=${LLVM_VERSION}" \
+  --build-arg "MVX_VERSION=${MVX_VERSION}" \
   -t "${BASE}:${TAG}" -t mvx:latest .
 
 # The daemon and demo layer on the freshly built base.
