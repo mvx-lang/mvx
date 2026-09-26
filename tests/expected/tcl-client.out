@@ -12,6 +12,9 @@ cataloged=1 0
 call=0 out=42
 create=0 0
 listed hash=1 dir=1
+bind-known=0
+bind-absent=1 offered=1
+bind-envbad=4
 dropfile=0 missing=1
 into: 0/R1 0/R2 0/R3
 into-miss=1 kept=R3
