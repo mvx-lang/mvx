@@ -162,6 +162,28 @@ mvxc_status mvxc_create_file(mvxc_session *s, const char *name,
 mvxc_status mvxc_delete_file(mvxc_session *s, const char *name);
 mvxc_val   *mvxc_files(mvxc_session *s);
 
+/* Bind `file` to the backend `want` -- what a checkout needs when a record's
+ * %FILE% control names the backend that file was on, so it lands there instead
+ * of on this host's default.  On MVX a hash file comes into existence on first
+ * write, so what is needed is the BINDING and not a create.
+ *
+ *   MVXC_OK        bound -- or `want` is already what this account uses, which
+ *                  needs no binding.
+ *   MVXC_NOTFOUND  this host has no such backend, and NOTHING was bound.  When
+ *                  `instead` is non-NULL it receives the backend this host
+ *                  would offer in its place ("" when there is none), so the
+ *                  caller can put that to its user and bind it by calling
+ *                  again with it.
+ *   MVXC_ERROR     $MVXDRIVER names a backend this host does not have.
+ *
+ * THE LIBRARY DOES NOT ASK.  The runtime's own mvx_bind_driver prompts, which
+ * is right for the shell and wrong here for the same reason mvxc_connect sets
+ * @LEVEL to 0: the C caller owns the screen.  So the knowledge of what this
+ * host has stays here and the policy -- ask, substitute, or refuse -- stays
+ * with the program. */
+mvxc_status mvxc_bind_file(mvxc_session *s, const char *file, const char *want,
+                           char *instead, size_t cap);
+
 /* Would CALL <name> resolve in this account?  mvxc_call asks this before it
  * calls; it is here separately because a caller usually wants to CHOOSE rather
  * than be told afterwards -- and on jBASE an unresolved CALL traps into the

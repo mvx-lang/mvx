@@ -4336,6 +4336,7 @@ if command -v cc >/dev/null 2>&1; then
   cat > "$TESTROOT/client.c" <<'CLEOF'
 #include <mvxc.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 int main(int argc, char **argv) {
     mvxc_status st;
@@ -4419,6 +4420,24 @@ int main(int argc, char **argv) {
     }
     printf("listed hash=%d dir=%d\n", hash, dir);
     mvxc_free(fl);
+    /* --- binding a file to a backend (#302) ---------------------------
+       A checkout names the backend a file was on, and the binding is what
+       puts it there.  THE LIBRARY MUST NOT ASK: the runtime's own
+       mvx_bind_driver prompts, and if this inherited that, the line below
+       would hang the suite forever instead of failing it. */
+    char sub[64];
+    printf("bind-known=%d\n", mvxc_bind_file(s, "ZZTEMP", "lmdb",
+                                             sub, sizeof sub));
+    sub[0] = 'x';
+    int miss = mvxc_bind_file(s, "ZZTEMP", "nosuchdb", sub, sizeof sub);
+    printf("bind-absent=%d offered=%d\n", miss, sub[0] != '\0');
+    /* Named up front and not here either: a backend the host does not have
+       is an error, not a question. */
+    setenv("MVXDRIVER", "nosuchdb", 1);
+    printf("bind-envbad=%d\n", mvxc_bind_file(s, "ZZTEMP", "nosuchdb",
+                                              NULL, 0));
+    unsetenv("MVXDRIVER");
+
     printf("dropfile=%d missing=%d\n", mvxc_delete_file(s, "ZZTEMP"),
                                        mvxc_delete_file(s, "NOSUCHFILE"));
     mvxc_delete_file(s, "ZZDIR");

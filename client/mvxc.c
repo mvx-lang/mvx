@@ -399,6 +399,20 @@ mvxc_val *mvxc_files(mvxc_session *s) {
     return v;
 }
 
+mvxc_status mvxc_bind_file(mvxc_session *s, const char *file, const char *want,
+                           char *instead, size_t cap) {
+    if (instead && cap) instead[0] = '\0';
+    if (!s || !file || !want) return MVXC_ERROR;
+    int r = mvx_bind_driver_quiet(file, want, instead, cap);
+    if (r == 1) return MVXC_OK;
+    if (r < 0) {
+        set_err(s, "MVXDRIVER names a backend this host does not have");
+        return MVXC_ERROR;
+    }
+    set_err(s, "this host has no such backend");
+    return MVXC_NOTFOUND;
+}
+
 int mvxc_cataloged(mvxc_session *s, const char *name) {
     (void)s;
     if (!name) return 0;
