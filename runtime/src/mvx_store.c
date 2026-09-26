@@ -4400,16 +4400,26 @@ static char g_sub_all[64];        /* the "always" answer, for the rest of the ru
 static int  g_sub_skip_all;       /* likewise, for "no" */
 
 /* 1 -> use `chosen`; 0 -> skip this file; -1 -> abort the operation. */
+/* `may_ask` is whether this caller owns the terminal (mvx#302).  The shell and
+   the verbs do; the client library does not -- a library that prompted would be
+   writing over whatever its host program has on screen -- so it passes 0, gets
+   back the backend that WOULD have been offered, and lets its own caller
+   decide.  Everything before the prompt is shared either way: $MVXDRIVER and a
+   remembered "always" are answers already given, not questions. */
 static int driver_substitute(const char *file, const char *want,
-                             char *chosen, size_t cap) {
+                             char *chosen, size_t cap, int may_ask) {
     /* SUPPLIED UP FRONT BEATS ASKING.  It is how a script says what it wants,
        and it is the only reason this path is testable — a prompt no automated
        test can reach is a prompt that rots. */
     const char *env = getenv("MVXDRIVER");
     if (env && env[0]) {
         if (!mvx_driver_available(env)) {
-            fprintf(stderr, "MVXDRIVER=\"%s\" is not a driver on this host\n",
-                    env);
+            /* Only where there is a terminal to say it to (mvx#302).  A library
+               reporting through the caller's stderr is the same intrusion as a
+               prompt; the status is how it tells its caller. */
+            if (may_ask)
+                fprintf(stderr, "MVXDRIVER=\"%s\" is not a driver on this host\n",
+                        env);
             return -1;
         }
         snprintf(chosen, cap, "%s", env);
@@ -4426,6 +4436,13 @@ static int driver_substitute(const char *file, const char *want,
     mvx_account_hash(dflt, sizeof dflt);
     if (!dflt[0] || !mvx_driver_available(dflt))
         snprintf(dflt, sizeof dflt, "lmdb");
+
+    if (!may_ask) {
+        /* Not ours to ask, and not ours to print either: hand back what we
+           would have offered and say nothing. */
+        snprintf(chosen, cap, "%s", dflt);
+        return 0;
+    }
 
     fprintf(stderr, "\n%s: backend \"%s\" is not available on this host\n",
             file, want);
@@ -4487,7 +4504,9 @@ static int driver_substitute(const char *file, const char *want,
  *
  * Returns 1 when the file is bound (to `want`, or to whatever was chosen in its
  * place), 0 when the user declined or there was nobody to ask. */
-int mvx_bind_driver(const char *file, const char *want) {
+static int bind_driver(const char *file, const char *want,
+                       char *instead, size_t icap, int may_ask) {
+    if (instead && icap) instead[0] = '\0';
     if (!file || !file[0] || !want || !want[0]) return 0;
     /* A connection profile resolves its own driver later; nothing to check. */
     if (want[0] == '@') { binding_add(file, want, ""); return 1; }
@@ -4501,12 +4520,28 @@ int mvx_bind_driver(const char *file, const char *want) {
 
     if (mvx_driver_available(want)) { binding_add(file, want, ""); return 1; }
 
-    char sub[64];
-    if (driver_substitute(file, want, sub, sizeof sub) != 1) return 0;
+    char sub[64] = "";
+    int r = driver_substitute(file, want, sub, sizeof sub, may_ask);
+    if (r != 1) {
+        /* Nothing is bound.  For a caller that could not be asked, `sub` is
+           what it would have been offered -- pass it on so the decision can be
+           made where the terminal is. */
+        if (instead && icap) snprintf(instead, icap, "%s", sub);
+        return r < 0 ? -1 : 0;
+    }
     /* The substitute may BE the default, in which case say nothing rather than
        record a binding that means "as usual". */
     if (strcasecmp(eff, sub) != 0) binding_add(file, sub, "");
     return 1;
+}
+
+int mvx_bind_driver(const char *file, const char *want) {
+    return bind_driver(file, want, NULL, 0, 1) == 1;
+}
+
+int mvx_bind_driver_quiet(const char *file, const char *want,
+                          char *instead, size_t icap) {
+    return bind_driver(file, want, instead, icap, 0);
 }
 
 int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
@@ -4561,7 +4596,7 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
            is nothing here to check and "@conn1" is not a file on disk. */
         if (drvname[0] != '@' && !mvx_driver_available(drvname)) {
             char sub[64];
-            int r = driver_substitute(cspec, drvname, sub, sizeof sub);
+            int r = driver_substitute(cspec, drvname, sub, sizeof sub, 1);
             if (r <= 0) return 0;
             snprintf(drvname, sizeof drvname, "%s", sub);
             ap = "";
@@ -4621,7 +4656,7 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
         if (binding_for(cspec, bdrv, sizeof bdrv, bpar, sizeof bpar) &&
             !mvx_driver_available(bdrv)) {
             char sub[64];
-            int r = driver_substitute(cspec, bdrv, sub, sizeof sub);
+            int r = driver_substitute(cspec, bdrv, sub, sizeof sub, 1);
             if (r <= 0) return 0;
             binding_add(cspec, sub, "");
         }

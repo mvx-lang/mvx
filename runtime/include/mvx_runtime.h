@@ -165,6 +165,15 @@ void mvx_driver_names(char *out, size_t cap);
    1 when bound (to `want` or a chosen substitute), 0 when declined. */
 int mvx_bind_driver(const char *file, const char *want);
 
+/* The same decision WITHOUT the terminal (mvx#302), for a caller that does not
+   own the screen -- the client library, and through it any program embedding
+   MVX.  1 when bound; 0 when this host has no such backend and NOTHING was
+   bound, with `instead` receiving the backend that would have been offered ("" 
+   when there is none) so the caller can ask its own user and bind that;
+   -1 when $MVXDRIVER names a backend this host does not have. */
+int mvx_bind_driver_quiet(const char *file, const char *want,
+                          char *instead, size_t icap);
+
 /* --- value lifecycle --------------------------------------------------- */
 void mv_init(mv_value *v);
 void mv_clear(mv_value *v);                         /* release + unassigned */
