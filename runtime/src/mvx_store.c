@@ -3842,6 +3842,27 @@ static int fl_internal(const char *p, size_t n) {
            memmem(p, n, ".IDX.", 5) != NULL;
 }
 
+/* Has this name already been listed?  FILELIST asks each local driver and then
+   reads BINDINGS, and a BOUND file is named by both -- the driver holds it and
+   the binding names it -- so it appeared twice (mvx#307).  This only became
+   visible once the lmdb driver stopped prefixing a bound spec with the params
+   separator: before that the two spellings differed by a newline and nothing
+   could match them up.
+   Entries are @AM-separated, each "name" @VM "driver"; only the name part is
+   compared. */
+static int fl_listed(const char *buf, size_t len, const char *name, size_t n) {
+    size_t i = 0;
+    while (i < len) {
+        size_t e = i;
+        while (e < len && (unsigned char)buf[e] != 0xFE) e++;
+        size_t nm = i;
+        while (nm < e && (unsigned char)buf[nm] != 0xFD) nm++;
+        if (nm - i == n && memcmp(buf + i, name, n) == 0) return 1;
+        i = e + 1;
+    }
+    return 0;
+}
+
 /* FILELIST(): every MV file in the account — subdirectories (directory
    driver) plus LMDB named DBs, as "name @VM type" attributes.  DICT
    stores and infrastructure directories are filtered out. */
@@ -3944,6 +3965,11 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                 size_t n = (size_t)(sp2 - p);
                 if (n == 0 || *p == '#' || (n == 1 && p[0] == '*'))
                     continue;
+                /* A dictionary or index table is furniture; the driver pass
+                   filters those and this one has to as well. */
+                if (fl_internal(p, n)) continue;
+                /* And a file a driver already reported is not a second file. */
+                if (fl_listed(buf, len, p, n)) continue;
                 char *dp = sp2;
                 while (*dp == ' ' || *dp == '\t') dp++;
                 char *de = dp;
