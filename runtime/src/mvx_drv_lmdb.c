@@ -173,7 +173,23 @@ static int dbi_open(unsigned flags, const char *spec, MDB_dbi *dbi,
     return 1;
 }
 
+/* "params\nspec" -- resolve() puts a binding's connection params ahead of the
+   spec, separated by a newline, and leaves the driver to parse it (see
+   mvx_store.c: "opaque to the runtime, parsed by the driver").  lmdb is local
+   and takes no params, but it still has to SKIP them, and it was the only
+   driver that did not: sqlite has split_spec() and lmdbnet splits too.
+   Without this a BOUND file became a named DB called "\nPARTS" -- a different
+   database from the "PARTS" the same file uses unbound, so binding an existing
+   local file walked away from its records.  It also put a blank line in LISTF,
+   and left "\nDICT.PARTS" where fl_internal() could not match the "DICT."
+   prefix it exists to filter, so a bound file exposed its dictionary (mvx#307). */
+static const char *spec_only(const char *spec) {
+    const char *nl = spec ? strchr(spec, '\n') : NULL;
+    return nl ? nl + 1 : spec;
+}
+
 static mvx_file *lmdb_open(const char *spec, char *err, size_t errlen) {
+    spec = spec_only(spec);
     MDB_dbi dbi;
     if (!dbi_open(0, spec, &dbi, err, errlen))   /* no MDB_CREATE: explicit */
         return NULL;
@@ -304,12 +320,14 @@ static const mvx_driver mvx_driver_lmdb = {
 };
 
 static int lmdb_create(const char *spec, char *err, size_t errlen) {
+    spec = spec_only(spec);
     MDB_dbi dbi;
     if (dbi_open(0, spec, &dbi, err, errlen)) return 0;  /* already exists */
     return dbi_open(MDB_CREATE, spec, &dbi, err, errlen);
 }
 
 static int lmdb_remove(const char *spec, char *err, size_t errlen) {
+    spec = spec_only(spec);
     MDB_dbi dbi;
     if (!dbi_open(0, spec, &dbi, err, errlen)) return 0;
     MDB_txn *txn;
