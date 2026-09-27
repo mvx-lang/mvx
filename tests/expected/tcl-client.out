@@ -12,6 +12,8 @@ cataloged=1 0
 call=0 out=42
 create=0 0
 listed hash=1 dir=1
+bind-self=0
+listed-once=1
 bind-known=0
 bind-absent=1 offered=1
 bind-envbad=4
