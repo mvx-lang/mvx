@@ -397,7 +397,7 @@ jobs:
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
       # NOT ATTACHED TO THE RELEASE HERE (mvx#297).  Publishing from inside
-          # the build container is what let v0.4.0 out: every check it passed ran
+      # the build container is what let v0.4.0 out: every check it passed ran
       # on the one machine where its libraries were guaranteed to exist.  The
       # tarball is handed to the verify job below instead, which runs it on the
       # bare runner, and nothing is attached to the release until every arch has
