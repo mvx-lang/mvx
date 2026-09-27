@@ -278,6 +278,12 @@ jobs:
               # nothing but libc and are copied untouched.
               for dep in $(objdump -p "$LIB/$so" 2>/dev/null | awk '/NEEDED/ {print $2}'); do
                 universal "$dep" && continue
+                # SINGLE QUOTES ARE THE POINT, so shellcheck's SC2016 is wrong here:
+                # $ORIGIN is a literal that the DYNAMIC LINKER expands at load
+                # time, to the directory holding the object.  Letting the shell
+                # expand it first would write an empty rpath and ship a tarball
+                # that cannot find its own libraries -- which is the v0.4.0 bug.
+                # shellcheck disable=SC2016
                 patchelf --set-rpath '$ORIGIN' "$LIB/$so"
                 echo "  gave $so an rpath of \$ORIGIN for $dep"
                 break
@@ -534,8 +540,14 @@ jobs:
           set -eu
           ls -l mvx-lang-*.tar.gz
           for arch in amd64 arm64; do
-            n=$(ls mvx-lang-*-linux-$arch.tar.gz 2>/dev/null | wc -l)
-            test "$n" -eq 1 || { echo "::error::expected one $arch tarball, found $n"; exit 1; }
+            # Counted with the glob itself rather than by parsing ls (SC2012).
+            # A glob that matches nothing is left as the literal pattern, so
+            # "exactly one word" is not enough on its own -- hence the -f.
+            set -- mvx-lang-*-linux-"$arch".tar.gz
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } || {
+              echo "::error::expected exactly one $arch tarball, found: $*"
+              exit 1
+            }
           done
 
       - name: Attach to release
