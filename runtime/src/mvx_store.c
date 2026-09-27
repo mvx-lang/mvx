@@ -3842,6 +3842,27 @@ static int fl_internal(const char *p, size_t n) {
            memmem(p, n, ".IDX.", 5) != NULL;
 }
 
+/* Has this name already been listed?  FILELIST asks each local driver and then
+   reads BINDINGS, and a BOUND file is named by both -- the driver holds it and
+   the binding names it -- so it appeared twice (mvx#307).  This only became
+   visible once the lmdb driver stopped prefixing a bound spec with the params
+   separator: before that the two spellings differed by a newline and nothing
+   could match them up.
+   Entries are @AM-separated, each "name" @VM "driver"; only the name part is
+   compared. */
+static int fl_listed(const char *buf, size_t len, const char *name, size_t n) {
+    size_t i = 0;
+    while (i < len) {
+        size_t e = i;
+        while (e < len && (unsigned char)buf[e] != 0xFE) e++;
+        size_t nm = i;
+        while (nm < e && (unsigned char)buf[nm] != 0xFD) nm++;
+        if (nm - i == n && memcmp(buf + i, name, n) == 0) return 1;
+        i = e + 1;
+    }
+    return 0;
+}
+
 /* FILELIST(): every MV file in the account — subdirectories (directory
    driver) plus LMDB named DBs, as "name @VM type" attributes.  DICT
    stores and infrastructure directories are filtered out. */
@@ -3944,6 +3965,11 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                 size_t n = (size_t)(sp2 - p);
                 if (n == 0 || *p == '#' || (n == 1 && p[0] == '*'))
                     continue;
+                /* A dictionary or index table is furniture; the driver pass
+                   filters those and this one has to as well. */
+                if (fl_internal(p, n)) continue;
+                /* And a file a driver already reported is not a second file. */
+                if (fl_listed(buf, len, p, n)) continue;
                 char *dp = sp2;
                 while (*dp == ' ' || *dp == '\t') dp++;
                 char *de = dp;
@@ -4406,6 +4432,24 @@ static int  g_sub_skip_all;       /* likewise, for "no" */
    back the backend that WOULD have been offered, and lets its own caller
    decide.  Everything before the prompt is shared either way: $MVXDRIVER and a
    remembered "always" are answers already given, not questions. */
+/* THE ACCOUNT'S EFFECTIVE DEFAULT TRANSPORT (mvx#307) -- the same answer the
+   open path resolves: the declared `driver` when it is declared and present on
+   this host, else undeclared_default().
+   NOT mvx_account_hash(), which is what the two callers below used to ask.
+   `hash` is the default CREATE-FILE *TYPE* -- "dir", a hash type -- a different
+   namespace from a driver name, and mvx_account_driver()'s own comment warns
+   about exactly this overloading ("turned a directory file into an lmdb one").
+   An account that declares `driver = sqlite` and no `hash` -- which is every
+   account scripts/mkaccount.sh makes -- answered "" and then fell back to a
+   hardcoded "lmdb", so a file already on sqlite looked like it needed moving:
+   a binding was written that said nothing, and LISTF counted the file twice. */
+static void effective_driver(char *out, size_t cap) {
+    char ad[64];
+    mvx_account_driver(ad, sizeof ad);
+    if (ad[0] && mvx_driver_available(ad)) { snprintf(out, cap, "%s", ad); return; }
+    snprintf(out, cap, "%s", undeclared_default());
+}
+
 static int driver_substitute(const char *file, const char *want,
                              char *chosen, size_t cap, int may_ask) {
     /* SUPPLIED UP FRONT BEATS ASKING.  It is how a script says what it wants,
@@ -4432,10 +4476,8 @@ static int driver_substitute(const char *file, const char *want,
     mvx_driver_names(avail, sizeof avail);
     for (char *c = avail; *c; c++) if (*c == ',') *c = ' ';
 
-    char dflt[600];
-    mvx_account_hash(dflt, sizeof dflt);
-    if (!dflt[0] || !mvx_driver_available(dflt))
-        snprintf(dflt, sizeof dflt, "lmdb");
+    char dflt[64];
+    effective_driver(dflt, sizeof dflt);
 
     if (!may_ask) {
         /* Not ours to ask, and not ours to print either: hand back what we
@@ -4513,9 +4555,9 @@ static int bind_driver(const char *file, const char *want,
 
     /* Already what this account would use: no binding, nothing to say.  An
        entry here would only record what was true anyway, on every file. */
-    char dflt[600];
-    mvx_account_hash(dflt, sizeof dflt);
-    const char *eff = dflt[0] ? dflt : "lmdb";
+    char effbuf[64];
+    effective_driver(effbuf, sizeof effbuf);
+    const char *eff = effbuf;
     if (strcasecmp(eff, want) == 0) return 1;
 
     if (mvx_driver_available(want)) { binding_add(file, want, ""); return 1; }
@@ -4669,7 +4711,14 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
         drv->remove(dataspec, err, sizeof err);
         return 0;
     }
-    write_file_meta(drv, dictspec, "lmdb", "");
+    /* THE DRIVER THAT ACTUALLY HOLDS IT, not a guess (mvx#307).  This was the
+       literal string "lmdb", so a plain CREATE-FILE on an account whose default
+       is sqlite -- which every scripts/mkaccount.sh account is -- recorded a
+       backend the file was never on.  The control is committed and a clone reads
+       it, so the wrong answer travelled: mv_git's %FILE% said lmdb while LISTF
+       said sqlite.  drv is the driver that just created the file and it knows
+       its own name. */
+    write_file_meta(drv, dictspec, drv->name ? drv->name : "", "");
     voc_register(cspec);
     return 1;
 }

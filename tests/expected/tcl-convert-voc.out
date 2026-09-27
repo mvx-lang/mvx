@@ -3,7 +3,6 @@ voc = sqlite
 [417] file T created
 --- CONVERT-FILE really converts, it does not just say so
 T converted to lmdb (0 record(s))
-T                       lmdb
 T                        lmdb
 --- and converting VOC updates the account record
 VOC converted to lmdb (2 record(s))
