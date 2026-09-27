@@ -399,9 +399,9 @@ jobs:
       # NOT ATTACHED TO THE RELEASE HERE (mvx#297).  Publishing from inside
       # the build container is what let v0.4.0 out: every check it passed ran
       # on the one machine where its libraries were guaranteed to exist.  The
-      # tarball is handed to the verify job below instead, and that job --
-      # running on the bare runner, which is not this image -- is the only
-      # thing that publishes.
+      # tarball is handed to the verify job below instead, which runs it on the
+      # bare runner, and nothing is attached to the release until every arch has
+      # passed that.
       - uses: actions/upload-artifact@v4
         with:
           name: tarball-${{ matrix.arch }}
@@ -412,7 +412,8 @@ jobs:
   # ---- run it somewhere that is not the image that built it ---------------
   # THE LAST CHECK THAT COUNTS (mvx#297).  Every assertion in the binaries job
   # is a claim about the tarball read off its own contents; this one starts the
-  # program on a different machine, and it is the step that attaches the asset.
+  # program on a different machine.  It no longer attaches anything: publishing
+  # is one job, below, because this one is a matrix (mvx#312).
   # The runner is the same label that used to build these binaries before
   # mvx#203, so it is an ordinary glibc host, and -- the point -- it does not
   # carry libedit.so.0, which is asserted below rather than assumed.
@@ -496,6 +497,46 @@ jobs:
           out="$(./prog)"
           echo "$out"
           test "$out" = "published-ok 4"
+
+  # ---- attach both tarballs, once, from one job ---------------------------
+  # ONE JOB ATTACHES, BECAUSE A MATRIX CANNOT (mvx#312).  This step used to sit
+  # at the end of verify, which is a two-arch matrix, so both legs called
+  # action-gh-release on the same tag.  The action creates the release when it is
+  # absent and updates it when it is present, so when neither leg had created it
+  # yet -- which is the normal case, they finish together -- both created one.
+  # v0.4.3 shipped with a second, empty draft release for its tag.
+  #
+  # That outcome was luck.  The same race can attach ONE arch's tarball to the
+  # release everyone sees, or leave the published release empty and the assets on
+  # a draft -- and the published one is what /releases/latest resolves to, which
+  # every downstream port installs by name (mv_git#263 pins its tooling to it).
+  # A release that looks complete and carries one architecture is worse than a
+  # failed release.
+  #
+  # Depending on the whole verify matrix also makes the release atomic in a
+  # second way worth having: no asset is published until EVERY arch has run on a
+  # bare host, so a half-verified release cannot exist either.
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          merge-multiple: true          # both arches into one directory
+
+      # `needs: verify` already means both legs passed, so this is about the
+      # artifacts arriving under the names expected rather than about the build.
+      # Without it a rename upstream publishes a one-arch release quietly, which
+      # is the exact failure this job exists to prevent.
+      - name: Both architectures are here
+        run: |
+          set -eu
+          ls -l mvx-lang-*.tar.gz
+          for arch in amd64 arm64; do
+            n=$(ls mvx-lang-*-linux-$arch.tar.gz 2>/dev/null | wc -l)
+            test "$n" -eq 1 || { echo "::error::expected one $arch tarball, found $n"; exit 1; }
+          done
 
       - name: Attach to release
         uses: softprops/action-gh-release@v3
@@ -582,12 +623,14 @@ jobs:
             ghcr.io/mvx-lang/mvx-demo:latest
 
   # ---- what kind of release is this? ------------------------------------
-  # Every publish step above can CREATE the release, and an unset prerelease
-  # field defaults to "full release" -- so whichever ran first decided, and a
-  # dev build promoted to Latest is what anyone installing by name would get.
-  # Say it once, at the end, when there is nothing left to race with.
+  # The publish step CREATES the release when the tag has none, and an unset
+  # prerelease field defaults to "full release" -- so a dev build would promote
+  # itself to Latest, which is what anyone installing by name would then get.
+  # Only one job publishes now (mvx#312), so this is no longer settling a race
+  # between several of them; it is still the only place that states what the
+  # release IS, and it must run after the job that creates it.
   mark:
-    needs: [verify, images]
+    needs: [publish, images]
     runs-on: ubuntu-latest
     steps:
       - name: Say what this release is
