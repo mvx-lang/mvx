@@ -4413,28 +4413,58 @@ int main(int argc, char **argv) {
                              mvxc_create_file(s, "ZZDIR", "DIR"));
     mvxc_val *fl = mvxc_files(s);
     int nf = mvxc_dcount(fl, 0), hash = 0, dir = 0;
+    char ztype[64] = "";
     for (int i = 1; i <= nf; i++) {
         const char *nm = mvxc_val_at(fl, i, 1);
-        if (!strcmp(nm, "ZZTEMP")) hash = 1;
+        if (!strcmp(nm, "ZZTEMP")) {
+            hash = 1;
+            /* COPIED, not kept.  What mvxc_val_at returns belongs to `fl` and
+               dies with it, and this is needed after the free below. */
+            snprintf(ztype, sizeof ztype, "%s", mvxc_val_at(fl, i, 2));
+        }
         if (!strcmp(nm, "ZZDIR") && !strcmp(mvxc_val_at(fl, i, 2), "dir")) dir = 1;
     }
     printf("listed hash=%d dir=%d\n", hash, dir);
     mvxc_free(fl);
+
+    /* BINDING A FILE TO THE BACKEND IT IS ALREADY ON IS A NO-OP (mvx#307).
+       The backend mvxc_files just reported for ZZTEMP IS the account's
+       effective default, so asking for it must be recognised as nothing to do.
+       It was not: the check compared against the default CREATE-FILE *type*
+       (`hash`) rather than the default *driver*, found that empty, assumed
+       "lmdb", and wrote a binding that restated what was already true -- after
+       which the file was enumerated twice, once by the backend and once by the
+       binding table.  So the count is the assertion. */
+    printf("bind-self=%d\n", mvxc_bind_file(s, "ZZTEMP", ztype, NULL, 0));
+    mvxc_val *fl2 = mvxc_files(s);
+    int n2 = mvxc_dcount(fl2, 0), seen = 0;
+    for (int i = 1; i <= n2; i++)
+        if (!strcmp(mvxc_val_at(fl2, i, 1), "ZZTEMP")) seen++;
+    printf("listed-once=%d\n", seen);
+    mvxc_free(fl2);
     /* --- binding a file to a backend (#302) ---------------------------
        A checkout names the backend a file was on, and the binding is what
        puts it there.  THE LIBRARY MUST NOT ASK: the runtime's own
        mvx_bind_driver prompts, and if this inherited that, the line below
        would hang the suite forever instead of failing it. */
+    /* A NAME OF ITS OWN, not ZZTEMP.  Binding is "bind, do not create" -- it
+       records where a file SHOULD live, for a clone where it does not exist yet
+       -- so binding a file that already exists somewhere else leaves the name
+       pointing at an empty backend.  These asserts used to reuse ZZTEMP and got
+       away with it only because the default was misreported as lmdb, which made
+       binding to lmdb a no-op (mvx#307).  With the default read correctly the
+       bind lands, and the delete below then looked for ZZTEMP where it had never
+       been. */
     char sub[64];
-    printf("bind-known=%d\n", mvxc_bind_file(s, "ZZTEMP", "lmdb",
+    printf("bind-known=%d\n", mvxc_bind_file(s, "ZZBIND", "lmdb",
                                              sub, sizeof sub));
     sub[0] = 'x';
-    int miss = mvxc_bind_file(s, "ZZTEMP", "nosuchdb", sub, sizeof sub);
+    int miss = mvxc_bind_file(s, "ZZBIND", "nosuchdb", sub, sizeof sub);
     printf("bind-absent=%d offered=%d\n", miss, sub[0] != '\0');
     /* Named up front and not here either: a backend the host does not have
        is an error, not a question. */
     setenv("MVXDRIVER", "nosuchdb", 1);
-    printf("bind-envbad=%d\n", mvxc_bind_file(s, "ZZTEMP", "nosuchdb",
+    printf("bind-envbad=%d\n", mvxc_bind_file(s, "ZZBIND", "nosuchdb",
                                               NULL, 0));
     unsetenv("MVXDRIVER");
 
