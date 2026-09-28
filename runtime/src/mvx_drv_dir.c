@@ -60,16 +60,42 @@ static char *rec_path(dir_file *f, const char *id, int64_t idlen) {
     return p;
 }
 
+/* A BOUND FILE'S SPEC ARRIVES AS "params\nspec" (mvx#310).  resolve() says so
+ * -- opaque to the runtime, parsed by the driver -- and every other driver
+ * parses it: sqlite and postgres split it, lmdb skips it (mvx#309).  This one
+ * did not, and used the whole thing as a path, so a file bound to dir was
+ * created in a directory whose name began with a newline.  Reads and writes
+ * still worked, being consistently wrong, but:
+ *
+ *   - the name is the interface for THIS driver, whose entire purpose is that a
+ *     record is an OS file somebody can look at and edit.  A directory called
+ *     "\nBP" is hostile to every tool that has to touch it;
+ *   - "\nDICT.BP" cannot match the "DICT." prefix that fl_internal() tests, so
+ *     a bound file exposed its dictionary in LISTF;
+ *   - and the leading newline printed as a blank line, and never matched the
+ *     name the bindings pass reported, so the file was listed twice.
+ *
+ * The params are SKIPPED rather than used.  Nothing produces any for dir today,
+ * and a location for it would be a second root to resolve records against --
+ * a real feature, not a spelling.  If one is ever wanted, this is the single
+ * place that turns a spec into a path, so this is where it goes. */
+static void spec_path(const char *spec, char *path, size_t cap) {
+    const char *nl = strchr(spec, '\n');
+    if (nl) spec = nl + 1;                 /* skip the params, keep the spec */
+
+    const char *acct = getenv("MVXACCOUNT");
+    if (!acct || !acct[0]) acct = ".";
+    if (spec[0] == '/')
+        snprintf(path, cap, "%s", spec);
+    else
+        snprintf(path, cap, "%s/%s", acct, spec);
+}
+
 static const mvx_driver mvx_driver_dir;
 
 static mvx_file *dir_open(const char *spec, char *err, size_t errlen) {
-    const char *acct = getenv("MVXACCOUNT");
-    if (!acct || !acct[0]) acct = ".";
     char path[4096];
-    if (spec[0] == '/')
-        snprintf(path, sizeof path, "%s", spec);
-    else
-        snprintf(path, sizeof path, "%s/%s", acct, spec);
+    spec_path(spec, path, sizeof path);    /* not its own copy of this */
 
     struct stat sb;
     if (stat(path, &sb) != 0)
@@ -81,6 +107,9 @@ static mvx_file *dir_open(const char *spec, char *err, size_t errlen) {
     dir_file *f = calloc(1, sizeof(dir_file));
     if (!f) mvx_fatal("out of memory opening %s", spec);
     f->base.driver = &mvx_driver_dir;
+    /* the WHOLE spec, params included, the way sqlite and postgres keep it:
+       ix_load() rebuilds a dictionary's spec from this and has to put the
+       "DICT." after the params, not in front of them */
     f->base.spec = strdup(spec);
     f->path = strdup(path);
     return (mvx_file *)f;
@@ -198,15 +227,6 @@ static void dir_select_end(mvx_cursor *c) {
 }
 
 static int64_t dir_select_count(mvx_cursor *c) { return c ? c->n : 0; }
-
-static void spec_path(const char *spec, char *path, size_t cap) {
-    const char *acct = getenv("MVXACCOUNT");
-    if (!acct || !acct[0]) acct = ".";
-    if (spec[0] == '/')
-        snprintf(path, cap, "%s", spec);
-    else
-        snprintf(path, cap, "%s/%s", acct, spec);
-}
 
 static int dir_create(const char *spec, char *err, size_t errlen) {
     char path[4096];
