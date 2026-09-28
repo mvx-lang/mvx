@@ -1,0 +1,10 @@
+--- a driver that does not read profiles is refused, by name
+CREATE-FILE: connection 'salesdb' names driver sqlite, which does not read connection profiles -- it would take "@salesdb" for a location of its own.  Bind to sqlite directly instead.
+--- and nothing is left behind named for the reference
+0
+--- nor is an unusable binding recorded
+no BINDINGS
+--- an undefined profile says so
+CREATE-FILE: connection 'nosuch' is not defined (SET-CONNECTION nosuch driver=... address=...)
+--- and one that exists but names no driver says THAT
+CREATE-FILE: connection 'nodriver' does not say which driver it uses (SET-CONNECTION nodriver driver=...)

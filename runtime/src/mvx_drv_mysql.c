@@ -244,11 +244,42 @@ static MYSQL *my_connect(const char *loc, char *err, size_t errlen) {
         return NULL;
     }
     char host[256], port[16], user[128], pass[256], dbn[128];
-    conf_get(loc, "host", host, sizeof host);
-    conf_get(loc, "port", port, sizeof port);
-    conf_get(loc, "user", user, sizeof user);
-    conf_get(loc, "password", pass, sizeof pass);
-    conf_get(loc, "dbname", dbn, sizeof dbn);
+    if (loc[0] == '@') {
+        /* A CONNECTION PROFILE (mvx#319), read the way postgres reads one, and
+           with the same field names -- an operator should not have to learn a
+           different spelling per driver.  Without this the reference arrived
+           here as the location itself and was parsed for key=value pairs it
+           does not have, so every field came back empty and the connection
+           went to the defaults below: a binding that named one database
+           quietly used another.
+           `address` is host:port, as elsewhere. */
+        const char *cn = loc + 1;
+        char address[256] = "";
+        host[0] = port[0] = user[0] = pass[0] = dbn[0] = '\0';
+        mvx_conn_lookup(cn, "address", address, sizeof address);
+        mvx_conn_lookup(cn, "dbname", dbn, sizeof dbn);
+        mvx_conn_lookup(cn, "user", user, sizeof user);
+        mvx_conn_lookup(cn, "password", pass, sizeof pass);
+        /* rightmost colon: an IPv6 literal has its own, and the port is last */
+        const char *colon = strrchr(address, ':');
+        if (colon) {
+            size_t hl = (size_t)(colon - address);
+            if (hl >= sizeof host) hl = sizeof host - 1;
+            memcpy(host, address, hl);
+            host[hl] = '\0';
+            snprintf(port, sizeof port, "%s", colon + 1);
+        } else {
+            snprintf(host, sizeof host, "%s", address);
+        }
+        /* the namespace names the database when the profile does not */
+        if (!dbn[0]) mvx_conn_lookup(cn, "namespace", dbn, sizeof dbn);
+    } else {
+        conf_get(loc, "host", host, sizeof host);
+        conf_get(loc, "port", port, sizeof port);
+        conf_get(loc, "user", user, sizeof user);
+        conf_get(loc, "password", pass, sizeof pass);
+        conf_get(loc, "dbname", dbn, sizeof dbn);
+    }
     MYSQL *db = mysql_init(NULL);
     if (!db) { snprintf(err, errlen, "mysql: mysql_init failed"); return NULL; }
     /* Reconnect, because an MV session sits idle across user think-time for
@@ -2003,6 +2034,7 @@ static const mvx_driver mvx_driver_mysql = {
     my_map_text_cap,                      /* mapped columns are bounded here */
     my_conn_epoch,                        /* which connection, for mvx#253 */
     my_release_conn,                      /* let a left account go (mvx#251) */
+    .takes_connection = 1,   /* reads .mvx-private/connections (mvx#319) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

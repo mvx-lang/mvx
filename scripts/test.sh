@@ -1055,6 +1055,39 @@ check tcl-bind-dir "$( \
   echo '--- with nothing named for the binding parameters'; \
   "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -c 'params')"
 
+# A CONNECTION PROFILE IS REFUSED BY A DRIVER THAT CANNOT READ ONE (#319).
+#
+# A binding may name a profile instead of a driver -- `ORDERS @salesdb` -- and
+# the reference is handed to the driver as its params so the driver resolves the
+# address itself.  Four of the seven never did, and two of those misread it in
+# silence: sqlite took "@salesdb" for a database PATH and created a file of that
+# name in the account, while the profile's `address` was ignored and nothing was
+# reported.  A binding is recorded once and resolved for ever, so the refusal
+# belongs at bind time, where whoever typed it is still there.
+#
+# Asserted on the FILESYSTEM as well as the message, because the message is the
+# new part and the absent file is the bug: the count is what was wrong before.
+CPA="$TESTROOT/connacct"
+"$ROOT/scripts/mkaccount.sh" "$CPA" >/dev/null 2>&1
+mkdir -p "$CPA/.mvx-private"
+cat > "$CPA/.mvx-private/connections" <<'CONNS'
+salesdb    driver     sqlite
+salesdb    address    sales.db
+nodriver   address    somewhere:1234
+CONNS
+chmod 700 "$CPA/.mvx-private"; chmod 600 "$CPA/.mvx-private/connections"
+check tcl-conn-refused "$( \
+  echo '--- a driver that does not read profiles is refused, by name'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE ORDERS USING @salesdb' 2>&1 | head -1; \
+  echo '--- and nothing is left behind named for the reference'; \
+  ls "$CPA" | grep -c '@' ; \
+  echo '--- nor is an unusable binding recorded'; \
+  { [ -f "$CPA/BINDINGS" ] && cat "$CPA/BINDINGS" || echo 'no BINDINGS'; }; \
+  echo '--- an undefined profile says so'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE X USING @nosuch' 2>&1 | head -1; \
+  echo '--- and one that exists but names no driver says THAT'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE Y USING @nodriver' 2>&1 | head -1)"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and

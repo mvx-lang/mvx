@@ -2153,6 +2153,7 @@ static const mvx_driver mvx_driver_postgres = {
     NULL,                                 /* map_text_cap: no bound here */
     pg_conn_epoch,                        /* which connection, for mvx#253 */
     pg_release_conn,                      /* let a left account go (mvx#251) */
+    .takes_connection = 1,   /* reads .mvx-private/connections (mvx#319) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {
