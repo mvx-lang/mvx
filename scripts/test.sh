@@ -1032,6 +1032,29 @@ check tcl-convert-voc "$( \
   echo '--- with the policy lines in .mvx untouched'; \
   grep -cE '^permit' "$CVA/.mvx")"
 
+# A FILE BOUND TO dir IS CREATED UNDER ITS OWN NAME (#310).
+#
+# A bound file's spec reaches the driver as "params\nspec".  dir used the whole
+# string as a path, so `CREATE-FILE x USING dir` made a directory whose name
+# began with a newline: reads and writes worked, being consistently wrong, but
+# the name is the interface for this driver in a way it is not for lmdb -- the
+# whole point of dir is that a record is an OS file somebody can open.
+#
+# Asserted on the FILESYSTEM as well as in the listing, because that is where
+# the fault was: LISTF printed the leading newline as a blank line and listed
+# the file twice, but only the directory entry says the name is right.  The same
+# fault in lmdb was #309.
+BDA="$TESTROOT/binddiracct"
+"$ROOT/scripts/mkaccount.sh" "$BDA" >/dev/null 2>&1
+check tcl-bind-dir "$( \
+  "$TCL" -a "$BDA" -c 'CREATE-FILE ZZD USING dir' 2>&1; \
+  echo '--- the directory is called what the file is called'; \
+  { [ -d "$BDA/ZZD" ] && echo "ZZD is a directory"; } || echo "ZZD IS NOT THERE"; \
+  echo '--- and is listed once, on dir'; \
+  "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -cE '^ZZD +dir'; \
+  echo '--- with nothing named for the binding parameters'; \
+  "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -c 'params')"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and
