@@ -1193,6 +1193,33 @@ check tcl-file-halves "$( \
   echo '--- and a half file can be deleted, not only made'; \
   "$TCL" -a "$HLF" -c 'DELETE-FILE SHARED' 2>&1)"
 
+# A DICTIONARY WITH NO DATA IS STILL A FILE (#318 stage 5).
+#
+# CREATE-FILE DICT makes one, which is how a shared dictionary is made, and U2
+# lists it the same way -- UniData shows the file with an empty data location
+# beside its D_ dictionary.  Here the only thing in the backend is DICT.<name>,
+# which the listing filters as furniture, so the file was invisible.
+#
+# That was not cosmetic.  mv_git finds an account's files through this list, so
+# the dictionary was never staged and a clone lost the D-items every data file
+# pointed at; and the file's VOC pointer, belonging to no file the list knew,
+# looked like ORDINARY CONTENT rather than derived plumbing -- so a VOC/
+# directory was committed and materialised OVER the account's real VOC.
+#
+# Asserted here on the listing.  The mv_git side is in that suite, where the
+# round trip can be run.
+DCO="$TESTROOT/dictonly"
+"$ROOT/scripts/mkaccount.sh" "$DCO" >/dev/null 2>&1
+check tcl-dict-only "$( \
+  "$TCL" -a "$DCO" -c 'CREATE-FILE DICT SHAREDD' 2>&1; \
+  echo '--- it is listed, on the backend that holds it'; \
+  "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -E '^SHAREDD'; \
+  echo '--- and its own dictionary is not listed beside it'; \
+  "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -c 'DICT\.'; \
+  echo '--- a file with both halves is still listed once'; \
+  "$TCL" -a "$DCO" -c 'CREATE-FILE BOTHH' >/dev/null 2>&1; \
+  "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -c 'BOTHH')"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and

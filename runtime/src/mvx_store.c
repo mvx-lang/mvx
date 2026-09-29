@@ -4240,6 +4240,38 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                 if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, local_drv[li]);
                 p = am ? am + 1 : end;
             }
+            /* A DICTIONARY WITH NO DATA IS STILL A FILE (#318 stage 5).
+             *
+             * CREATE-FILE DICT makes one, which is how a SHARED dictionary is
+             * made, and U2 lists it the same way -- UniData shows the file with
+             * an empty data location and its D_ dictionary.  Here the only
+             * thing in the backend is DICT.<name>, which the pass above filters
+             * as furniture, so the file was invisible: LISTF did not show it,
+             * mv_git could not find it, its records were never staged, and a
+             * clone lost the dictionary every data file was pointing at.  Worse,
+             * its VOC pointer then looked like ORDINARY CONTENT rather than a
+             * file pointer, so a VOC/ directory was committed and materialised
+             * over the account's real VOC.
+             *
+             * Second walk, after the first, so fl_listed() can see whether the
+             * data half was already reported.  Per driver, because a dictionary
+             * and the data it describes are made together on one backend -- and
+             * a DICT.<name> whose data is gone is a dictionary-only file now,
+             * whatever it used to be. */
+            if (names.tag == MV_STR && names.s->len > 0) {
+                const char *q = mv_str_bytes(names.s), *qe = q + names.s->len;
+                while (q < qe) {
+                    const char *am = memchr(q, '\xFE', (size_t)(qe - q));
+                    size_t n = (am ? am : qe) - q;
+                    if (n > 5 && memcmp(q, "DICT.", 5) == 0) {
+                        const char *base = q + 5;
+                        size_t bn = n - 5;
+                        if (!fl_listed(buf, len, base, bn))
+                            FL_PUTS(base, bn, local_drv[li]);
+                    }
+                    q = am ? am + 1 : qe;
+                }
+            }
         }
         mv_clear(&names);
     }
