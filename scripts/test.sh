@@ -1141,6 +1141,58 @@ EOF
 "$MVX" "$ptrread" -o "$TESTROOT/ptrreadbin" 2>/dev/null
 check tcl-voc-pointer "$( (cd "$PTR" && MVXACCOUNT=. "$TESTROOT/ptrreadbin" 2>&1) )"
 
+# HALF A FILE, AND A DICTIONARY SEVERAL FILES SHARE (#318 stage 4).
+#
+# U2 spells this CREATE.FILE DICT name and CREATE.FILE DATA name, and each half
+# stands alone -- verified on UniData 8.3, where a dictionary-only file has an
+# empty F2 and a data-only file an empty F3.  A dictionary on its own is how a
+# SHARED dictionary is made before anything uses it; data on its own is how a
+# file borrows someone else's.
+#
+# The sharing is the point, so it is asserted through the QUERY path rather than
+# by reading the pointer back: the D-items live only in the shared dictionary,
+# and both files are listed through them with their headings and formats.  A
+# pointer assertion would pass even if resolution ignored it.
+HLF="$TESTROOT/halfacct"
+"$ROOT/scripts/mkaccount.sh" "$HLF" >/dev/null 2>&1
+hlfseed="$TESTROOT/hlfseed.b"
+cat > "$hlfseed" <<'EOF'
+OPEN "VOC" TO V ELSE STOP
+FOR EACH = 1 TO 2
+   IF EACH = 1 THEN F = "S24" ELSE F = "S25"
+   READ R FROM V,F THEN
+      R<3> = "sqlite:DICT.SHARED"
+      WRITE R ON V,F
+   END ELSE
+      PRINT "no pointer for ":F
+   END
+NEXT EACH
+OPEN "DICT","SHARED" TO D ELSE STOP "no shared dictionary"
+WRITE "D":@AM:"1":@AM:"":@AM:"Customer":@AM:"12L":@AM:"S" ON D,"CUST"
+OPEN "S24" TO A ELSE STOP
+WRITE "Ada" ON A,"I1"
+OPEN "S25" TO B ELSE STOP
+WRITE "Grace" ON B,"I2"
+PRINT "seeded"
+EOF
+"$MVX" "$hlfseed" -o "$TESTROOT/hlfseedbin" 2>/dev/null
+check tcl-file-halves "$( \
+  echo '--- a dictionary on its own has no data half'; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DICT SHARED' 2>&1; \
+  "$TCL" -a "$HLF" -c 'CT VOC SHARED' 2>&1 | sed 1d; \
+  echo '--- and data on its own has no dictionary half'; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DATA S24' 2>&1; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DATA S25' >/dev/null 2>&1; \
+  "$TCL" -a "$HLF" -c 'CT VOC S24' 2>&1 | sed 1d; \
+  echo '--- a dictionary is a hash file, so DIR is refused'; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DICT NOPE DIR' 2>&1; \
+  echo '--- one dictionary serves both files'; \
+  (cd "$HLF" && MVXACCOUNT=. "$TESTROOT/hlfseedbin" 2>&1); \
+  "$TCL" -a "$HLF" -c 'LIST S24 CUST' 2>&1 | normalise | grep -E 'Ada|Customer'; \
+  "$TCL" -a "$HLF" -c 'LIST S25 CUST' 2>&1 | normalise | grep -E 'Grace'; \
+  echo '--- and a half file can be deleted, not only made'; \
+  "$TCL" -a "$HLF" -c 'DELETE-FILE SHARED' 2>&1)"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and

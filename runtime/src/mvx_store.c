@@ -4566,7 +4566,14 @@ static void location_of(const char *cspec, int want_dict,
  *
  * Skips the master dictionary itself and bare dictionaries (a file's own VOC
  * item already covers its dictionary). */
-static void voc_register(const char *name) {
+/* MV_HALF_* say which halves of the file exist, so the pointer can leave the
+   other one empty -- U2's CREATE.FILE DICT and DATA, which is what makes a
+   shared dictionary creatable without editing VOC by hand (#318 stage 4). */
+#define MV_HALF_DATA 1
+#define MV_HALF_DICT 2
+#define MV_HALF_BOTH (MV_HALF_DATA | MV_HALF_DICT)
+
+static void voc_register(const char *name, int halves) {
     size_t nl = strlen(name);
     if (strcmp(name, "VOC") == 0 || strcmp(name, "MD") == 0) return;
     if (nl > 5 && strcmp(name + nl - 5, ".DICT") == 0) return;
@@ -4577,11 +4584,13 @@ static void voc_register(const char *name) {
     mvx_file *v = drv->open(vspec, err, sizeof err);
     if (!v) return;
 
-    char dataloc[1800], dictloc[1800], parms[600];
+    char dataloc[1800] = "", dictloc[1800] = "", parms[600] = "";
     int was = g_derive_only;
     g_derive_only = 1;              /* describe where it lives, do not echo */
-    location_of(name, 0, dataloc, sizeof dataloc, parms, sizeof parms);
-    location_of(name, 1, dictloc, sizeof dictloc, NULL, 0);
+    if (halves & MV_HALF_DATA)
+        location_of(name, 0, dataloc, sizeof dataloc, parms, sizeof parms);
+    if (halves & MV_HALF_DICT)
+        location_of(name, 1, dictloc, sizeof dictloc, NULL, 0);
     g_derive_only = was;
 
     char rec[4096];
@@ -4606,7 +4615,8 @@ static void voc_register(const char *name) {
         char nb[40];
         const char *ep;
         int64_t elen = mv_val_chars(&existing, nb, sizeof nb, &ep);
-        int ours = (elen == ln && memcmp(ep, legacy, (size_t)ln) == 0);
+        int ours = (halves == MV_HALF_BOTH && elen == ln &&
+                    memcmp(ep, legacy, (size_t)ln) == 0);
         mv_clear(&existing);
         if (!ours) { drv->close(v); return; }
     } else {
@@ -5035,7 +5045,52 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
         mvx_account_hash(defbuf, sizeof defbuf);
         if (defbuf[0]) tp = defbuf;
     }
+    /* WHICH HALVES (#318 stage 4).  U2 spells this CREATE.FILE DICT name and
+       CREATE.FILE DATA name, and each half stands alone: a dictionary with no
+       data is how a SHARED dictionary is made before anything uses it, and data
+       with no dictionary is how a file borrows someone else's.
+       Parsed as a whole word, not by first letter -- "DIR" is also a D. */
+    int halves = MV_HALF_BOTH;
+    {
+        const char *q = tp;
+        size_t qn = 0;
+        while (q[qn] && q[qn] != ' ' && q[qn] != '\t') qn++;
+        if (qn == 4 && strncasecmp(q, "DICT", 4) == 0) halves = MV_HALF_DICT;
+        else if (qn == 4 && strncasecmp(q, "DATA", 4) == 0) halves = MV_HALF_DATA;
+        if (halves != MV_HALF_BOTH) {
+            tp += qn;
+            while (*tp == ' ' || *tp == '\t') tp++;
+            /* the rest is the ordinary type; with nothing left, the account
+               default applies -- but a dictionary is always a hash file, so
+               "DICT ... DIR" is a contradiction rather than a shorthand */
+            if (halves == MV_HALF_DICT && tp[0] &&
+                (strcasecmp(tp, "DIR") == 0 || strcasecmp(tp, "DIRECTORY") == 0)) {
+                fprintf(stderr, "CREATE-FILE DICT: a dictionary is a hash "
+                                "file, never a directory\n");
+                return 0;
+            }
+            if (!tp[0] && halves == MV_HALF_DATA) {
+                mvx_account_hash(defbuf, sizeof defbuf);
+                if (defbuf[0]) tp = defbuf;
+            }
+        }
+    }
+
     char err[256] = "";
+
+    /* A DICTIONARY ON ITS OWN: no data half, so nothing to create but the
+       dictionary, and it resolves as a hash file like any other. */
+    if (halves == MV_HALF_DICT) {
+        char dictspec[1720];
+        const mvx_driver *ddrv = resolve(cspec, 1, dictspec, sizeof dictspec);
+        if (!ddrv->create(dictspec, err, sizeof err)) {
+            if (err[0]) fprintf(stderr, "CREATE-FILE DICT: %s\n", err);
+            return 0;
+        }
+        write_file_meta(ddrv, dictspec, ddrv->name ? ddrv->name : "", "");
+        voc_register(cspec, MV_HALF_DICT);
+        return 1;
+    }
 
     /* CREATE-FILE name USING <driver> {params}: bind at creation and
        create through that driver.  The binding is recorded in BINDINGS
@@ -5098,15 +5153,17 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
            file's, which was right only while the two could never differ.  A
            directory file's dictionary is a local hash file, so they differ
            now, and reusing drv would ask the dir driver to make a table. */
-        const mvx_driver *ddrv =
-            resolve(cspec, 1, dictspec, sizeof dictspec);
-        if (!ddrv->create(dictspec, err, sizeof err)) {
-            drv->remove(dataspec, err, sizeof err);
-            binding_remove(cspec);
-            return 0;
+        if (halves & MV_HALF_DICT) {
+            const mvx_driver *ddrv =
+                resolve(cspec, 1, dictspec, sizeof dictspec);
+            if (!ddrv->create(dictspec, err, sizeof err)) {
+                drv->remove(dataspec, err, sizeof err);
+                binding_remove(cspec);
+                return 0;
+            }
+            write_file_meta(ddrv, dictspec, drvname, ap);
         }
-        write_file_meta(ddrv, dictspec, drvname, ap);
-        voc_register(cspec);
+        voc_register(cspec, halves);
         /* If this was VOC, the account's record of where VOC lives is now
            stale, and VOC is the one file nothing else can describe -- it has
            to be opened before anything that could (#187).  CONVERT-FILE goes
@@ -5137,17 +5194,19 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
            an existing account keeps the dictionary it has.
            %FILE% still records "dir": that is the DATA file's class, which is
            what a checkout reads to know what to recreate. */
-        char dspec[1720];
-        const mvx_driver *ddrv = resolve(cspec, 1, dspec, sizeof dspec);
-        if (!ddrv->create(dspec, err, sizeof err)) {
-            /* A hash backend reports "already exists" as a failed create --
-               which is right for CREATE-FILE -- so this is the ordinary second
-               call, not a fault.  Undo only what this call made. */
-            if (!preexisting) drv->remove(cspec, err, sizeof err);
-            return 0;
+        if (halves & MV_HALF_DICT) {
+            char dspec[1720];
+            const mvx_driver *ddrv = resolve(cspec, 1, dspec, sizeof dspec);
+            if (!ddrv->create(dspec, err, sizeof err)) {
+                /* A hash backend reports "already exists" as a failed create
+                   -- which is right for CREATE-FILE -- so this is the ordinary
+                   second call, not a fault.  Undo only what this call made. */
+                if (!preexisting) drv->remove(cspec, err, sizeof err);
+                return 0;
+            }
+            write_file_meta(ddrv, dspec, "dir", "");
         }
-        write_file_meta(ddrv, dspec, "dir", "");
-        voc_register(cspec);
+        voc_register(cspec, halves);
         return 1;
     }
 
@@ -5170,10 +5229,13 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
     char dataspec[1720], dictspec[1720];
     const mvx_driver *drv = resolve(cspec, 0, dataspec, sizeof dataspec);
     if (!drv->create(dataspec, err, sizeof err)) return 0;
-    const mvx_driver *ddrv = resolve(cspec, 1, dictspec, sizeof dictspec);
-    if (!ddrv->create(dictspec, err, sizeof err)) {
-        drv->remove(dataspec, err, sizeof err);
-        return 0;
+    const mvx_driver *ddrv = NULL;
+    if (halves & MV_HALF_DICT) {
+        ddrv = resolve(cspec, 1, dictspec, sizeof dictspec);
+        if (!ddrv->create(dictspec, err, sizeof err)) {
+            drv->remove(dataspec, err, sizeof err);
+            return 0;
+        }
     }
     /* THE DRIVER THAT ACTUALLY HOLDS IT, not a guess (mvx#307).  This was the
        literal string "lmdb", so a plain CREATE-FILE on an account whose default
@@ -5182,8 +5244,11 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
        it, so the wrong answer travelled: mv_git's %FILE% said lmdb while LISTF
        said sqlite.  drv is the driver that just created the file and it knows
        its own name. */
-    write_file_meta(ddrv, dictspec, drv->name ? drv->name : "", "");
-    voc_register(cspec);
+    /* %FILE% lives IN the dictionary, so a data-only file has nowhere to put
+       one.  The pointer carries the location now, which is what MVX resolves
+       from; %FILE% remains for the committed open-account form. */
+    if (ddrv) write_file_meta(ddrv, dictspec, drv->name ? drv->name : "", "");
+    voc_register(cspec, halves);
     return 1;
 }
 
@@ -5197,9 +5262,14 @@ int64_t mvx_deletefile(mvx_ctx *ctx, const mv_value *spec) {
        local hash file, so one driver can no longer remove both. */
     const mvx_driver *ddrv = resolve(cspec, 1, dspec, sizeof dspec);
     char err[256] = "";
-    ddrv->remove(dspec, err, sizeof err);       /* dict first, may be absent */
+    int64_t gone_dict = ddrv->remove(dspec, err, sizeof err);
     const mvx_driver *drv = resolve(cspec, 0, rspec, sizeof rspec);
     int64_t r = drv->remove(rspec, err, sizeof err);
+    /* EITHER HALF COUNTS (#318 stage 4).  A file may now be one half only -- a
+       shared dictionary with no data, or data borrowing another file's
+       dictionary -- and reporting failure because the absent half could not be
+       removed would leave something creatable that cannot be deleted. */
+    if (!r && gone_dict) r = 1;
     if (r) {
         binding_remove(cspec);              /* binding dies with it */
         voc_unregister(cspec);              /* and its VOC file pointer (#71) */

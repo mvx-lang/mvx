@@ -1,0 +1,19 @@
+--- a dictionary on its own has no data half
+[417] file SHARED created
+001 F
+002 
+003 sqlite:DICT.SHARED
+--- and data on its own has no dictionary half
+[417] file S24 created
+001 F
+002 sqlite:S24
+--- a dictionary is a hash file, so DIR is refused
+CREATE-FILE DICT: a dictionary is a hash file, never a directory
+unable to create NOPE (does it already exist?)
+--- one dictionary serves both files
+seeded
+@ID          Customer    
+I1           Ada         
+I2           Grace       
+--- and a half file can be deleted, not only made
+[418] file SHARED deleted
