@@ -1,0 +1,7 @@
+[417] file SHAREDD created
+--- it is listed, on the backend that holds it
+SHAREDD                  sqlite
+--- and its own dictionary is not listed beside it
+0
+--- a file with both halves is still listed once
+1
