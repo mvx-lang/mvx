@@ -4294,6 +4294,56 @@ static void write_file_meta(const mvx_driver *drv, const char *dictspec,
    dictionaries (a file's own VOC item already covers its dictionary), never
    clobbers an existing VOC record, and is a silent no-op before the VOC exists
    (the bootstrap CREATE-FILE VOC). */
+/* WHERE A HALF OF A FILE LIVES, as the pointer spells it (#318 stage 2).
+ *
+ *     location  ::= scheme ":" [ "//" authority "/" ] spec
+ *
+ * scheme is the driver, authority a connection profile, and spec the REST OF
+ * THE ATTRIBUTE, verbatim.  URI-shaped and deliberately a reduced set of one:
+ * no percent-encoding, query or fragment, because an MV file name may legally
+ * contain ? # % : / and @ -- all creatable today -- and either the record
+ * would have to carry encoded names a person cannot read in CT, or it would
+ * mis-resolve silently on names that already exist.
+ *
+ * Nothing reads this yet.  It is written so that an account describes itself
+ * before anything depends on the description. */
+static void location_of(const char *cspec, int want_dict,
+                        char *out, size_t cap, char *params, size_t pcap) {
+    if (params && pcap) params[0] = '\0';
+    char spec[1720];
+    const mvx_driver *d = resolve(cspec, want_dict, spec, sizeof spec);
+    const char *dn = (d && d->name) ? d->name : "";
+
+    /* a bound file's spec reaches the driver as "params\nspec" */
+    const char *nl = strchr(spec, '\n');
+    const char *tail = nl ? nl + 1 : spec;
+    if (nl) {
+        size_t plen = (size_t)(nl - spec);
+        if (plen > 1 && spec[0] == '@') {          /* a connection profile */
+            snprintf(out, cap, "%s://%.*s/%s", dn, (int)plen - 1, spec + 1,
+                     tail);
+            return;
+        }
+        /* Raw connection params -- an address and namespace written straight
+           into BINDINGS rather than named as a profile.  There is no room for
+           them in a location, and inventing authority syntax for an address
+           would be guessing, so they ride in the options attribute. */
+        if (plen && params && pcap)
+            snprintf(params, pcap, "%.*s", (int)plen, spec);
+    }
+    snprintf(out, cap, "%s:%s", dn, tail);
+}
+
+/* Register a newly created file in the account's VOC as a file pointer, so
+   every MV file is discoverable there (#71) alongside its dictionary.
+ *
+ * Attr 1 is "F" for every file, including a directory one: `dir` is a driver,
+ * not a file type, so what a file IS lives in the location (#318).  "DIR" is
+ * still recognised by mvx_voc_class for accounts that come from systems which
+ * write it; it is simply never written here.
+ *
+ * Skips the master dictionary itself and bare dictionaries (a file's own VOC
+ * item already covers its dictionary). */
 static void voc_register(const char *name) {
     size_t nl = strlen(name);
     if (strcmp(name, "VOC") == 0 || strcmp(name, "MD") == 0) return;
@@ -4305,23 +4355,38 @@ static void voc_register(const char *name) {
     mvx_file *v = drv->open(vspec, err, sizeof err);
     if (!v) return;
 
+    char dataloc[1800], dictloc[1800], parms[600];
+    location_of(name, 0, dataloc, sizeof dataloc, parms, sizeof parms);
+    location_of(name, 1, dictloc, sizeof dictloc, NULL, 0);
+
+    char rec[4096];
+    int n = snprintf(rec, sizeof rec, "F%c%s%c%s",
+                     (char)0xFE, dataloc, (char)0xFE, dictloc);
+    if (parms[0])
+        n += snprintf(rec + n, sizeof rec - (size_t)n, "%c%s",
+                      (char)0xFE, parms);
+
+    /* REWRITE ONLY WHAT WE WROTE.  A pointer already there is either ours and
+       out of date -- every account carries "F / name / name.DICT", which was
+       inaccurate for a hash file the day it was written, since its dictionary
+       is DICT.<name> inside the backend -- or it is somebody's own edit, and
+       overwriting that would be taking their account off them.  So the stale
+       form is recognised exactly, byte for byte, and anything else is left. */
     mv_value existing;
     mv_init(&existing);
-    if (drv->read(v, name, (int64_t)nl, &existing)) {   /* already present */
+    if (drv->read(v, name, (int64_t)nl, &existing)) {
+        char legacy[1300];
+        int ln = snprintf(legacy, sizeof legacy, "F%c%s%c%s.DICT",
+                          (char)0xFE, name, (char)0xFE, name);
+        char nb[40];
+        const char *ep;
+        int64_t elen = mv_val_chars(&existing, nb, sizeof nb, &ep);
+        int ours = (elen == ln && memcmp(ep, legacy, (size_t)ln) == 0);
         mv_clear(&existing);
-        drv->close(v);
-        return;
+        if (!ours) { drv->close(v); return; }
+    } else {
+        mv_clear(&existing);
     }
-    mv_clear(&existing);
-
-    char rec[600];
-    size_t n = 0;
-    rec[n++] = 'F';
-    rec[n++] = (char)0xFE;                 /* attribute mark */
-    memcpy(rec + n, name, nl); n += nl;
-    rec[n++] = (char)0xFE;
-    memcpy(rec + n, name, nl); n += nl;
-    memcpy(rec + n, ".DICT", 5); n += 5;
 
     mv_value rv;
     mv_init(&rv);

@@ -1481,6 +1481,16 @@ fi
 # #71: CREATE-FILE registers the file in the VOC as an "F" file pointer (attr 1
 # F, attr 2 data, attr 3 dictionary), for both directory and lmdb files;
 # DELETE-FILE removes it.
+#
+# EACH HALF IS A LOCATION NOW (#318 stage 2): "scheme:spec", where the scheme is
+# the driver -- so a directory file is an `F` like anything else, with `dir` as
+# a driver rather than a file type of its own, and its dictionary is a local
+# hash file rather than a sibling directory.  Attribute 1 is therefore never
+# "DIR"; mvx_voc_class still recognises that for accounts from systems which
+# write it, but nothing here produces one.
+#
+# Nothing READS this yet, which is the point of writing it first: an account
+# describes itself before anything depends on the description.
 CFV="$TESTROOT/cfvoc"
 "$ROOT/scripts/mkaccount.sh" "$CFV" >/dev/null
 check tcl-createfile-voc "$(printf '%s\n' \
