@@ -598,6 +598,7 @@ static const mvx_driver mvx_driver_lmdbnet = {
     net_write_ix, net_del_ix, net_index_select, net_index_drop,
     net_lock, net_unlock,
     .select_count = net_select_count,
+    .takes_connection = 1,   /* reads .mvx-private/connections (mvx#319) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

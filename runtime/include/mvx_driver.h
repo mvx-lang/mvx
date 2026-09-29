@@ -380,6 +380,29 @@ typedef struct mvx_driver {
        account that named it, or the session ending.  The runtime closes that
        location's files first, so a driver may assume none are open on it. */
     void (*release_conn)(const char *loc);
+
+    /* DOES THIS DRIVER READ A CONNECTION PROFILE? (mvx#319)
+     *
+     * A binding may name a profile instead of a driver -- `ORDERS @salesdb` --
+     * and the reference is passed through as the driver's params, deliberately,
+     * so the driver resolves the profile's address, namespace and credentials
+     * itself with mvx_conn_lookup().  A driver that does not do that takes
+     * "@salesdb" for its own location: sqlite created a database file literally
+     * named `@salesdb` while the profile's `address` was ignored, silently.
+     *
+     * So a driver says here whether it understands one, and the runtime refuses
+     * a profile binding the driver could only misread -- at bind time, beside
+     * the availability check, while whoever typed it is still there.
+     *
+     * Declared rather than inferred: the runtime keeping its own list of which
+     * drivers are networked would be a second place to update, and the answer
+     * belongs to the driver.  Zero means no, which is why this sits last -- a
+     * driver that does not mention it fails closed.
+     *
+     * A LOCAL driver may legitimately want one: a profile's `address` is a
+     * database path for sqlite, which is how one file's data goes in its own
+     * database.  That is an addition, not an omission; today they say no. */
+    int takes_connection;
 } mvx_driver;
 
 /* map_backfill sentinel: the transform is not expressible in this backend, so
@@ -422,7 +445,9 @@ typedef struct mvx_file_base {
  * has no note either. */
 #define MVX_FILE_FORMAT 3
 
-#define MVX_DRIVER_ABI 16
+/* 17: takes_connection (mvx#319).  A trailing field, so a driver built against
+   16 is refused by its own entry point rather than read past its end. */
+#define MVX_DRIVER_ABI 17
 
 typedef const mvx_driver *(*mvx_driver_entry_fn)(int abi);
 

@@ -4546,12 +4546,74 @@ static int driver_substitute(const char *file, const char *want,
  *
  * Returns 1 when the file is bound (to `want`, or to whatever was chosen in its
  * place), 0 when the user declined or there was nobody to ask. */
+/* CAN THIS `@name` BINDING ACTUALLY WORK? (mvx#319)
+ *
+ * A profile names a driver, and the reference is handed to that driver as its
+ * params so the driver can resolve the address, namespace and credentials
+ * itself.  A driver that does not read profiles takes the reference for its own
+ * location instead, and says nothing: sqlite created a database file literally
+ * called `@salesdb` while the profile's `address` was ignored.
+ *
+ * Refused here rather than at open, for the same reason the availability check
+ * is here -- the person who typed the binding is still standing there, and a
+ * binding is recorded once but resolved for ever.
+ *
+ * Returns 1 when the binding is usable; 0 with `err` set when it is not. */
+static int conn_usable(const char *want, char *err, size_t ecap) {
+    if (!want || want[0] != '@') return 1;
+    const char *cn = want + 1;
+    char cdrv[64] = "";
+    if (!mvx_conn_lookup(cn, "driver", cdrv, sizeof cdrv) || !cdrv[0]) {
+        /* Absent and incomplete are different mistakes, and "is not defined"
+           sends someone looking for a profile that is sitting right there with
+           a field missing.  Any other field answering proves it exists. */
+        char probe[256] = "";
+        int exists = mvx_conn_lookup(cn, "address", probe, sizeof probe) ||
+                     mvx_conn_lookup(cn, "namespace", probe, sizeof probe) ||
+                     mvx_conn_lookup(cn, "token", probe, sizeof probe);
+        if (exists)
+            snprintf(err, ecap,
+                     "connection '%s' does not say which driver it uses "
+                     "(SET-CONNECTION %s driver=...)", cn, cn);
+        else
+            snprintf(err, ecap,
+                     "connection '%s' is not defined "
+                     "(SET-CONNECTION %s driver=... address=...)", cn, cn);
+        return 0;
+    }
+    if (!mvx_driver_available(cdrv)) {
+        snprintf(err, ecap, "connection '%s' names driver %s, "
+                 "which this host does not have", cn, cdrv);
+        return 0;
+    }
+    const mvx_driver *d = driver_load(cdrv);
+    if (d && !d->takes_connection) {
+        snprintf(err, ecap,
+                 "connection '%s' names driver %s, which does not read "
+                 "connection profiles -- it would take \"%s\" for a location "
+                 "of its own.  Bind to %s directly instead.",
+                 cn, cdrv, want, cdrv);
+        return 0;
+    }
+    return 1;
+}
+
 static int bind_driver(const char *file, const char *want,
                        char *instead, size_t icap, int may_ask) {
     if (instead && icap) instead[0] = '\0';
     if (!file || !file[0] || !want || !want[0]) return 0;
-    /* A connection profile resolves its own driver later; nothing to check. */
-    if (want[0] == '@') { binding_add(file, want, ""); return 1; }
+    /* A connection profile resolves its own driver later -- but whether that
+       driver can read a profile at all is checkable now, and has to be
+       (mvx#319). */
+    if (want[0] == '@') {
+        char cerr[320] = "";
+        if (!conn_usable(want, cerr, sizeof cerr)) {
+            fprintf(stderr, "%s: %s\n", file, cerr);
+            return 0;
+        }
+        binding_add(file, want, "");
+        return 1;
+    }
 
     /* Already what this account would use: no binding, nothing to say.  An
        entry here would only record what was true anyway, on every file. */
@@ -4633,9 +4695,17 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
            Ask rather than abort, and bind to whatever is chosen so every later
            OPEN resolves there (mvx#113).  The connection params belong to the
            backend that is gone, so they do not travel with the substitution. */
-        /* NOT for `@name`: that is a connection PROFILE, not a driver — the
-           driver comes from the profile when the binding is resolved, so there
-           is nothing here to check and "@conn1" is not a file on disk. */
+        /* NOT the availability check for `@name`: that is a connection PROFILE,
+           not a driver, and "@conn1" is not a driver on disk.  Its own check is
+           above -- the profile has to exist and to name a driver that reads
+           one (mvx#319). */
+        if (drvname[0] == '@') {
+            char cerr[320] = "";
+            if (!conn_usable(drvname, cerr, sizeof cerr)) {
+                fprintf(stderr, "CREATE-FILE: %s\n", cerr);
+                return 0;
+            }
+        }
         if (drvname[0] != '@' && !mvx_driver_available(drvname)) {
             char sub[64];
             int r = driver_substitute(cspec, drvname, sub, sizeof sub, 1);
