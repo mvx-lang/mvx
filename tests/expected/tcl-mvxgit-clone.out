@@ -2,6 +2,7 @@ descriptor: .mvx
 no .mv-account on disk
 records in backend, not on disk
 disk %FILE%: native
+and its dictionary is not a directory
 PARTS                    dir
 ORDERS                   sqlite
 W1           Widget      

@@ -805,6 +805,53 @@ static const char *undeclared_default(void) {
    sibling directory for directory files — so a directory file NAME and
    its dictionary NAME.DICT sit side by side (BP and BP.DICT), matching
    the git-legible form exactly. */
+/* THE BACKENDS THAT NEED NOTHING BUT THIS MACHINE.  Named once: FILELIST asks
+   both for an account's unbound files, and a directory file's dictionary has to
+   land on one of them (#318).  A second list somewhere else would be a second
+   thing to update when a local backend is added. */
+static const char *const mvx_local_drivers[] = {"lmdb", "sqlite"};
+#define MVX_NLOCAL (sizeof mvx_local_drivers / sizeof mvx_local_drivers[0])
+
+static int driver_is_local(const char *d) {
+    if (!d || !d[0]) return 0;
+    for (size_t i = 0; i < MVX_NLOCAL; i++)
+        if (strcmp(d, mvx_local_drivers[i]) == 0) return 1;
+    return 0;
+}
+
+/* Is this name already a directory in the account?  Asked before creating
+   one, because dir_create() is deliberately idempotent and so cannot say. */
+static int dir_already_there(const char *cspec) {
+    const char *acct = getenv("MVXACCOUNT");
+    if (!acct || !acct[0]) acct = ".";
+    char path[4160];
+    if (cspec[0] == '/') snprintf(path, sizeof path, "%s", cspec);
+    else                 snprintf(path, sizeof path, "%s/%s", acct, cspec);
+    struct stat sb;
+    return stat(path, &sb) == 0 && S_ISDIR(sb.st_mode);
+}
+
+/* Which local backend holds a DIRECTORY file's dictionary (#318).
+ *
+ * The account's own default when that is local, so an account that says sqlite
+ * keeps sqlite and nothing surprising appears; otherwise the same answer an
+ * undeclared account gets, which is already local by construction.
+ *
+ * Never a networked one, and that is the rule rather than a preference: a
+ * directory file IS a directory on this filesystem, so a dictionary needing a
+ * network round-trip would make a local file unusable without a network it
+ * never required -- and unopenable on a host that simply cannot reach it. */
+static const char *local_hash_driver(void) {
+    static char keep[64];
+    char ad[64];
+    mvx_account_driver(ad, sizeof ad);
+    if (ad[0] && driver_is_local(ad) && mvx_driver_available(ad)) {
+        snprintf(keep, sizeof keep, "%s", ad);
+        return keep;
+    }
+    return undeclared_default();
+}
+
 static const mvx_driver *resolve(const char *cspec, int want_dict,
                                  char *outspec, size_t cap) {
     const char *acct = getenv("MVXACCOUNT");
@@ -818,8 +865,31 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
 
     struct stat sb;
     if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        snprintf(outspec, cap, want_dict ? "%s.DICT" : "%s", cspec);
-        return driver_load("dir");
+        if (!want_dict) {
+            snprintf(outspec, cap, "%s", cspec);
+            return driver_load("dir");
+        }
+        /* A DICTIONARY IS NEVER A DIRECTORY (#318).  Data and dictionary are
+           different kinds of thing: a directory file exists so its RECORDS are
+           OS files a person edits and git diffs -- the whole point for BP
+           source -- but a dictionary holds D-items nobody edits in an editor
+           and the query path reads constantly.  In a hash backend LIST and
+           SELECT push a dictionary lookup down instead of opening a directory
+           and reading a file per attribute.
+
+           EXCEPT WHERE ONE IS ALREADY THERE.  An account made before this has
+           a real <name>.DICT directory, and answering "hash" for it would lose
+           every D-item in it.  So an existing directory still wins, no account
+           needs converting, and both layouts keep working. */
+        char dpath[4160];
+        snprintf(dpath, sizeof dpath, "%s.DICT", path);
+        struct stat db;
+        if (stat(dpath, &db) == 0 && S_ISDIR(db.st_mode)) {
+            snprintf(outspec, cap, "%s.DICT", cspec);
+            return driver_load("dir");
+        }
+        snprintf(outspec, cap, "DICT.%s", cspec);
+        return driver_load(local_hash_driver());
     }
     /* Per-file backend binding (ARCHITECTURE.md 4.4: migration is per
        file).  A file may be bound to a networked or foreign backend by
@@ -828,6 +898,13 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
        "params\nspec" - opaque to the runtime, parsed by the driver. */
     char driver[64], params[512];
     if (binding_for(cspec, driver, sizeof driver, params, sizeof params)) {
+        /* The same rule as above, for the other way to make a directory file:
+           CREATE-FILE x USING dir binds to dir rather than leaving a directory
+           for the stat() to find, and its dictionary is a hash file too. */
+        if (want_dict && strcmp(driver, "dir") == 0) {
+            snprintf(outspec, cap, "DICT.%s", cspec);
+            return driver_load(local_hash_driver());
+        }
         snprintf(outspec, cap, want_dict ? "%s\nDICT.%s" : "%s\n%s",
                  params, cspec);
         return driver_load(driver);
@@ -922,15 +999,17 @@ static void ix_load(open_file *o) {
        (index_select over a mapped column, Postgres). */
     if (!b->driver->write_ix && !b->driver->index_select) return;
 
+    /* THE DICTIONARY'S OWN DRIVER AGAIN (#318).  Rebuilding the spec here and
+       opening it with b->driver assumed the dictionary lives wherever the data
+       does.  resolve() is the one place that knows, so ask it -- which also
+       drops this function's private copy of how a dictionary is spelled. */
     char dspec[1720];
-    const char *nl = strchr(b->spec, '\n');
-    if (nl)
-        snprintf(dspec, sizeof dspec, "%.*s\nDICT.%s",
-                 (int)(nl - b->spec), b->spec, nl + 1);
-    else
-        snprintf(dspec, sizeof dspec, "DICT.%s", b->spec);
+    const char *dname = b->spec;
+    const char *nl0 = strchr(b->spec, '\n');
+    if (nl0) dname = nl0 + 1;              /* a bound spec is "params\nname" */
+    const mvx_driver *ddrv = resolve(dname, 1, dspec, sizeof dspec);
     char err[256] = "";
-    mvx_file *d = b->driver->open(dspec, err, sizeof err);
+    mvx_file *d = ddrv->open(dspec, err, sizeof err);
     if (!d) return;
 
     mv_value xl, item, drec, ano;
@@ -3922,8 +4001,8 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
        was invisible here, so LISTF under-reported it and mvx-git -- which
        finds an account's files through this same list -- committed the
        account without its records (mv_git#240). */
-    static const char *local_drv[] = {"lmdb", "sqlite"};
-    for (size_t li = 0; li < sizeof local_drv / sizeof local_drv[0]; li++) {
+    const char *const *local_drv = mvx_local_drivers;
+    for (size_t li = 0; li < MVX_NLOCAL; li++) {
         if (!mvx_driver_available(local_drv[li])) continue;
         const mvx_driver *ld = driver_load(local_drv[li]);
         if (!ld || !ld->names) continue;
@@ -4722,13 +4801,18 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
             binding_remove(cspec);
             return 0;
         }
-        resolve(cspec, 1, dictspec, sizeof dictspec);
-        if (!drv->create(dictspec, err, sizeof err)) {
+        /* THE DICTIONARY'S OWN DRIVER (#318).  This used to reuse the data
+           file's, which was right only while the two could never differ.  A
+           directory file's dictionary is a local hash file, so they differ
+           now, and reusing drv would ask the dir driver to make a table. */
+        const mvx_driver *ddrv =
+            resolve(cspec, 1, dictspec, sizeof dictspec);
+        if (!ddrv->create(dictspec, err, sizeof err)) {
             drv->remove(dataspec, err, sizeof err);
             binding_remove(cspec);
             return 0;
         }
-        write_file_meta(drv, dictspec, drvname, ap);
+        write_file_meta(ddrv, dictspec, drvname, ap);
         voc_register(cspec);
         /* If this was VOC, the account's record of where VOC lives is now
            stale, and VOC is the one file nothing else can describe -- it has
@@ -4741,18 +4825,35 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
 
     if (tp[0] == 'D' || tp[0] == 'd') {
         const mvx_driver *drv = driver_load("dir");
+        /* DID IT EXIST BEFORE WE TOUCHED IT?  dir_create() is idempotent by
+           design, so it cannot tell us, and the rollback below must never
+           remove a directory -- and the records in it -- that we did not
+           create.  This is not hypothetical: a checkout calls createfile once
+           per committed subtree, so the second call for a file arrives with
+           the data already there and the dictionary already made, and a
+           rollback then deleted the file it had just materialised. */
+        int preexisting = dir_already_there(cspec);
         if (!drv->create(cspec, err, sizeof err)) return 0;
         /* A dictionary directory (NAME.DICT) is a file but needs no
            dictionary of its own — never create NAME.DICT.DICT. */
         size_t cl = strlen(cspec);
         if (cl > 5 && strcmp(cspec + cl - 5, ".DICT") == 0) return 1;
-        char dspec[1152];
-        snprintf(dspec, sizeof dspec, "%s.DICT", cspec);
-        if (!drv->create(dspec, err, sizeof err)) {
-            drv->remove(cspec, err, sizeof err);
+        /* THE DICTIONARY IS A LOCAL HASH FILE, not a sibling directory (#318).
+           resolve() picks it, and answers <name>.DICT on dir when an older
+           account already has one there -- so this is also the route by which
+           an existing account keeps the dictionary it has.
+           %FILE% still records "dir": that is the DATA file's class, which is
+           what a checkout reads to know what to recreate. */
+        char dspec[1720];
+        const mvx_driver *ddrv = resolve(cspec, 1, dspec, sizeof dspec);
+        if (!ddrv->create(dspec, err, sizeof err)) {
+            /* A hash backend reports "already exists" as a failed create --
+               which is right for CREATE-FILE -- so this is the ordinary second
+               call, not a fault.  Undo only what this call made. */
+            if (!preexisting) drv->remove(cspec, err, sizeof err);
             return 0;
         }
-        write_file_meta(drv, dspec, "dir", "");
+        write_file_meta(ddrv, dspec, "dir", "");
         voc_register(cspec);
         return 1;
     }
@@ -4776,8 +4877,8 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
     char dataspec[1720], dictspec[1720];
     const mvx_driver *drv = resolve(cspec, 0, dataspec, sizeof dataspec);
     if (!drv->create(dataspec, err, sizeof err)) return 0;
-    resolve(cspec, 1, dictspec, sizeof dictspec);
-    if (!drv->create(dictspec, err, sizeof err)) {
+    const mvx_driver *ddrv = resolve(cspec, 1, dictspec, sizeof dictspec);
+    if (!ddrv->create(dictspec, err, sizeof err)) {
         drv->remove(dataspec, err, sizeof err);
         return 0;
     }
@@ -4788,7 +4889,7 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
        it, so the wrong answer travelled: mv_git's %FILE% said lmdb while LISTF
        said sqlite.  drv is the driver that just created the file and it knows
        its own name. */
-    write_file_meta(drv, dictspec, drv->name ? drv->name : "", "");
+    write_file_meta(ddrv, dictspec, drv->name ? drv->name : "", "");
     voc_register(cspec);
     return 1;
 }
@@ -4799,10 +4900,12 @@ int64_t mvx_deletefile(mvx_ctx *ctx, const mv_value *spec) {
     if (!spec_cstr(spec, cspec, sizeof cspec)) return 0;
 
     char dspec[1720], rspec[1720];
-    const mvx_driver *drv = resolve(cspec, 1, dspec, sizeof dspec);
+    /* EACH HALF WITH ITS OWN DRIVER (#318): a directory file's dictionary is a
+       local hash file, so one driver can no longer remove both. */
+    const mvx_driver *ddrv = resolve(cspec, 1, dspec, sizeof dspec);
     char err[256] = "";
-    drv->remove(dspec, err, sizeof err);        /* dict first, may be absent */
-    resolve(cspec, 0, rspec, sizeof rspec);
+    ddrv->remove(dspec, err, sizeof err);       /* dict first, may be absent */
+    const mvx_driver *drv = resolve(cspec, 0, rspec, sizeof rspec);
     int64_t r = drv->remove(rspec, err, sizeof err);
     if (r) {
         binding_remove(cspec);              /* binding dies with it */

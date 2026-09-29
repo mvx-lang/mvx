@@ -3,4 +3,5 @@ git: .mv-account
 git: no .mvx
 git: no lmdb store
 disk %FILE%: native
+and its dictionary is not a directory
 disk descriptor: .mvx
