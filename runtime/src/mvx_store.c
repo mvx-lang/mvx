@@ -4516,8 +4516,14 @@ int mvx_voc_class(const char *type, int64_t len) {
    know a file's backend after a clone).  On disk it is always the native
    record = "FILE" VM type VM conn; the engine translates it to the portable
    DIR/hash class when it writes the open form to git. */
+/* `halves` marks a file that has only one, as "halves=dict" (#318 stage 5b).
+   A further value on the control, so every control ever written is unchanged
+   and still reads correctly -- absent means both.  A dictionary-only file needs
+   it because its control IS a record and travels as one; a data-only file has
+   no control at all, and mv_git synthesises one for the commit. */
 static void write_file_meta(const mvx_driver *drv, const char *dictspec,
-                            const char *type, const char *conn) {
+                            const char *type, const char *conn,
+                            const char *halves) {
     char err[256] = "";
     mvx_file *d = drv->open(dictspec, err, sizeof err);
     if (!d) return;
@@ -4527,10 +4533,15 @@ static void write_file_meta(const mvx_driver *drv, const char *dictspec,
     rec[n++] = (char)0xFD;                  /* value mark */
     size_t tl = strlen(type);
     memcpy(rec + n, type, tl); n += tl;
-    if (conn && conn[0]) {
+    if ((conn && conn[0]) || (halves && halves[0])) {
         rec[n++] = (char)0xFD;
-        size_t cl = strlen(conn);
-        memcpy(rec + n, conn, cl); n += cl;
+        size_t cl = conn ? strlen(conn) : 0;
+        if (cl) { memcpy(rec + n, conn, cl); n += cl; }
+    }
+    if (halves && halves[0]) {
+        rec[n++] = (char)0xFD;
+        size_t hl = strlen(halves);
+        memcpy(rec + n, halves, hl); n += hl;
     }
     mv_value rv;
     mv_init(&rv);
@@ -5119,7 +5130,8 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
             if (err[0]) fprintf(stderr, "CREATE-FILE DICT: %s\n", err);
             return 0;
         }
-        write_file_meta(ddrv, dictspec, ddrv->name ? ddrv->name : "", "");
+        write_file_meta(ddrv, dictspec, ddrv->name ? ddrv->name : "", "",
+                        "halves=dict");
         voc_register(cspec, MV_HALF_DICT);
         return 1;
     }
@@ -5193,7 +5205,7 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                 binding_remove(cspec);
                 return 0;
             }
-            write_file_meta(ddrv, dictspec, drvname, ap);
+            write_file_meta(ddrv, dictspec, drvname, ap, NULL);
         }
         voc_register(cspec, halves);
         /* If this was VOC, the account's record of where VOC lives is now
@@ -5236,7 +5248,7 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                 if (!preexisting) drv->remove(cspec, err, sizeof err);
                 return 0;
             }
-            write_file_meta(ddrv, dspec, "dir", "");
+            write_file_meta(ddrv, dspec, "dir", "", NULL);
         }
         voc_register(cspec, halves);
         return 1;
@@ -5279,7 +5291,7 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
     /* %FILE% lives IN the dictionary, so a data-only file has nowhere to put
        one.  The pointer carries the location now, which is what MVX resolves
        from; %FILE% remains for the committed open-account form. */
-    if (ddrv) write_file_meta(ddrv, dictspec, drv->name ? drv->name : "", "");
+    if (ddrv) write_file_meta(ddrv, dictspec, drv->name ? drv->name : "", "", NULL);
     voc_register(cspec, halves);
     return 1;
 }
