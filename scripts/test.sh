@@ -1088,6 +1088,59 @@ check tcl-conn-refused "$( \
   echo '--- and one that exists but names no driver says THAT'; \
   "$TCL" -a "$CPA" -c 'CREATE-FILE Y USING @nodriver' 2>&1 | head -1)"
 
+# RESOLUTION READS THE VOC POINTER (#318 stage 3).
+#
+# The pointer is the account's own statement of where a file lives; resolution
+# used to derive it instead, from a stat() and BINDINGS.  Proved by EDITING a
+# pointer and nothing else: if resolution still found the data, it was not
+# reading it.
+#
+# And the form every pre-stage-2 account carries -- "F / name / name.DICT" --
+# must be IGNORED rather than believed, because it was inaccurate for hash
+# files the day it was written: their dictionary is DICT.<name> in the backend,
+# not a directory.  An account nobody has touched has to resolve exactly as it
+# did before, so that case is asserted too, and it is the one that would break
+# every existing account if it regressed.
+PTR="$TESTROOT/ptracct"
+"$ROOT/scripts/mkaccount.sh" "$PTR" >/dev/null 2>&1
+"$TCL" -a "$PTR" -c 'CREATE-FILE PF' >/dev/null 2>&1
+ptrseed="$TESTROOT/ptrseed.b"
+cat > "$ptrseed" <<'EOF'
+OPEN "PF" TO F ELSE STOP
+WRITE "here" ON F, "K"
+OPEN "VOC" TO V ELSE STOP
+* point it somewhere the data is not
+READ R FROM V,"PF" THEN
+   R<2> = "lmdb:PF"
+   R<3> = "lmdb:DICT.PF"
+   WRITE R ON V,"PF"
+END
+* and a second file whose pointer is the pre-stage-2 form, which must be ignored
+X = CREATEFILE("LEGACYP")
+OPEN "LEGACYP" TO G ELSE STOP
+WRITE "still reachable" ON G, "K"
+L = "F":@AM:"LEGACYP":@AM:"LEGACYP.DICT"
+WRITE L ON V,"LEGACYP"
+PRINT "seeded"
+EOF
+"$MVX" "$ptrseed" -o "$TESTROOT/ptrseedbin" 2>/dev/null
+(cd "$PTR" && MVXACCOUNT=. "$TESTROOT/ptrseedbin") >/dev/null
+ptrread="$TESTROOT/ptrread.b"
+cat > "$ptrread" <<'EOF'
+OPEN "PF" TO F ELSE
+   PRINT "PF: followed the pointer (not found where the data is)"
+   GOTO 10
+END
+PRINT "PF: STILL RESOLVING BY DERIVATION"
+10 OPEN "LEGACYP" TO G ELSE
+   PRINT "LEGACYP: LOST -- the stale form was believed"
+   STOP
+END
+READ R FROM G,"K" THEN PRINT "LEGACYP: ":R ELSE PRINT "LEGACYP: no record"
+EOF
+"$MVX" "$ptrread" -o "$TESTROOT/ptrreadbin" 2>/dev/null
+check tcl-voc-pointer "$( (cd "$PTR" && MVXACCOUNT=. "$TESTROOT/ptrreadbin" 2>&1) )"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and

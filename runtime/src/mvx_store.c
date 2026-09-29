@@ -853,6 +853,218 @@ static const char *local_hash_driver(void) {
 }
 
 static const mvx_driver *resolve(const char *cspec, int want_dict,
+                                 char *outspec, size_t cap);
+
+/* ---- reading a file's location out of its VOC pointer (#318 stage 3) -----
+ *
+ * The pointer is the account's own statement of where a file lives.  Until now
+ * it was written and never read, and resolution was DERIVED instead: stat() the
+ * name to see if it is a directory, then BINDINGS, then the account default.
+ * Derivation cannot express two files of the same driver in different places,
+ * and it decides "is this a directory file" by touching the filesystem on every
+ * open.
+ *
+ * SHADOWING, NOT REPLACING.  A usable pointer wins; everything else falls
+ * through to the derivation below exactly as before.  Two reasons, and the
+ * second is the one that matters: BINDINGS also carries a "*" policy line,
+ * which is per-account rather than per-file and has nowhere else to live yet;
+ * and stage 2 only writes a pointer when a file is created, so an account
+ * nobody has touched still carries the old form for every file in it.
+ *
+ * THE OLD FORM IS IGNORED RATHER THAN TRUSTED.  Every account written before
+ * stage 2 says "F / name / name.DICT", which was inaccurate for hash files the
+ * day it was written -- their dictionary is DICT.<name> inside the backend.
+ * It is recognised byte for byte and passed over, so an untouched account
+ * resolves exactly as it does today. */
+
+/* One attribute of an @AM-separated record, 1-based.  Empty when absent. */
+static void attr_n(const char *rec, int64_t len, int n,
+                   const char **out, int64_t *olen) {
+    const char *p = rec, *end = rec + len;
+    for (int i = 1; i < n && p < end; i++) {
+        const char *am = memchr(p, (char)0xFE, (size_t)(end - p));
+        p = am ? am + 1 : end;
+    }
+    const char *am = (p < end)
+        ? memchr(p, (char)0xFE, (size_t)(end - p)) : NULL;
+    *out = p;
+    *olen = (am ? am : end) - p;
+}
+
+/* scheme ":" [ "//" authority "/" ] spec -- the spec is the rest, verbatim. */
+static int parse_location(const char *loc, char *drv, size_t dcap,
+                          char *conn, size_t ccap, const char **spec) {
+    conn[0] = '\0';
+    const char *c = strchr(loc, ':');
+    if (!c || c == loc) return 0;
+    size_t dl = (size_t)(c - loc);
+    if (dl >= dcap) return 0;
+    memcpy(drv, loc, dl);
+    drv[dl] = '\0';
+
+    const char *rest = c + 1;
+    if (rest[0] == '/' && rest[1] == '/') {
+        const char *slash = strchr(rest + 2, '/');
+        if (!slash) return 0;                   /* an authority and no spec */
+        size_t cl = (size_t)(slash - (rest + 2));
+        if (cl == 0 || cl >= ccap) return 0;
+        memcpy(conn, rest + 2, cl);
+        conn[cl] = '\0';
+        *spec = slash + 1;
+    } else {
+        *spec = rest;
+    }
+    return (*spec)[0] != '\0';
+}
+
+/* WHICH ACCOUNT THIS IS, resolved -- not how it was spelled.
+ *
+ * MVXACCOUNT is "." under the shell and stays "." after mvx_logto, which
+ * fchdir()s and leaves the name alone, so the spelling does not distinguish
+ * accounts at all.  Keying a cache on it means a program that opens a file,
+ * LOGTOs and opens the same name again is served the first account's answer --
+ * the menu-switching-company case, and exactly the fault mvx#264 fixed in the
+ * lmdb driver's env cache for the same reason.  Resolve it. */
+static void account_key(char *out, size_t cap) {
+    const char *acct = getenv("MVXACCOUNT");
+    if (!acct || !acct[0]) acct = ".";
+    char real[4096];
+    if (realpath(acct, real)) snprintf(out, cap, "%s", real);
+    else                      snprintf(out, cap, "%s", acct);
+}
+
+/* A tiny cache, because resolve() is on the open path and this reads VOC.
+   Negative answers are cached too: an account written before stage 2 has no
+   usable pointer for any file, and without this it would read VOC on every
+   open for ever.  Dropped whole when a pointer is written or removed, and
+   when the session moves to another account. */
+#define PL_CACHE 64
+static struct {
+    char name[256];
+    int  want_dict;
+    int  found;
+    char drv[64];
+    char spec[1200];
+} g_pl[PL_CACHE];
+static int  g_pl_n;
+static int  g_pl_next;
+/* ONE ACCOUNT AT A TIME, whole-cache.  Holding the account per entry would
+   mean storing a path per entry and comparing truncated copies of it, and two
+   deep paths that truncate alike would serve one account's answer in the
+   other -- the fault above, reintroduced by the fix for it. */
+static char g_pl_acct[4096];
+
+static void pointer_cache_drop(void) {
+    g_pl_n = 0; g_pl_next = 0; g_pl_acct[0] = '\0';
+}
+
+/* Derive, do not read the pointer.  Two callers need it: resolving VOC itself,
+   which would recurse; and voc_register, which asks resolve() where a file
+   lives in order to WRITE that answer down -- reading the pointer there would
+   have it copy the record back onto itself instead of describing reality. */
+static int g_derive_only;
+
+static int pointer_location(const char *cspec, int want_dict,
+                            char *drvname, size_t dcap,
+                            char *outspec, size_t ocap) {
+    /* VOC is opened before anything that could describe it (#187), and MD is
+       its other name -- neither can be resolved through a record inside it. */
+    if (!cspec || !cspec[0]) return 0;
+    if (strcasecmp(cspec, "VOC") == 0 || strcasecmp(cspec, "MD") == 0) return 0;
+    if (g_derive_only) return 0;
+
+    char acct[4096];
+    account_key(acct, sizeof acct);
+    if (strcmp(g_pl_acct, acct) != 0) {         /* the session moved */
+        g_pl_n = 0; g_pl_next = 0;
+        snprintf(g_pl_acct, sizeof g_pl_acct, "%s", acct);
+    }
+
+    for (int i = 0; i < g_pl_n; i++) {
+        if (g_pl[i].want_dict != want_dict) continue;
+        if (strcmp(g_pl[i].name, cspec) != 0) continue;
+        if (!g_pl[i].found) return 0;
+        snprintf(drvname, dcap, "%s", g_pl[i].drv);
+        snprintf(outspec, ocap, "%s", g_pl[i].spec);
+        return 1;
+    }
+
+    int found = 0;
+    char fdrv[64] = "", fspec[1200] = "";
+
+    g_derive_only = 1;
+    char vspec[1152];
+    const mvx_driver *vd = resolve("VOC", 0, vspec, sizeof vspec);
+    char err[256] = "";
+    mvx_file *v = vd ? vd->open(vspec, err, sizeof err) : NULL;
+    if (v) {
+        mv_value rec;
+        mv_init(&rec);
+        if (vd->read(v, cspec, (int64_t)strlen(cspec), &rec)) {
+            char nb[40];
+            const char *rp;
+            int64_t rlen = mv_val_chars(&rec, nb, sizeof nb, &rp);
+
+            /* the form every pre-stage-2 account carries, and it is wrong */
+            char legacy[1300];
+            int ln = snprintf(legacy, sizeof legacy, "F%c%s%c%s.DICT",
+                              (char)0xFE, cspec, (char)0xFE, cspec);
+            int stale = (rlen == ln && memcmp(rp, legacy, (size_t)ln) == 0);
+
+            const char *t; int64_t tl;
+            attr_n(rp, rlen, 1, &t, &tl);
+            int is_f = (tl == 1 && (t[0] == 'F' || t[0] == 'f'));
+
+            if (is_f && !stale) {
+                const char *lp; int64_t ll;
+                attr_n(rp, rlen, want_dict ? 3 : 2, &lp, &ll);
+                if (ll > 0 && ll < 1100) {
+                    char loc[1152];
+                    memcpy(loc, lp, (size_t)ll);
+                    loc[ll] = '\0';
+                    char conn[128];
+                    const char *sp;
+                    if (parse_location(loc, fdrv, sizeof fdrv,
+                                       conn, sizeof conn, &sp)) {
+                        const char *pp; int64_t pl2;
+                        attr_n(rp, rlen, 4, &pp, &pl2);   /* raw params */
+                        if (conn[0])
+                            snprintf(fspec, sizeof fspec, "@%s\n%s", conn, sp);
+                        else if (pl2 > 0)
+                            snprintf(fspec, sizeof fspec, "%.*s\n%s",
+                                     (int)pl2, pp, sp);
+                        else
+                            snprintf(fspec, sizeof fspec, "%s", sp);
+                        found = mvx_driver_available(fdrv);
+                    }
+                }
+            }
+        }
+        mv_clear(&rec);
+        vd->close(v);
+    }
+    g_derive_only = 0;
+
+    {
+        /* Round-robin once full, rather than giving up on caching: stopping
+           at the cap would leave every file past the 64th reading VOC on
+           every open, which is the one case this cache exists for. */
+        int i;
+        if (g_pl_n < PL_CACHE) i = g_pl_n++;
+        else { i = g_pl_next; g_pl_next = (g_pl_next + 1) % PL_CACHE; }
+        snprintf(g_pl[i].name, sizeof g_pl[i].name, "%s", cspec);
+        g_pl[i].want_dict = want_dict;
+        g_pl[i].found = found;
+        snprintf(g_pl[i].drv, sizeof g_pl[i].drv, "%s", fdrv);
+        snprintf(g_pl[i].spec, sizeof g_pl[i].spec, "%s", fspec);
+    }
+    if (!found) return 0;
+    snprintf(drvname, dcap, "%s", fdrv);
+    snprintf(outspec, ocap, "%s", fspec);
+    return 1;
+}
+
+static const mvx_driver *resolve(const char *cspec, int want_dict,
                                  char *outspec, size_t cap) {
     const char *acct = getenv("MVXACCOUNT");
     if (!acct || !acct[0]) acct = ".";
@@ -862,6 +1074,16 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
         snprintf(path, sizeof path, "%s", cspec);
     else
         snprintf(path, sizeof path, "%s/%s", acct, cspec);
+
+    /* WHAT THE ACCOUNT SAYS, before what the filesystem suggests (#318). */
+    {
+        char pdrv[64], pspec[1200];
+        if (pointer_location(cspec, want_dict, pdrv, sizeof pdrv,
+                             pspec, sizeof pspec)) {
+            snprintf(outspec, cap, "%s", pspec);
+            return driver_load(pdrv);
+        }
+    }
 
     struct stat sb;
     if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
@@ -4356,8 +4578,11 @@ static void voc_register(const char *name) {
     if (!v) return;
 
     char dataloc[1800], dictloc[1800], parms[600];
+    int was = g_derive_only;
+    g_derive_only = 1;              /* describe where it lives, do not echo */
     location_of(name, 0, dataloc, sizeof dataloc, parms, sizeof parms);
     location_of(name, 1, dictloc, sizeof dictloc, NULL, 0);
+    g_derive_only = was;
 
     char rec[4096];
     int n = snprintf(rec, sizeof rec, "F%c%s%c%s",
@@ -4394,6 +4619,7 @@ static void voc_register(const char *name) {
     drv->write(v, name, (int64_t)nl, &rv);
     mv_clear(&rv);
     drv->close(v);
+    pointer_cache_drop();           /* what resolve() remembers is now stale */
 }
 
 /* Remove a file's VOC pointer on DELETE-FILE — but only if the record is in
@@ -4412,8 +4638,10 @@ static void voc_unregister(const char *name) {
         char nb[40];
         const char *p;
         int64_t len = mv_val_chars(&rec, nb, sizeof nb, &p);
-        if (len >= 1 && p[0] == 'F' && (len == 1 || p[1] == (char)0xFE))
+        if (len >= 1 && p[0] == 'F' && (len == 1 || p[1] == (char)0xFE)) {
             drv->del(v, name, (int64_t)nl);
+            pointer_cache_drop();
+        }
     }
     mv_clear(&rec);
     drv->close(v);
