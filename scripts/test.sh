@@ -1736,6 +1736,14 @@ version = 1
   # normalises the staged git objects to the open form - %FILE% becomes DIR/hash,
   # .mvx is stored at .mv-account, and the binary lmdb store is never tracked -
   # while the working tree on disk stays a native MVX account.
+  #
+  # "native" MOVED, and that is the point being asserted (#318).  A directory
+  # file's dictionary is a local hash file now, not a sibling NAME.DICT
+  # directory, so %FILE% is read through the dictionary rather than off the
+  # disk -- and the absence of the directory is asserted too, or the check
+  # would pass just as well on the old layout.  The GIT form is unchanged:
+  # <name>.DICT/%FILE% is still what a commit carries, synthesised from the
+  # backend exactly as it already was for lmdb-file dictionaries.
   MGF="$TESTROOT/mgopenform"
   "$ROOT/scripts/mkaccount.sh" "$MGF" >/dev/null
   "$TCL" -a "$MGF" -c 'CREATE-FILE PARTS DIR' >/dev/null 2>&1
@@ -1751,7 +1759,9 @@ version = 1
         || echo 'git: no .mvx'; }; \
     { git cat-file -e 'HEAD:mvxdata.lmdb/data.mdb' 2>/dev/null \
         && echo 'git: lmdb store (WRONG)' || echo 'git: no lmdb store'; }; \
-    { grep -q 'FILE' 'PARTS.DICT/%FILE%' && echo 'disk %FILE%: native'; }; \
+    { "$TCL" -a . -c 'CT DICT PARTS %FILE%' 2>&1 | grep -q 'FILE' \
+        && echo 'disk %FILE%: native'; }; \
+    { [ ! -d 'PARTS.DICT' ] && echo 'and its dictionary is not a directory'; }; \
     { [ -f .mvx ] && echo 'disk descriptor: .mvx'; })"
 
   # lmdb-file dictionaries: their records live in LMDB (no on-disk .DICT dir for
@@ -1808,7 +1818,9 @@ EOF
     { [ -f .mvx ] && echo 'descriptor: .mvx'; }; \
     { [ ! -e .mv-account ] && echo 'no .mv-account on disk'; }; \
     { [ ! -d ORDERS ] && [ -d mvxdata.lmdb ] && echo 'records in backend, not on disk'; }; \
-    { grep -q 'FILE' 'PARTS.DICT/%FILE%' && echo 'disk %FILE%: native'; }; \
+    { "$TCL" -a . -c 'CT DICT PARTS %FILE%' 2>&1 | grep -q 'FILE' \
+        && echo 'disk %FILE%: native'; }; \
+    { [ ! -d 'PARTS.DICT' ] && echo 'and its dictionary is not a directory'; }; \
     "$TCL" -a . -c 'LISTF' 2>&1 | normalise | grep -E '^PARTS |^ORDERS '; \
     "$TCL" -a . -c 'LIST PARTS NAME' 2>&1 | normalise | grep -E 'W1|Widget' | head -1 )"
 
