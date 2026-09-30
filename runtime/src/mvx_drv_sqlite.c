@@ -119,12 +119,53 @@ static void fn_mvx_vm_has(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
 
 /* Open (once per database file) and cache.  Every table in this file is
    an MV file of the same account, which is what keeps joins co-located. */
+/* A CONNECTION PROFILE NAMES A LOCAL DATABASE TOO (mvx#326).
+ *
+ * `ORDERS @salesdb' with a profile whose driver is sqlite means "that database
+ * over there": several accounts can share one, and the database can live outside
+ * the account entirely -- which is what a container needs, where the image is
+ * read-only and the data belongs on a mounted volume.
+ *
+ * A RELATIVE address resolves against the ACCOUNT, not the process's working
+ * directory.  MVXACCOUNT is "." under the shell and stays "." after mvx_logto,
+ * which fchdir()s, so "against the cwd" would mean a different file after a
+ * LOGTO -- the same trap mvx#264 fixed for the env cache.
+ *
+ * Returns the path to use, in `out`.  A profile with no address is an error the
+ * caller reports: silently falling back to the account's own database is how one
+ * account would quietly write into another's file. */
+static int conn_db_path(const char *loc, char *out, size_t cap,
+                        char *err, size_t errlen) {
+    const char *cn = loc + 1;                      /* past the '@' */
+    char addr[1024] = "";
+    if (!mvx_conn_lookup(cn, "address", addr, sizeof addr) || !addr[0]) {
+        snprintf(err, errlen,
+                 "sqlite: connection '%s' has no address "
+                 "(SET-CONNECTION %s address=/path/to/db.sqlite)", cn, cn);
+        return 0;
+    }
+    if (addr[0] == '/') {
+        snprintf(out, cap, "%s", addr);
+    } else {
+        const char *acct = getenv("MVXACCOUNT");
+        if (!acct || !acct[0]) acct = ".";
+        snprintf(out, cap, "%s/%s", acct, addr);
+    }
+    return 1;
+}
+
 static sqlite3 *sq_connect(const char *path, char *err, size_t errlen) {
     /* NO PATH MEANS THE ACCOUNT'S OWN DATABASE (#187).  An account can now
        declare sqlite as its default backend, and a default has to know where
        to put things without being told -- lmdb has always defaulted to
        <account>/mvxdata.lmdb for exactly this reason.  Same shape, same
        place. */
+    char resolved[4096];
+    if (path && path[0] == '@') {              /* a connection profile (#326) */
+        if (!conn_db_path(path, resolved, sizeof resolved, err, errlen))
+            return NULL;
+        path = resolved;
+    }
     char dflt[4096];
     if (!path || !path[0]) {
         const char *acct = getenv("MVXACCOUNT");
@@ -1646,6 +1687,7 @@ static const mvx_driver mvx_driver_sqlite = {
     NULL,                                 /* map_text_cap: no bound here */
     NULL,                                 /* conn_epoch: a file, not a server */
     sq_release_conn,                      /* let a left account go (mvx#251) */
+    .takes_connection = 1,   /* a profile names a local database too (#326) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

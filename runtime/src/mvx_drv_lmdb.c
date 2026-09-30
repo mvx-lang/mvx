@@ -36,6 +36,11 @@
 typedef struct {
     mvx_file_base base;
     MDB_dbi dbi;
+    /* WHICH ENVIRONMENT THIS FILE IS IN (mvx#326).  There can be several now --
+       one per connection profile, plus the account's own -- so an operation
+       cannot reach for "the" env.  Held per file, because that is the thing that
+       knows. */
+    MDB_env *env;
 } lmdb_file;
 
 struct mvx_cursor {
@@ -61,9 +66,16 @@ struct mvx_cursor {
  * (lmdb_open takes no location), and the macOS named-semaphore cost below is
  * a reason not to hold several.  Asking for a different one closes the
  * current. */
-static MDB_env *g_env;
+/* A FEW AT A TIME NOW, NOT ONE (mvx#326).  The one-at-a-time rule above was
+   justified by "lmdb_open takes no location", and a connection profile gives it
+   one: a file on @store and an unbound file in the account are two environments,
+   and closing one to open the other would invalidate dbi handles the caller
+   still holds.  Bounded, because the macOS named-semaphore cost is real -- four
+   is a working set, not a pool. */
+#define MAX_ENVS 4
+static struct { MDB_env *env; char path[4096]; } g_envs[MAX_ENVS];
+static int g_nenvs;
 static pid_t g_env_pid;
-static char g_env_path[4096];
 
 /* Close the environment on a clean exit so LMDB releases its lock.  On macOS
    that lock is a *named* POSIX semaphore (one per environment); leaving it
@@ -73,15 +85,35 @@ static char g_env_path[4096];
    so a forked child never closes the parent's env.  (Companion to the
    mdb_reader_check below, which reaps dead reader-table slots.) */
 static void env_atexit(void) {
-    if (g_env && getpid() == g_env_pid) {
-        mdb_env_close(g_env);
-        g_env = NULL;
-    }
+    if (getpid() != g_env_pid) return;
+    for (int i = 0; i < g_nenvs; i++)
+        if (g_envs[i].env) { mdb_env_close(g_envs[i].env); g_envs[i].env = NULL; }
+    g_nenvs = 0;
 }
 
 /* The database this account means, named absolutely.  realpath on the ACCOUNT
    (which exists) rather than on the store (which may not yet). */
-static void env_path(char *out, size_t cap) {
+static void env_path(const char *loc, char *out, size_t cap) {
+    /* A CONNECTION PROFILE NAMES THE ENVIRONMENT (mvx#326), so several accounts
+       can share one and it can live outside the account -- what a container
+       needs, where the image is read-only and the data is on a mounted volume.
+       A relative address resolves against the ACCOUNT, not the process's
+       working directory: MVXACCOUNT is "." and stays "." after mvx_logto, which
+       fchdir()s, so "against the cwd" would mean a different database after a
+       LOGTO -- the trap mvx#264 fixed for this very cache. */
+    if (loc && loc[0] == '@') {
+        char addr[1024] = "";
+        if (mvx_conn_lookup(loc + 1, "address", addr, sizeof addr) && addr[0]) {
+            if (addr[0] == '/') { snprintf(out, cap, "%s", addr); return; }
+            const char *acct = getenv("MVXACCOUNT");
+            if (!acct || !acct[0]) acct = ".";
+            char rp[4096];
+            const char *base = realpath(acct, rp) ? rp : acct;
+            snprintf(out, cap, "%s/%s", base, addr);
+            return;
+        }
+        /* no address: fall through to the account's own, and say so on open */
+    }
     const char *acct = getenv("MVXACCOUNT");
     if (!acct || !acct[0]) acct = ".";
     char rp[4096];
@@ -89,26 +121,38 @@ static void env_path(char *out, size_t cap) {
     snprintf(out, cap, "%s/mvxdata.lmdb", base);
 }
 
-static void env_drop(void) {
-    if (g_env && getpid() == g_env_pid) mdb_env_close(g_env);
-    g_env = NULL;
-    g_env_path[0] = '\0';
+/* Close the environment at `path`, or every one when `path` is NULL. */
+static void env_drop_at(const char *path) {
+    for (int i = 0; i < g_nenvs; i++) {
+        if (path && strcmp(g_envs[i].path, path) != 0) continue;
+        if (g_envs[i].env && getpid() == g_env_pid) mdb_env_close(g_envs[i].env);
+        g_envs[i] = g_envs[--g_nenvs];
+        if (path) return;
+        i--;
+    }
 }
+
+static void env_drop(void) { env_drop_at(NULL); }
 
 /* Let an account go (mvx#251's contract, mvx#278's fix).  Without this
    mvx_store_leave could close every file and still leave the env open, so the
    next account inherited it.  The location is always the account's own. */
 static void lmdb_release_conn(const char *loc) {
-    (void)loc;
-    env_drop();
+    char path[4096];
+    env_path(loc, path, sizeof path);
+    env_drop_at(path);
 }
 
-static MDB_env *env_get(char *err, size_t errlen) {
+static MDB_env *env_get(const char *loc, char *err, size_t errlen) {
     char path[4096];
-    env_path(path, sizeof path);
-    if (g_env) {
-        if (strcmp(g_env_path, path) == 0) return g_env;
-        env_drop();                  /* a different account: not ours any more */
+    env_path(loc, path, sizeof path);
+    for (int i = 0; i < g_nenvs; i++)
+        if (strcmp(g_envs[i].path, path) == 0) return g_envs[i].env;
+    if (g_nenvs == MAX_ENVS) {
+        /* Oldest out.  A program working across more than four databases at once
+           pays a reopen, which is the right trade against leaking a semaphore
+           per environment for the life of the process. */
+        env_drop_at(g_envs[0].path);
     }
     mkdir(path, 0775);
 
@@ -137,9 +181,10 @@ static MDB_env *env_get(char *err, size_t errlen) {
        open fails with MDB_READERS_FULL. */
     int dead = 0;
     mdb_reader_check(env, &dead);
-    g_env = env;
+    g_envs[g_nenvs].env = env;
+    snprintf(g_envs[g_nenvs].path, sizeof g_envs[0].path, "%s", path);
+    g_nenvs++;
     g_env_pid = getpid();
-    snprintf(g_env_path, sizeof g_env_path, "%s", path);
     static int registered;
     if (!registered) { atexit(env_atexit); registered = 1; }
     return env;
@@ -148,9 +193,9 @@ static MDB_env *env_get(char *err, size_t errlen) {
 static const mvx_driver mvx_driver_lmdb;
 
 /* Open the named DB; creating is the caller's choice via flags. */
-static int dbi_open(unsigned flags, const char *spec, MDB_dbi *dbi,
-                    char *err, size_t errlen) {
-    MDB_env *env = env_get(err, errlen);
+static int dbi_open(unsigned flags, const char *loc, const char *spec,
+                    MDB_dbi *dbi, char *err, size_t errlen) {
+    MDB_env *env = env_get(loc, err, errlen);
     if (!env) return 0;
     MDB_txn *txn;
     int rc = mdb_txn_begin(env, NULL, 0, &txn);
@@ -188,10 +233,24 @@ static const char *spec_only(const char *spec) {
     return nl ? nl + 1 : spec;
 }
 
+/* The location half of "params\nspec", which lmdb used only to skip (mvx#309).
+   It matters now: a connection profile names the environment (mvx#326). */
+static void spec_loc(const char *spec, char *out, size_t cap) {
+    out[0] = '\0';
+    const char *nl = spec ? strchr(spec, '\n') : NULL;
+    if (!nl) return;
+    size_t n = (size_t)(nl - spec);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, spec, n);
+    out[n] = '\0';
+}
+
 static mvx_file *lmdb_open(const char *spec, char *err, size_t errlen) {
+    char loc[640];
+    spec_loc(spec, loc, sizeof loc);   /* the environment (#326) */
     spec = spec_only(spec);
     MDB_dbi dbi;
-    if (!dbi_open(0, spec, &dbi, err, errlen))   /* no MDB_CREATE: explicit */
+    if (!dbi_open(0, loc, spec, &dbi, err, errlen))   /* no MDB_CREATE: explicit */
         return NULL;
 
     lmdb_file *f = calloc(1, sizeof(lmdb_file));
@@ -199,6 +258,7 @@ static mvx_file *lmdb_open(const char *spec, char *err, size_t errlen) {
     f->base.driver = &mvx_driver_lmdb;
     f->base.spec = strdup(spec);
     f->dbi = dbi;
+    f->env = env_get(loc, err, errlen);      /* the one dbi_open just used */
     return (mvx_file *)f;
 }
 
@@ -213,7 +273,7 @@ static int lmdb_read(mvx_file *fh, const char *id, int64_t idlen,
     lmdb_file *f = (lmdb_file *)fh;
     if (idlen > MAX_KEY) return 0;
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, MDB_RDONLY, &txn) != 0) return 0;
+    if (mdb_txn_begin(f->env, NULL, MDB_RDONLY, &txn) != 0) return 0;
     MDB_val k = {(size_t)idlen, (void *)id}, v;
     int rc = mdb_get(txn, f->dbi, &k, &v);
     if (rc == 0)
@@ -231,7 +291,7 @@ static int lmdb_write(mvx_file *fh, const char *id, int64_t idlen,
     int64_t rlen = mv_val_chars(rec, nb, sizeof nb, &rp);
 
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, 0, &txn) != 0) return 0;
+    if (mdb_txn_begin(f->env, NULL, 0, &txn) != 0) return 0;
     MDB_val k = {(size_t)idlen, (void *)id};
     MDB_val v = {(size_t)rlen, (void *)rp};
     int rc = mdb_put(txn, f->dbi, &k, &v, 0);
@@ -243,7 +303,7 @@ static int lmdb_del(mvx_file *fh, const char *id, int64_t idlen) {
     lmdb_file *f = (lmdb_file *)fh;
     if (idlen > MAX_KEY) return 0;
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, 0, &txn) != 0) return 0;
+    if (mdb_txn_begin(f->env, NULL, 0, &txn) != 0) return 0;
     MDB_val k = {(size_t)idlen, (void *)id};
     int rc = mdb_del(txn, f->dbi, &k, NULL);
     if (rc != 0) { mdb_txn_abort(txn); return 0; }
@@ -256,7 +316,7 @@ static mvx_cursor *lmdb_select_begin(mvx_file *fh) {
     if (!c) mvx_fatal("out of memory in SELECT");
 
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, MDB_RDONLY, &txn) != 0) return c;
+    if (mdb_txn_begin(f->env, NULL, MDB_RDONLY, &txn) != 0) return c;
     MDB_cursor *cur;
     if (mdb_cursor_open(txn, f->dbi, &cur) != 0) {
         mdb_txn_abort(txn);
@@ -317,28 +377,35 @@ static const mvx_driver mvx_driver_lmdb = {
     NULL, NULL,                         /* locks: runtime local table */
     .select_count = lmdb_select_count,
     .release_conn = lmdb_release_conn,  /* let a left account go (mvx#278) */
+    .takes_connection = 1,   /* a profile names the environment (#326) */
 };
 
 static int lmdb_create(const char *spec, char *err, size_t errlen) {
+    char loc[640];
+    spec_loc(spec, loc, sizeof loc);   /* the environment (#326) */
     spec = spec_only(spec);
     MDB_dbi dbi;
-    if (dbi_open(0, spec, &dbi, err, errlen)) return 0;  /* already exists */
-    return dbi_open(MDB_CREATE, spec, &dbi, err, errlen);
+    if (dbi_open(0, loc, spec, &dbi, err, errlen)) return 0;  /* already exists */
+    return dbi_open(MDB_CREATE, loc, spec, &dbi, err, errlen);
 }
 
 static int lmdb_remove(const char *spec, char *err, size_t errlen) {
+    char loc[640];
+    spec_loc(spec, loc, sizeof loc);   /* the environment (#326) */
     spec = spec_only(spec);
     MDB_dbi dbi;
-    if (!dbi_open(0, spec, &dbi, err, errlen)) return 0;
+    if (!dbi_open(0, loc, spec, &dbi, err, errlen)) return 0;
+    MDB_env *env = env_get(loc, err, errlen);   /* no file handle here (#326) */
+    if (!env) return 0;
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, 0, &txn) != 0) return 0;
+    if (mdb_txn_begin(env, NULL, 0, &txn) != 0) return 0;
     if (mdb_drop(txn, dbi, 1) != 0) { mdb_txn_abort(txn); return 0; }
     return mdb_txn_commit(txn) == 0;
 }
 
 /* Named-DB names are the keys of the environment's unnamed main DB. */
 static int lmdb_names(const char *loc, mv_value *out, char *err, size_t errlen) {
-    MDB_env *env = env_get(err, errlen);
+    MDB_env *env = env_get(loc, err, errlen);
     if (!env) return 0;
     MDB_txn *txn;
     if (mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) != 0) return 0;
@@ -414,7 +481,7 @@ static int lmdb_write_ix(mvx_file *fh, const char *id, int64_t idlen,
     int64_t rlen = mv_val_chars(rec, nb, sizeof nb, &rp);
 
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, 0, &txn) != 0) return 0;
+    if (mdb_txn_begin(f->env, NULL, 0, &txn) != 0) return 0;
     if (!apply_ops(txn, f, id, idlen, ops, nops)) {
         mdb_txn_abort(txn);
         return 0;
@@ -433,7 +500,7 @@ static int lmdb_del_ix(mvx_file *fh, const char *id, int64_t idlen,
     lmdb_file *f = (lmdb_file *)fh;
     if (idlen > MAX_KEY) return 0;
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, 0, &txn) != 0) return 0;
+    if (mdb_txn_begin(f->env, NULL, 0, &txn) != 0) return 0;
     if (!apply_ops(txn, f, id, idlen, ops, nops)) {
         mdb_txn_abort(txn);
         return 0;
@@ -451,7 +518,7 @@ static mvx_cursor *lmdb_index_select(mvx_file *fh, const char *item,
                                      const char *key, int64_t klen) {
     lmdb_file *f = (lmdb_file *)fh;
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, MDB_RDONLY, &txn) != 0) return NULL;
+    if (mdb_txn_begin(f->env, NULL, MDB_RDONLY, &txn) != 0) return NULL;
     MDB_dbi dbi;
     if (idx_dbi(txn, f, item, 0, &dbi) != 0) {   /* no such index */
         mdb_txn_abort(txn);
@@ -486,7 +553,7 @@ static mvx_cursor *lmdb_index_select(mvx_file *fh, const char *item,
 static int lmdb_index_drop(mvx_file *fh, const char *item) {
     lmdb_file *f = (lmdb_file *)fh;
     MDB_txn *txn;
-    if (mdb_txn_begin(g_env, NULL, 0, &txn) != 0) return 0;
+    if (mdb_txn_begin(f->env, NULL, 0, &txn) != 0) return 0;
     MDB_dbi dbi;
     if (idx_dbi(txn, f, item, 0, &dbi) != 0) {
         mdb_txn_abort(txn);
