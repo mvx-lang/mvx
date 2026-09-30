@@ -617,11 +617,12 @@ void mvx_account_namespace(char *out, size_t outlen) {
 
 /* Does this file have a backend binding?  Consult the account's
    BINDINGS record, whose lines are "SPEC driver {params...}" (an exact
-   spec, or "*" for every LMDB file); driver names a storage driver
-   (lmdbnet, and later postgres, mongo, ...) and params is its
-   connection string, opaque to the runtime.  With no BINDINGS record,
-   bare $MVXDAEMON binds the whole account to lmdbnet.  Returns 1 when
-   bound, filling driver and params. */
+   spec, or "*" for every file); driver names a storage driver and params is
+   its connection string, opaque to the runtime.  With no BINDINGS record,
+   bare $MVXDAEMON binds the whole account to lmdbnet -- deprecated (#327) and
+   warned about once, but kept because the operator chose it.  A line naming no
+   driver USED to mean the same thing; it does not any more, because nobody
+   chose that.  Returns 1 when bound, filling driver and params. */
 static int binding_for(const char *cspec, char *driver, size_t dcap,
                        char *params, size_t pcap) {
     const char *envd = getenv("MVXDAEMON");
@@ -632,6 +633,21 @@ static int binding_for(const char *cspec, char *driver, size_t dcap,
     FILE *fp = fopen(path, "r");
     if (!fp) {
         if (envd && envd[0]) {
+            /* THE WHOLE-ACCOUNT NETWORKED DEPLOYMENT (#327).  Kept, because the
+               operator chose it by setting $MVXDAEMON -- unlike a BINDINGS line
+               with no driver, which nobody chose and which no longer means this.
+               Said once per process: this is on the resolve path, so warning per
+               open would bury it in its own noise. */
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr,
+                        "mvx: warning: $MVXDAEMON binds this account to lmdbnet, "
+                        "which is deprecated (mvx#327) and will be removed. It "
+                        "pushes no filtering or sorting into the backend, so "
+                        "every WITH is filtered in the verb. Use postgres for a "
+                        "shared database; CONVERT-FILE moves a file.\n");
+            }
             char nsb[128];
             mvx_account_namespace(nsb, sizeof nsb);
             snprintf(driver, dcap, "lmdbnet");
@@ -694,7 +710,14 @@ static int binding_for(const char *cspec, char *driver, size_t dcap,
         snprintf(params, pcap, "@%s", cn);
         return 1;
     }
-    if (!ud[0]) ud = "lmdbnet";         /* default backend */
+    /* A LINE WITH NO DRIVER NAMES NOTHING (#327).  It used to mean lmdbnet at
+       $MVXDAEMON -- a networked backend, chosen by nobody, for a line that only
+       gives a file name.  A binding that says no driver is not a binding, so
+       fall through and let the file take the account's default like any other.
+       lmdbnet is being deprecated: it pushes nothing down, so every WITH streams
+       the whole id list to the verb and filters there, and unlike lmdb it pays
+       network latency to do it.  postgres answers those in SQL. */
+    if (!ud[0]) return 0;
     if (!up[0] && strcmp(ud, "lmdbnet") == 0)
         up = envd && envd[0] ? envd : "";
     if (strcmp(ud, "lmdbnet") == 0 && !up[0])
@@ -5161,6 +5184,19 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                             "address (give one, or set $MVXDAEMON)\n");
             return 0;
         }
+        /* SAID ONCE, WHERE THE CHOICE IS MADE (#327).  lmdbnet pushes nothing
+           down -- no select_where, select_order, count_where, sum_where, join or
+           explain -- so every WITH streams the whole id list to the verb and
+           filters there, and unlike lmdb it pays network latency to do it.
+           postgres answers those in SQL and needs no code of ours.  At BIND
+           time, not on every open: a binding is recorded once and resolved for
+           ever, so this is the moment somebody can still choose differently. */
+        if (strcmp(drvname, "lmdbnet") == 0)
+            fprintf(stderr, "CREATE-FILE: lmdbnet is deprecated (mvx#327) and "
+                            "will be removed; it pushes no filtering or sorting "
+                            "into the backend. Use postgres for a shared "
+                            "database, or lmdb for a local one. Move an existing "
+                            "file with CONVERT-FILE %s postgres\n", cspec);
         /* The named backend may not be on this host — a clone of an account
            whose files were migrated elsewhere is the ordinary way to get here.
            Ask rather than abort, and bind to whatever is chosen so every later
