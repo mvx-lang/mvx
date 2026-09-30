@@ -1055,38 +1055,55 @@ check tcl-bind-dir "$( \
   echo '--- with nothing named for the binding parameters'; \
   "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -c 'params')"
 
-# A CONNECTION PROFILE IS REFUSED BY A DRIVER THAT CANNOT READ ONE (#319).
+# A CONNECTION PROFILE IS REFUSED BY A DRIVER THAT CANNOT READ ONE (#319),
+# AND HONOURED BY ONE THAT CAN -- INCLUDING THE LOCAL ONES (#326).
 #
-# A binding may name a profile instead of a driver -- `ORDERS @salesdb` -- and
-# the reference is handed to the driver as its params so the driver resolves the
+# A binding may name a profile instead of a driver -- `ORDERS @salesdb` -- and the
+# reference is handed to the driver as its params so the driver resolves the
 # address itself.  Four of the seven never did, and two of those misread it in
 # silence: sqlite took "@salesdb" for a database PATH and created a file of that
-# name in the account, while the profile's `address` was ignored and nothing was
-# reported.  A binding is recorded once and resolved for ever, so the refusal
-# belongs at bind time, where whoever typed it is still there.
+# name in the account, while the profile's `address` was ignored.
 #
-# Asserted on the FILESYSTEM as well as the message, because the message is the
-# new part and the absent file is the bug: the count is what was wrong before.
+# sqlite and lmdb read one now (#326), because "somewhere else" includes another
+# directory: several accounts can share a database, and it can live outside the
+# account -- which is what a container needs, where the image is read-only and the
+# data belongs on a mounted volume.  `dir` still cannot, so it is what keeps the
+# refusal honest.
 CPA="$TESTROOT/connacct"
 "$ROOT/scripts/mkaccount.sh" "$CPA" >/dev/null 2>&1
-mkdir -p "$CPA/.mvx-private"
-cat > "$CPA/.mvx-private/connections" <<'CONNS'
-salesdb    driver     sqlite
-salesdb    address    sales.db
+mkdir -p "$CPA/.mvx-private" "$TESTROOT/connvol"
+cat > "$CPA/.mvx-private/connections" <<CONNS
+plaindir   driver     dir
+plaindir   address    somewhere
 nodriver   address    somewhere:1234
+onvolume   driver     sqlite
+onvolume   address    $TESTROOT/connvol/shared.sqlite
+relative   driver     sqlite
+relative   address    beside.sqlite
+lmdbvol    driver     lmdb
+lmdbvol    address    $TESTROOT/connvol/shared.lmdb
 CONNS
 chmod 700 "$CPA/.mvx-private"; chmod 600 "$CPA/.mvx-private/connections"
 check tcl-conn-refused "$( \
-  echo '--- a driver that does not read profiles is refused, by name'; \
-  "$TCL" -a "$CPA" -c 'CREATE-FILE ORDERS USING @salesdb' 2>&1 | head -1; \
+  echo '--- a driver that cannot read a profile is refused, by name'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE D1 USING @plaindir' 2>&1 | head -1; \
   echo '--- and nothing is left behind named for the reference'; \
   ls "$CPA" | grep -c '@' ; \
-  echo '--- nor is an unusable binding recorded'; \
-  { [ -f "$CPA/BINDINGS" ] && cat "$CPA/BINDINGS" || echo 'no BINDINGS'; }; \
   echo '--- an undefined profile says so'; \
   "$TCL" -a "$CPA" -c 'CREATE-FILE X USING @nosuch' 2>&1 | head -1; \
   echo '--- and one that exists but names no driver says THAT'; \
-  "$TCL" -a "$CPA" -c 'CREATE-FILE Y USING @nodriver' 2>&1 | head -1)"
+  "$TCL" -a "$CPA" -c 'CREATE-FILE Y USING @nodriver' 2>&1 | head -1; \
+  echo '--- sqlite puts the database where the profile says'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE ONVOL USING @onvolume' 2>&1 | head -1; \
+  { [ -f "$TESTROOT/connvol/shared.sqlite" ] && echo 'the database is on the volume'; }; \
+  { [ ! -e "$CPA/@onvolume" ] && echo 'and nothing is named for the reference'; }; \
+  echo '--- a relative address is relative to the ACCOUNT, not the cwd'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE REL1 USING @relative' >/dev/null 2>&1; \
+  { [ -f "$CPA/beside.sqlite" ] && echo 'beside.sqlite is in the account'; }; \
+  echo '--- and lmdb takes one too, as its environment'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE LMVOL USING @lmdbvol' 2>&1 | head -1; \
+  { [ -d "$TESTROOT/connvol/shared.lmdb" ] && echo 'the environment is on the volume'; })"
+
 
 # RESOLUTION READS THE VOC POINTER (#318 stage 3).
 #

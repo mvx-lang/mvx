@@ -1,10 +1,17 @@
---- a driver that does not read profiles is refused, by name
-CREATE-FILE: connection 'salesdb' names driver sqlite, which does not read connection profiles -- it would take "@salesdb" for a location of its own.  Bind to sqlite directly instead.
+--- a driver that cannot read a profile is refused, by name
+CREATE-FILE: connection 'plaindir' names driver dir, which does not read connection profiles -- it would take "@plaindir" for a location of its own.  Bind to dir directly instead.
 --- and nothing is left behind named for the reference
 0
---- nor is an unusable binding recorded
-no BINDINGS
 --- an undefined profile says so
 CREATE-FILE: connection 'nosuch' is not defined (SET-CONNECTION nosuch driver=... address=...)
 --- and one that exists but names no driver says THAT
 CREATE-FILE: connection 'nodriver' does not say which driver it uses (SET-CONNECTION nodriver driver=...)
+--- sqlite puts the database where the profile says
+[417] file ONVOL created
+the database is on the volume
+and nothing is named for the reference
+--- a relative address is relative to the ACCOUNT, not the cwd
+beside.sqlite is in the account
+--- and lmdb takes one too, as its environment
+[417] file LMVOL created
+the environment is on the volume
