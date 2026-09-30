@@ -4228,12 +4228,41 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
     int ne = scandir(acct, &ents, NULL, alphasort);
     for (int i = 0; i < ne; i++) {
         const char *nm = ents[i]->d_name;
+        size_t nml = strlen(nm);
         if (nm[0] != '.' && strcmp(nm, "mvxdata.lmdb") != 0) {
             char p[4096];
             snprintf(p, sizeof p, "%s/%s", acct, nm);
             struct stat sb;
-            if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode))
-                FL_PUTS(nm, strlen(nm), "dir");
+            int isdir = stat(p, &sb) == 0 && S_ISDIR(sb.st_mode);
+            /* A LEGACY DICTIONARY DIRECTORY IS FURNITURE (#316).
+             *
+             * Before mvx#318 a directory file's dictionary was a sibling
+             * directory, <name>.DICT, and this pass listed it as a file of its
+             * own -- so every such file appeared twice and the count was wrong.
+             * New files have a hash dictionary, which fl_internal() already
+             * hides, so this is only ever an account made before that.
+             *
+             * THE CONDITION IS resolve()'s, EXACTLY: it answers <name>.DICT for
+             * a directory file when <name>.DICT is itself a directory, so the
+             * listing hides precisely what resolution calls the dictionary and
+             * the two cannot disagree.
+             *
+             * Which is also why an EXPORTED dictionary is still listed, and
+             * must be: `EXPORT DICT PARTS` writes a directory called PARTS.DICT
+             * as tracked source, and BUILD reads its %FILE% to learn what to
+             * create.  There the data half is absent or on a hash backend, so
+             * <name> is not a directory, the condition is false, and the export
+             * stays visible.  An earlier attempt at this filtered the suffix
+             * unconditionally and broke exactly that. */
+            if (isdir && nml > 5 && memcmp(nm + nml - 5, ".DICT", 5) == 0) {
+                char bp[4096];
+                size_t pl = strlen(p);          /* the PATH's length, not the
+                                                   name's -- p is acct/name */
+                snprintf(bp, sizeof bp, "%.*s", (int)(pl - 5), p);
+                struct stat bb;
+                if (stat(bp, &bb) == 0 && S_ISDIR(bb.st_mode)) isdir = 0;
+            }
+            if (isdir) FL_PUTS(nm, nml, "dir");
         }
         free(ents[i]);
     }

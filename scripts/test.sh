@@ -1273,6 +1273,49 @@ check tcl-convert-keeps-pointer "$( \
   echo '--- and the account keeps its own'; \
   "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^005')"
 
+# A LEGACY DICTIONARY DIRECTORY IS FURNITURE; AN EXPORTED ONE IS NOT (#316).
+#
+# Before mvx#318 a directory file's dictionary was a sibling directory,
+# <name>.DICT, and the listing showed it as a file of its own -- so the file
+# appeared twice and the count was wrong.  New files have a hash dictionary,
+# which the listing already hides, so this only ever affects an account made
+# before that.
+#
+# THE TWO CASES SHARE A SPELLING AND MUST DIVERGE, which is why an earlier
+# attempt at this failed: filtering the suffix unconditionally also hid the
+# directory `EXPORT DICT` writes as tracked source, and BUILD reads its %FILE%
+# to learn what to create.  The condition is resolve()'s own -- <name>.DICT is
+# the dictionary when <name> is ALSO a directory -- so the listing hides exactly
+# what resolution calls the dictionary, and an export, whose data half is absent
+# or on a hash backend, stays visible.
+#
+# The legacy account is built with the PRE-#318 pointer form, because stage 3
+# reads the pointer first: with a modern pointer the dictionary is wherever that
+# says, and the directory beside it is not consulted at all.
+LGD="$TESTROOT/legacydict"
+"$ROOT/scripts/mkaccount.sh" "$LGD" >/dev/null 2>&1
+"$TCL" -a "$LGD" -c 'CREATE-FILE LEGF DIR' >/dev/null 2>&1
+mkdir -p "$LGD/LEGF.DICT"
+printf 'D\n1\n\nName\n20L\n' > "$LGD/LEGF.DICT/NAME"
+lgdseed="$TESTROOT/lgdseed.b"
+cat > "$lgdseed" <<'EOF'
+OPEN "VOC" TO V ELSE STOP
+R = "F":@AM:"LEGF":@AM:"LEGF.DICT"
+WRITE R ON V,"LEGF"
+PRINT "legacy pointer set"
+EOF
+"$MVX" "$lgdseed" -o "$TESTROOT/lgdseedbin" 2>/dev/null
+check tcl-legacy-dict "$( \
+  (cd "$LGD" && MVXACCOUNT=. "$TESTROOT/lgdseedbin" 2>&1); \
+  echo '--- the file is listed once, its dictionary not at all'; \
+  "$TCL" -a "$LGD" -c 'LISTF' 2>&1 | grep -c 'LEGF'; \
+  echo '--- and the dictionary still resolves, out of that directory'; \
+  "$TCL" -a "$LGD" -c 'CT DICT LEGF NAME' 2>&1 | grep -E '^004'; \
+  echo '--- an exported dictionary with no data half stays visible'; \
+  mkdir -p "$LGD/EXPORTED.DICT"; \
+  printf 'FILE\375dir\n' > "$LGD/EXPORTED.DICT/%FILE%"; \
+  "$TCL" -a "$LGD" -c 'LISTF' 2>&1 | grep -c 'EXPORTED.DICT')"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and
