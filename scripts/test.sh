@@ -1032,6 +1032,211 @@ check tcl-convert-voc "$( \
   echo '--- with the policy lines in .mvx untouched'; \
   grep -cE '^permit' "$CVA/.mvx")"
 
+# A FILE BOUND TO dir IS CREATED UNDER ITS OWN NAME (#310).
+#
+# A bound file's spec reaches the driver as "params\nspec".  dir used the whole
+# string as a path, so `CREATE-FILE x USING dir` made a directory whose name
+# began with a newline: reads and writes worked, being consistently wrong, but
+# the name is the interface for this driver in a way it is not for lmdb -- the
+# whole point of dir is that a record is an OS file somebody can open.
+#
+# Asserted on the FILESYSTEM as well as in the listing, because that is where
+# the fault was: LISTF printed the leading newline as a blank line and listed
+# the file twice, but only the directory entry says the name is right.  The same
+# fault in lmdb was #309.
+BDA="$TESTROOT/binddiracct"
+"$ROOT/scripts/mkaccount.sh" "$BDA" >/dev/null 2>&1
+check tcl-bind-dir "$( \
+  "$TCL" -a "$BDA" -c 'CREATE-FILE ZZD USING dir' 2>&1; \
+  echo '--- the directory is called what the file is called'; \
+  { [ -d "$BDA/ZZD" ] && echo "ZZD is a directory"; } || echo "ZZD IS NOT THERE"; \
+  echo '--- and is listed once, on dir'; \
+  "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -cE '^ZZD +dir'; \
+  echo '--- with nothing named for the binding parameters'; \
+  "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -c 'params')"
+
+# A CONNECTION PROFILE IS REFUSED BY A DRIVER THAT CANNOT READ ONE (#319),
+# AND HONOURED BY ONE THAT CAN -- INCLUDING THE LOCAL ONES (#326).
+#
+# A binding may name a profile instead of a driver -- `ORDERS @salesdb` -- and the
+# reference is handed to the driver as its params so the driver resolves the
+# address itself.  Four of the seven never did, and two of those misread it in
+# silence: sqlite took "@salesdb" for a database PATH and created a file of that
+# name in the account, while the profile's `address` was ignored.
+#
+# sqlite and lmdb read one now (#326), because "somewhere else" includes another
+# directory: several accounts can share a database, and it can live outside the
+# account -- which is what a container needs, where the image is read-only and the
+# data belongs on a mounted volume.  `dir` still cannot, so it is what keeps the
+# refusal honest.
+CPA="$TESTROOT/connacct"
+"$ROOT/scripts/mkaccount.sh" "$CPA" >/dev/null 2>&1
+mkdir -p "$CPA/.mvx-private" "$TESTROOT/connvol"
+cat > "$CPA/.mvx-private/connections" <<CONNS
+plaindir   driver     dir
+plaindir   address    somewhere
+nodriver   address    somewhere:1234
+onvolume   driver     sqlite
+onvolume   address    $TESTROOT/connvol/shared.sqlite
+relative   driver     sqlite
+relative   address    beside.sqlite
+lmdbvol    driver     lmdb
+lmdbvol    address    $TESTROOT/connvol/shared.lmdb
+CONNS
+chmod 700 "$CPA/.mvx-private"; chmod 600 "$CPA/.mvx-private/connections"
+check tcl-conn-refused "$( \
+  echo '--- a driver that cannot read a profile is refused, by name'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE D1 USING @plaindir' 2>&1 | head -1; \
+  echo '--- and nothing is left behind named for the reference'; \
+  ls "$CPA" | grep -c '@' ; \
+  echo '--- an undefined profile says so'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE X USING @nosuch' 2>&1 | head -1; \
+  echo '--- and one that exists but names no driver says THAT'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE Y USING @nodriver' 2>&1 | head -1; \
+  echo '--- sqlite puts the database where the profile says'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE ONVOL USING @onvolume' 2>&1 | head -1; \
+  { [ -f "$TESTROOT/connvol/shared.sqlite" ] && echo 'the database is on the volume'; }; \
+  { [ ! -e "$CPA/@onvolume" ] && echo 'and nothing is named for the reference'; }; \
+  echo '--- a relative address is relative to the ACCOUNT, not the cwd'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE REL1 USING @relative' >/dev/null 2>&1; \
+  { [ -f "$CPA/beside.sqlite" ] && echo 'beside.sqlite is in the account'; }; \
+  echo '--- and lmdb takes one too, as its environment'; \
+  "$TCL" -a "$CPA" -c 'CREATE-FILE LMVOL USING @lmdbvol' 2>&1 | head -1; \
+  { [ -d "$TESTROOT/connvol/shared.lmdb" ] && echo 'the environment is on the volume'; })"
+
+
+# RESOLUTION READS THE VOC POINTER (#318 stage 3).
+#
+# The pointer is the account's own statement of where a file lives; resolution
+# used to derive it instead, from a stat() and BINDINGS.  Proved by EDITING a
+# pointer and nothing else: if resolution still found the data, it was not
+# reading it.
+#
+# And the form every pre-stage-2 account carries -- "F / name / name.DICT" --
+# must be IGNORED rather than believed, because it was inaccurate for hash
+# files the day it was written: their dictionary is DICT.<name> in the backend,
+# not a directory.  An account nobody has touched has to resolve exactly as it
+# did before, so that case is asserted too, and it is the one that would break
+# every existing account if it regressed.
+PTR="$TESTROOT/ptracct"
+"$ROOT/scripts/mkaccount.sh" "$PTR" >/dev/null 2>&1
+"$TCL" -a "$PTR" -c 'CREATE-FILE PF' >/dev/null 2>&1
+ptrseed="$TESTROOT/ptrseed.b"
+cat > "$ptrseed" <<'EOF'
+OPEN "PF" TO F ELSE STOP
+WRITE "here" ON F, "K"
+OPEN "VOC" TO V ELSE STOP
+* point it somewhere the data is not
+READ R FROM V,"PF" THEN
+   R<2> = "lmdb:PF"
+   R<3> = "lmdb:DICT.PF"
+   WRITE R ON V,"PF"
+END
+* and a second file whose pointer is the pre-stage-2 form, which must be ignored
+X = CREATEFILE("LEGACYP")
+OPEN "LEGACYP" TO G ELSE STOP
+WRITE "still reachable" ON G, "K"
+L = "F":@AM:"LEGACYP":@AM:"LEGACYP.DICT"
+WRITE L ON V,"LEGACYP"
+PRINT "seeded"
+EOF
+"$MVX" "$ptrseed" -o "$TESTROOT/ptrseedbin" 2>/dev/null
+(cd "$PTR" && MVXACCOUNT=. "$TESTROOT/ptrseedbin") >/dev/null
+ptrread="$TESTROOT/ptrread.b"
+cat > "$ptrread" <<'EOF'
+OPEN "PF" TO F ELSE
+   PRINT "PF: followed the pointer (not found where the data is)"
+   GOTO 10
+END
+PRINT "PF: STILL RESOLVING BY DERIVATION"
+10 OPEN "LEGACYP" TO G ELSE
+   PRINT "LEGACYP: LOST -- the stale form was believed"
+   STOP
+END
+READ R FROM G,"K" THEN PRINT "LEGACYP: ":R ELSE PRINT "LEGACYP: no record"
+EOF
+"$MVX" "$ptrread" -o "$TESTROOT/ptrreadbin" 2>/dev/null
+check tcl-voc-pointer "$( (cd "$PTR" && MVXACCOUNT=. "$TESTROOT/ptrreadbin" 2>&1) )"
+
+# HALF A FILE, AND A DICTIONARY SEVERAL FILES SHARE (#318 stage 4).
+#
+# U2 spells this CREATE.FILE DICT name and CREATE.FILE DATA name, and each half
+# stands alone -- verified on UniData 8.3, where a dictionary-only file has an
+# empty F2 and a data-only file an empty F3.  A dictionary on its own is how a
+# SHARED dictionary is made before anything uses it; data on its own is how a
+# file borrows someone else's.
+#
+# The sharing is the point, so it is asserted through the QUERY path rather than
+# by reading the pointer back: the D-items live only in the shared dictionary,
+# and both files are listed through them with their headings and formats.  A
+# pointer assertion would pass even if resolution ignored it.
+HLF="$TESTROOT/halfacct"
+"$ROOT/scripts/mkaccount.sh" "$HLF" >/dev/null 2>&1
+hlfseed="$TESTROOT/hlfseed.b"
+cat > "$hlfseed" <<'EOF'
+OPEN "VOC" TO V ELSE STOP
+FOR EACH = 1 TO 2
+   IF EACH = 1 THEN F = "S24" ELSE F = "S25"
+   READ R FROM V,F THEN
+      R<3> = "sqlite:DICT.SHARED"
+      WRITE R ON V,F
+   END ELSE
+      PRINT "no pointer for ":F
+   END
+NEXT EACH
+OPEN "DICT","SHARED" TO D ELSE STOP "no shared dictionary"
+WRITE "D":@AM:"1":@AM:"":@AM:"Customer":@AM:"12L":@AM:"S" ON D,"CUST"
+OPEN "S24" TO A ELSE STOP
+WRITE "Ada" ON A,"I1"
+OPEN "S25" TO B ELSE STOP
+WRITE "Grace" ON B,"I2"
+PRINT "seeded"
+EOF
+"$MVX" "$hlfseed" -o "$TESTROOT/hlfseedbin" 2>/dev/null
+check tcl-file-halves "$( \
+  echo '--- a dictionary on its own has no data half'; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DICT SHARED' 2>&1; \
+  "$TCL" -a "$HLF" -c 'CT VOC SHARED' 2>&1 | sed 1d; \
+  echo '--- and data on its own has no dictionary half'; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DATA S24' 2>&1; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DATA S25' >/dev/null 2>&1; \
+  "$TCL" -a "$HLF" -c 'CT VOC S24' 2>&1 | sed 1d; \
+  echo '--- a dictionary is a hash file, so DIR is refused'; \
+  "$TCL" -a "$HLF" -c 'CREATE-FILE DICT NOPE DIR' 2>&1; \
+  echo '--- one dictionary serves both files'; \
+  (cd "$HLF" && MVXACCOUNT=. "$TESTROOT/hlfseedbin" 2>&1); \
+  "$TCL" -a "$HLF" -c 'LIST S24 CUST' 2>&1 | normalise | grep -E 'Ada|Customer'; \
+  "$TCL" -a "$HLF" -c 'LIST S25 CUST' 2>&1 | normalise | grep -E 'Grace'; \
+  echo '--- and a half file can be deleted, not only made'; \
+  "$TCL" -a "$HLF" -c 'DELETE-FILE SHARED' 2>&1)"
+
+# A DICTIONARY WITH NO DATA IS STILL A FILE (#318 stage 5).
+#
+# CREATE-FILE DICT makes one, which is how a shared dictionary is made, and U2
+# lists it the same way -- UniData shows the file with an empty data location
+# beside its D_ dictionary.  Here the only thing in the backend is DICT.<name>,
+# which the listing filters as furniture, so the file was invisible.
+#
+# That was not cosmetic.  mv_git finds an account's files through this list, so
+# the dictionary was never staged and a clone lost the D-items every data file
+# pointed at; and the file's VOC pointer, belonging to no file the list knew,
+# looked like ORDINARY CONTENT rather than derived plumbing -- so a VOC/
+# directory was committed and materialised OVER the account's real VOC.
+#
+# Asserted here on the listing.  The mv_git side is in that suite, where the
+# round trip can be run.
+DCO="$TESTROOT/dictonly"
+"$ROOT/scripts/mkaccount.sh" "$DCO" >/dev/null 2>&1
+check tcl-dict-only "$( \
+  "$TCL" -a "$DCO" -c 'CREATE-FILE DICT SHAREDD' 2>&1; \
+  echo '--- it is listed, on the backend that holds it'; \
+  "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -E '^SHAREDD'; \
+  echo '--- and its own dictionary is not listed beside it'; \
+  "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -c 'DICT\.'; \
+  echo '--- a file with both halves is still listed once'; \
+  "$TCL" -a "$DCO" -c 'CREATE-FILE BOTHH' >/dev/null 2>&1; \
+  "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -c 'BOTHH')"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and
@@ -1425,6 +1630,16 @@ fi
 # #71: CREATE-FILE registers the file in the VOC as an "F" file pointer (attr 1
 # F, attr 2 data, attr 3 dictionary), for both directory and lmdb files;
 # DELETE-FILE removes it.
+#
+# EACH HALF IS A LOCATION NOW (#318 stage 2): "scheme:spec", where the scheme is
+# the driver -- so a directory file is an `F` like anything else, with `dir` as
+# a driver rather than a file type of its own, and its dictionary is a local
+# hash file rather than a sibling directory.  Attribute 1 is therefore never
+# "DIR"; mvx_voc_class still recognises that for accounts from systems which
+# write it, but nothing here produces one.
+#
+# Nothing READS this yet, which is the point of writing it first: an account
+# describes itself before anything depends on the description.
 CFV="$TESTROOT/cfvoc"
 "$ROOT/scripts/mkaccount.sh" "$CFV" >/dev/null
 check tcl-createfile-voc "$(printf '%s\n' \
@@ -1680,6 +1895,14 @@ version = 1
   # normalises the staged git objects to the open form - %FILE% becomes DIR/hash,
   # .mvx is stored at .mv-account, and the binary lmdb store is never tracked -
   # while the working tree on disk stays a native MVX account.
+  #
+  # "native" MOVED, and that is the point being asserted (#318).  A directory
+  # file's dictionary is a local hash file now, not a sibling NAME.DICT
+  # directory, so %FILE% is read through the dictionary rather than off the
+  # disk -- and the absence of the directory is asserted too, or the check
+  # would pass just as well on the old layout.  The GIT form is unchanged:
+  # <name>.DICT/%FILE% is still what a commit carries, synthesised from the
+  # backend exactly as it already was for lmdb-file dictionaries.
   MGF="$TESTROOT/mgopenform"
   "$ROOT/scripts/mkaccount.sh" "$MGF" >/dev/null
   "$TCL" -a "$MGF" -c 'CREATE-FILE PARTS DIR' >/dev/null 2>&1
@@ -1695,7 +1918,9 @@ version = 1
         || echo 'git: no .mvx'; }; \
     { git cat-file -e 'HEAD:mvxdata.lmdb/data.mdb' 2>/dev/null \
         && echo 'git: lmdb store (WRONG)' || echo 'git: no lmdb store'; }; \
-    { grep -q 'FILE' 'PARTS.DICT/%FILE%' && echo 'disk %FILE%: native'; }; \
+    { "$TCL" -a . -c 'CT DICT PARTS %FILE%' 2>&1 | grep -q 'FILE' \
+        && echo 'disk %FILE%: native'; }; \
+    { [ ! -d 'PARTS.DICT' ] && echo 'and its dictionary is not a directory'; }; \
     { [ -f .mvx ] && echo 'disk descriptor: .mvx'; })"
 
   # lmdb-file dictionaries: their records live in LMDB (no on-disk .DICT dir for
@@ -1752,7 +1977,9 @@ EOF
     { [ -f .mvx ] && echo 'descriptor: .mvx'; }; \
     { [ ! -e .mv-account ] && echo 'no .mv-account on disk'; }; \
     { [ ! -d ORDERS ] && [ -d mvxdata.lmdb ] && echo 'records in backend, not on disk'; }; \
-    { grep -q 'FILE' 'PARTS.DICT/%FILE%' && echo 'disk %FILE%: native'; }; \
+    { "$TCL" -a . -c 'CT DICT PARTS %FILE%' 2>&1 | grep -q 'FILE' \
+        && echo 'disk %FILE%: native'; }; \
+    { [ ! -d 'PARTS.DICT' ] && echo 'and its dictionary is not a directory'; }; \
     "$TCL" -a . -c 'LISTF' 2>&1 | normalise | grep -E '^PARTS |^ORDERS '; \
     "$TCL" -a . -c 'LIST PARTS NAME' 2>&1 | normalise | grep -E 'W1|Widget' | head -1 )"
 

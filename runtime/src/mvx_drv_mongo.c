@@ -1032,6 +1032,7 @@ static const mvx_driver mvx_driver_mongo = {
        (map_read/map_child_read — mirror mode only), select_join, sum_where,
        select_order,
        select_multi, explain, bulk batching, map_backfill, and lock authority. */
+    .takes_connection = 1,   /* reads .mvx-private/connections (mvx#319) */
 };
 
 const mvx_driver *mvx_driver_entry(int abi) {

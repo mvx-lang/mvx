@@ -805,6 +805,265 @@ static const char *undeclared_default(void) {
    sibling directory for directory files — so a directory file NAME and
    its dictionary NAME.DICT sit side by side (BP and BP.DICT), matching
    the git-legible form exactly. */
+/* THE BACKENDS THAT NEED NOTHING BUT THIS MACHINE.  Named once: FILELIST asks
+   both for an account's unbound files, and a directory file's dictionary has to
+   land on one of them (#318).  A second list somewhere else would be a second
+   thing to update when a local backend is added. */
+static const char *const mvx_local_drivers[] = {"lmdb", "sqlite"};
+#define MVX_NLOCAL (sizeof mvx_local_drivers / sizeof mvx_local_drivers[0])
+
+static int driver_is_local(const char *d) {
+    if (!d || !d[0]) return 0;
+    for (size_t i = 0; i < MVX_NLOCAL; i++)
+        if (strcmp(d, mvx_local_drivers[i]) == 0) return 1;
+    return 0;
+}
+
+/* Is this name already a directory in the account?  Asked before creating
+   one, because dir_create() is deliberately idempotent and so cannot say. */
+static int dir_already_there(const char *cspec) {
+    const char *acct = getenv("MVXACCOUNT");
+    if (!acct || !acct[0]) acct = ".";
+    char path[4160];
+    if (cspec[0] == '/') snprintf(path, sizeof path, "%s", cspec);
+    else                 snprintf(path, sizeof path, "%s/%s", acct, cspec);
+    struct stat sb;
+    return stat(path, &sb) == 0 && S_ISDIR(sb.st_mode);
+}
+
+/* Which local backend holds a DIRECTORY file's dictionary (#318).
+ *
+ * The account's own default when that is local, so an account that says sqlite
+ * keeps sqlite and nothing surprising appears; otherwise the same answer an
+ * undeclared account gets, which is already local by construction.
+ *
+ * Never a networked one, and that is the rule rather than a preference: a
+ * directory file IS a directory on this filesystem, so a dictionary needing a
+ * network round-trip would make a local file unusable without a network it
+ * never required -- and unopenable on a host that simply cannot reach it. */
+static const char *local_hash_driver(void) {
+    static char keep[64];
+    char ad[64];
+    mvx_account_driver(ad, sizeof ad);
+    if (ad[0] && driver_is_local(ad) && mvx_driver_available(ad)) {
+        snprintf(keep, sizeof keep, "%s", ad);
+        return keep;
+    }
+    return undeclared_default();
+}
+
+static const mvx_driver *resolve(const char *cspec, int want_dict,
+                                 char *outspec, size_t cap);
+
+/* ---- reading a file's location out of its VOC pointer (#318 stage 3) -----
+ *
+ * The pointer is the account's own statement of where a file lives.  Until now
+ * it was written and never read, and resolution was DERIVED instead: stat() the
+ * name to see if it is a directory, then BINDINGS, then the account default.
+ * Derivation cannot express two files of the same driver in different places,
+ * and it decides "is this a directory file" by touching the filesystem on every
+ * open.
+ *
+ * SHADOWING, NOT REPLACING.  A usable pointer wins; everything else falls
+ * through to the derivation below exactly as before.  Two reasons, and the
+ * second is the one that matters: BINDINGS also carries a "*" policy line,
+ * which is per-account rather than per-file and has nowhere else to live yet;
+ * and stage 2 only writes a pointer when a file is created, so an account
+ * nobody has touched still carries the old form for every file in it.
+ *
+ * THE OLD FORM IS IGNORED RATHER THAN TRUSTED.  Every account written before
+ * stage 2 says "F / name / name.DICT", which was inaccurate for hash files the
+ * day it was written -- their dictionary is DICT.<name> inside the backend.
+ * It is recognised byte for byte and passed over, so an untouched account
+ * resolves exactly as it does today. */
+
+/* One attribute of an @AM-separated record, 1-based.  Empty when absent. */
+static void attr_n(const char *rec, int64_t len, int n,
+                   const char **out, int64_t *olen) {
+    const char *p = rec, *end = rec + len;
+    for (int i = 1; i < n && p < end; i++) {
+        const char *am = memchr(p, (char)0xFE, (size_t)(end - p));
+        p = am ? am + 1 : end;
+    }
+    const char *am = (p < end)
+        ? memchr(p, (char)0xFE, (size_t)(end - p)) : NULL;
+    *out = p;
+    *olen = (am ? am : end) - p;
+}
+
+/* scheme ":" [ "//" authority "/" ] spec -- the spec is the rest, verbatim. */
+static int parse_location(const char *loc, char *drv, size_t dcap,
+                          char *conn, size_t ccap, const char **spec) {
+    conn[0] = '\0';
+    const char *c = strchr(loc, ':');
+    if (!c || c == loc) return 0;
+    size_t dl = (size_t)(c - loc);
+    if (dl >= dcap) return 0;
+    memcpy(drv, loc, dl);
+    drv[dl] = '\0';
+
+    const char *rest = c + 1;
+    if (rest[0] == '/' && rest[1] == '/') {
+        const char *slash = strchr(rest + 2, '/');
+        if (!slash) return 0;                   /* an authority and no spec */
+        size_t cl = (size_t)(slash - (rest + 2));
+        if (cl == 0 || cl >= ccap) return 0;
+        memcpy(conn, rest + 2, cl);
+        conn[cl] = '\0';
+        *spec = slash + 1;
+    } else {
+        *spec = rest;
+    }
+    return (*spec)[0] != '\0';
+}
+
+/* WHICH ACCOUNT THIS IS, resolved -- not how it was spelled.
+ *
+ * MVXACCOUNT is "." under the shell and stays "." after mvx_logto, which
+ * fchdir()s and leaves the name alone, so the spelling does not distinguish
+ * accounts at all.  Keying a cache on it means a program that opens a file,
+ * LOGTOs and opens the same name again is served the first account's answer --
+ * the menu-switching-company case, and exactly the fault mvx#264 fixed in the
+ * lmdb driver's env cache for the same reason.  Resolve it. */
+static void account_key(char *out, size_t cap) {
+    const char *acct = getenv("MVXACCOUNT");
+    if (!acct || !acct[0]) acct = ".";
+    char real[4096];
+    if (realpath(acct, real)) snprintf(out, cap, "%s", real);
+    else                      snprintf(out, cap, "%s", acct);
+}
+
+/* A tiny cache, because resolve() is on the open path and this reads VOC.
+   Negative answers are cached too: an account written before stage 2 has no
+   usable pointer for any file, and without this it would read VOC on every
+   open for ever.  Dropped whole when a pointer is written or removed, and
+   when the session moves to another account. */
+#define PL_CACHE 64
+static struct {
+    char name[256];
+    int  want_dict;
+    int  found;
+    char drv[64];
+    char spec[1200];
+} g_pl[PL_CACHE];
+static int  g_pl_n;
+static int  g_pl_next;
+/* ONE ACCOUNT AT A TIME, whole-cache.  Holding the account per entry would
+   mean storing a path per entry and comparing truncated copies of it, and two
+   deep paths that truncate alike would serve one account's answer in the
+   other -- the fault above, reintroduced by the fix for it. */
+static char g_pl_acct[4096];
+
+static void pointer_cache_drop(void) {
+    g_pl_n = 0; g_pl_next = 0; g_pl_acct[0] = '\0';
+}
+
+/* Derive, do not read the pointer.  Two callers need it: resolving VOC itself,
+   which would recurse; and voc_register, which asks resolve() where a file
+   lives in order to WRITE that answer down -- reading the pointer there would
+   have it copy the record back onto itself instead of describing reality. */
+static int g_derive_only;
+
+static int pointer_location(const char *cspec, int want_dict,
+                            char *drvname, size_t dcap,
+                            char *outspec, size_t ocap) {
+    /* VOC is opened before anything that could describe it (#187), and MD is
+       its other name -- neither can be resolved through a record inside it. */
+    if (!cspec || !cspec[0]) return 0;
+    if (strcasecmp(cspec, "VOC") == 0 || strcasecmp(cspec, "MD") == 0) return 0;
+    if (g_derive_only) return 0;
+
+    char acct[4096];
+    account_key(acct, sizeof acct);
+    if (strcmp(g_pl_acct, acct) != 0) {         /* the session moved */
+        g_pl_n = 0; g_pl_next = 0;
+        snprintf(g_pl_acct, sizeof g_pl_acct, "%s", acct);
+    }
+
+    for (int i = 0; i < g_pl_n; i++) {
+        if (g_pl[i].want_dict != want_dict) continue;
+        if (strcmp(g_pl[i].name, cspec) != 0) continue;
+        if (!g_pl[i].found) return 0;
+        snprintf(drvname, dcap, "%s", g_pl[i].drv);
+        snprintf(outspec, ocap, "%s", g_pl[i].spec);
+        return 1;
+    }
+
+    int found = 0;
+    char fdrv[64] = "", fspec[1200] = "";
+
+    g_derive_only = 1;
+    char vspec[1152];
+    const mvx_driver *vd = resolve("VOC", 0, vspec, sizeof vspec);
+    char err[256] = "";
+    mvx_file *v = vd ? vd->open(vspec, err, sizeof err) : NULL;
+    if (v) {
+        mv_value rec;
+        mv_init(&rec);
+        if (vd->read(v, cspec, (int64_t)strlen(cspec), &rec)) {
+            char nb[40];
+            const char *rp;
+            int64_t rlen = mv_val_chars(&rec, nb, sizeof nb, &rp);
+
+            /* the form every pre-stage-2 account carries, and it is wrong */
+            char legacy[1300];
+            int ln = snprintf(legacy, sizeof legacy, "F%c%s%c%s.DICT",
+                              (char)0xFE, cspec, (char)0xFE, cspec);
+            int stale = (rlen == ln && memcmp(rp, legacy, (size_t)ln) == 0);
+
+            const char *t; int64_t tl;
+            attr_n(rp, rlen, 1, &t, &tl);
+            int is_f = (tl == 1 && (t[0] == 'F' || t[0] == 'f'));
+
+            if (is_f && !stale) {
+                const char *lp; int64_t ll;
+                attr_n(rp, rlen, want_dict ? 3 : 2, &lp, &ll);
+                if (ll > 0 && ll < 1100) {
+                    char loc[1152];
+                    memcpy(loc, lp, (size_t)ll);
+                    loc[ll] = '\0';
+                    char conn[128];
+                    const char *sp;
+                    if (parse_location(loc, fdrv, sizeof fdrv,
+                                       conn, sizeof conn, &sp)) {
+                        const char *pp; int64_t pl2;
+                        attr_n(rp, rlen, 4, &pp, &pl2);   /* raw params */
+                        if (conn[0])
+                            snprintf(fspec, sizeof fspec, "@%s\n%s", conn, sp);
+                        else if (pl2 > 0)
+                            snprintf(fspec, sizeof fspec, "%.*s\n%s",
+                                     (int)pl2, pp, sp);
+                        else
+                            snprintf(fspec, sizeof fspec, "%s", sp);
+                        found = mvx_driver_available(fdrv);
+                    }
+                }
+            }
+        }
+        mv_clear(&rec);
+        vd->close(v);
+    }
+    g_derive_only = 0;
+
+    {
+        /* Round-robin once full, rather than giving up on caching: stopping
+           at the cap would leave every file past the 64th reading VOC on
+           every open, which is the one case this cache exists for. */
+        int i;
+        if (g_pl_n < PL_CACHE) i = g_pl_n++;
+        else { i = g_pl_next; g_pl_next = (g_pl_next + 1) % PL_CACHE; }
+        snprintf(g_pl[i].name, sizeof g_pl[i].name, "%s", cspec);
+        g_pl[i].want_dict = want_dict;
+        g_pl[i].found = found;
+        snprintf(g_pl[i].drv, sizeof g_pl[i].drv, "%s", fdrv);
+        snprintf(g_pl[i].spec, sizeof g_pl[i].spec, "%s", fspec);
+    }
+    if (!found) return 0;
+    snprintf(drvname, dcap, "%s", fdrv);
+    snprintf(outspec, ocap, "%s", fspec);
+    return 1;
+}
+
 static const mvx_driver *resolve(const char *cspec, int want_dict,
                                  char *outspec, size_t cap) {
     const char *acct = getenv("MVXACCOUNT");
@@ -816,10 +1075,43 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
     else
         snprintf(path, sizeof path, "%s/%s", acct, cspec);
 
+    /* WHAT THE ACCOUNT SAYS, before what the filesystem suggests (#318). */
+    {
+        char pdrv[64], pspec[1200];
+        if (pointer_location(cspec, want_dict, pdrv, sizeof pdrv,
+                             pspec, sizeof pspec)) {
+            snprintf(outspec, cap, "%s", pspec);
+            return driver_load(pdrv);
+        }
+    }
+
     struct stat sb;
     if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        snprintf(outspec, cap, want_dict ? "%s.DICT" : "%s", cspec);
-        return driver_load("dir");
+        if (!want_dict) {
+            snprintf(outspec, cap, "%s", cspec);
+            return driver_load("dir");
+        }
+        /* A DICTIONARY IS NEVER A DIRECTORY (#318).  Data and dictionary are
+           different kinds of thing: a directory file exists so its RECORDS are
+           OS files a person edits and git diffs -- the whole point for BP
+           source -- but a dictionary holds D-items nobody edits in an editor
+           and the query path reads constantly.  In a hash backend LIST and
+           SELECT push a dictionary lookup down instead of opening a directory
+           and reading a file per attribute.
+
+           EXCEPT WHERE ONE IS ALREADY THERE.  An account made before this has
+           a real <name>.DICT directory, and answering "hash" for it would lose
+           every D-item in it.  So an existing directory still wins, no account
+           needs converting, and both layouts keep working. */
+        char dpath[4160];
+        snprintf(dpath, sizeof dpath, "%s.DICT", path);
+        struct stat db;
+        if (stat(dpath, &db) == 0 && S_ISDIR(db.st_mode)) {
+            snprintf(outspec, cap, "%s.DICT", cspec);
+            return driver_load("dir");
+        }
+        snprintf(outspec, cap, "DICT.%s", cspec);
+        return driver_load(local_hash_driver());
     }
     /* Per-file backend binding (ARCHITECTURE.md 4.4: migration is per
        file).  A file may be bound to a networked or foreign backend by
@@ -828,6 +1120,13 @@ static const mvx_driver *resolve(const char *cspec, int want_dict,
        "params\nspec" - opaque to the runtime, parsed by the driver. */
     char driver[64], params[512];
     if (binding_for(cspec, driver, sizeof driver, params, sizeof params)) {
+        /* The same rule as above, for the other way to make a directory file:
+           CREATE-FILE x USING dir binds to dir rather than leaving a directory
+           for the stat() to find, and its dictionary is a hash file too. */
+        if (want_dict && strcmp(driver, "dir") == 0) {
+            snprintf(outspec, cap, "DICT.%s", cspec);
+            return driver_load(local_hash_driver());
+        }
         snprintf(outspec, cap, want_dict ? "%s\nDICT.%s" : "%s\n%s",
                  params, cspec);
         return driver_load(driver);
@@ -922,15 +1221,17 @@ static void ix_load(open_file *o) {
        (index_select over a mapped column, Postgres). */
     if (!b->driver->write_ix && !b->driver->index_select) return;
 
+    /* THE DICTIONARY'S OWN DRIVER AGAIN (#318).  Rebuilding the spec here and
+       opening it with b->driver assumed the dictionary lives wherever the data
+       does.  resolve() is the one place that knows, so ask it -- which also
+       drops this function's private copy of how a dictionary is spelled. */
     char dspec[1720];
-    const char *nl = strchr(b->spec, '\n');
-    if (nl)
-        snprintf(dspec, sizeof dspec, "%.*s\nDICT.%s",
-                 (int)(nl - b->spec), b->spec, nl + 1);
-    else
-        snprintf(dspec, sizeof dspec, "DICT.%s", b->spec);
+    const char *dname = b->spec;
+    const char *nl0 = strchr(b->spec, '\n');
+    if (nl0) dname = nl0 + 1;              /* a bound spec is "params\nname" */
+    const mvx_driver *ddrv = resolve(dname, 1, dspec, sizeof dspec);
     char err[256] = "";
-    mvx_file *d = b->driver->open(dspec, err, sizeof err);
+    mvx_file *d = ddrv->open(dspec, err, sizeof err);
     if (!d) return;
 
     mv_value xl, item, drec, ano;
@@ -3922,8 +4223,8 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
        was invisible here, so LISTF under-reported it and mvx-git -- which
        finds an account's files through this same list -- committed the
        account without its records (mv_git#240). */
-    static const char *local_drv[] = {"lmdb", "sqlite"};
-    for (size_t li = 0; li < sizeof local_drv / sizeof local_drv[0]; li++) {
+    const char *const *local_drv = mvx_local_drivers;
+    for (size_t li = 0; li < MVX_NLOCAL; li++) {
         if (!mvx_driver_available(local_drv[li])) continue;
         const mvx_driver *ld = driver_load(local_drv[li]);
         if (!ld || !ld->names) continue;
@@ -3938,6 +4239,38 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                 size_t n = (am ? am : end) - p;
                 if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, local_drv[li]);
                 p = am ? am + 1 : end;
+            }
+            /* A DICTIONARY WITH NO DATA IS STILL A FILE (#318 stage 5).
+             *
+             * CREATE-FILE DICT makes one, which is how a SHARED dictionary is
+             * made, and U2 lists it the same way -- UniData shows the file with
+             * an empty data location and its D_ dictionary.  Here the only
+             * thing in the backend is DICT.<name>, which the pass above filters
+             * as furniture, so the file was invisible: LISTF did not show it,
+             * mv_git could not find it, its records were never staged, and a
+             * clone lost the dictionary every data file was pointing at.  Worse,
+             * its VOC pointer then looked like ORDINARY CONTENT rather than a
+             * file pointer, so a VOC/ directory was committed and materialised
+             * over the account's real VOC.
+             *
+             * Second walk, after the first, so fl_listed() can see whether the
+             * data half was already reported.  Per driver, because a dictionary
+             * and the data it describes are made together on one backend -- and
+             * a DICT.<name> whose data is gone is a dictionary-only file now,
+             * whatever it used to be. */
+            if (names.tag == MV_STR && names.s->len > 0) {
+                const char *q = mv_str_bytes(names.s), *qe = q + names.s->len;
+                while (q < qe) {
+                    const char *am = memchr(q, '\xFE', (size_t)(qe - q));
+                    size_t n = (am ? am : qe) - q;
+                    if (n > 5 && memcmp(q, "DICT.", 5) == 0) {
+                        const char *base = q + 5;
+                        size_t bn = n - 5;
+                        if (!fl_listed(buf, len, base, bn))
+                            FL_PUTS(base, bn, local_drv[li]);
+                    }
+                    q = am ? am + 1 : qe;
+                }
             }
         }
         mv_clear(&names);
@@ -4183,8 +4516,14 @@ int mvx_voc_class(const char *type, int64_t len) {
    know a file's backend after a clone).  On disk it is always the native
    record = "FILE" VM type VM conn; the engine translates it to the portable
    DIR/hash class when it writes the open form to git. */
+/* `halves` marks a file that has only one, as "halves=dict" (#318 stage 5b).
+   A further value on the control, so every control ever written is unchanged
+   and still reads correctly -- absent means both.  A dictionary-only file needs
+   it because its control IS a record and travels as one; a data-only file has
+   no control at all, and mv_git synthesises one for the commit. */
 static void write_file_meta(const mvx_driver *drv, const char *dictspec,
-                            const char *type, const char *conn) {
+                            const char *type, const char *conn,
+                            const char *halves) {
     char err[256] = "";
     mvx_file *d = drv->open(dictspec, err, sizeof err);
     if (!d) return;
@@ -4194,10 +4533,15 @@ static void write_file_meta(const mvx_driver *drv, const char *dictspec,
     rec[n++] = (char)0xFD;                  /* value mark */
     size_t tl = strlen(type);
     memcpy(rec + n, type, tl); n += tl;
-    if (conn && conn[0]) {
+    if ((conn && conn[0]) || (halves && halves[0])) {
         rec[n++] = (char)0xFD;
-        size_t cl = strlen(conn);
-        memcpy(rec + n, conn, cl); n += cl;
+        size_t cl = conn ? strlen(conn) : 0;
+        if (cl) { memcpy(rec + n, conn, cl); n += cl; }
+    }
+    if (halves && halves[0]) {
+        rec[n++] = (char)0xFD;
+        size_t hl = strlen(halves);
+        memcpy(rec + n, halves, hl); n += hl;
     }
     mv_value rv;
     mv_init(&rv);
@@ -4215,7 +4559,64 @@ static void write_file_meta(const mvx_driver *drv, const char *dictspec,
    dictionaries (a file's own VOC item already covers its dictionary), never
    clobbers an existing VOC record, and is a silent no-op before the VOC exists
    (the bootstrap CREATE-FILE VOC). */
-static void voc_register(const char *name) {
+/* WHERE A HALF OF A FILE LIVES, as the pointer spells it (#318 stage 2).
+ *
+ *     location  ::= scheme ":" [ "//" authority "/" ] spec
+ *
+ * scheme is the driver, authority a connection profile, and spec the REST OF
+ * THE ATTRIBUTE, verbatim.  URI-shaped and deliberately a reduced set of one:
+ * no percent-encoding, query or fragment, because an MV file name may legally
+ * contain ? # % : / and @ -- all creatable today -- and either the record
+ * would have to carry encoded names a person cannot read in CT, or it would
+ * mis-resolve silently on names that already exist.
+ *
+ * Nothing reads this yet.  It is written so that an account describes itself
+ * before anything depends on the description. */
+static void location_of(const char *cspec, int want_dict,
+                        char *out, size_t cap, char *params, size_t pcap) {
+    if (params && pcap) params[0] = '\0';
+    char spec[1720];
+    const mvx_driver *d = resolve(cspec, want_dict, spec, sizeof spec);
+    const char *dn = (d && d->name) ? d->name : "";
+
+    /* a bound file's spec reaches the driver as "params\nspec" */
+    const char *nl = strchr(spec, '\n');
+    const char *tail = nl ? nl + 1 : spec;
+    if (nl) {
+        size_t plen = (size_t)(nl - spec);
+        if (plen > 1 && spec[0] == '@') {          /* a connection profile */
+            snprintf(out, cap, "%s://%.*s/%s", dn, (int)plen - 1, spec + 1,
+                     tail);
+            return;
+        }
+        /* Raw connection params -- an address and namespace written straight
+           into BINDINGS rather than named as a profile.  There is no room for
+           them in a location, and inventing authority syntax for an address
+           would be guessing, so they ride in the options attribute. */
+        if (plen && params && pcap)
+            snprintf(params, pcap, "%.*s", (int)plen, spec);
+    }
+    snprintf(out, cap, "%s:%s", dn, tail);
+}
+
+/* Register a newly created file in the account's VOC as a file pointer, so
+   every MV file is discoverable there (#71) alongside its dictionary.
+ *
+ * Attr 1 is "F" for every file, including a directory one: `dir` is a driver,
+ * not a file type, so what a file IS lives in the location (#318).  "DIR" is
+ * still recognised by mvx_voc_class for accounts that come from systems which
+ * write it; it is simply never written here.
+ *
+ * Skips the master dictionary itself and bare dictionaries (a file's own VOC
+ * item already covers its dictionary). */
+/* MV_HALF_* say which halves of the file exist, so the pointer can leave the
+   other one empty -- U2's CREATE.FILE DICT and DATA, which is what makes a
+   shared dictionary creatable without editing VOC by hand (#318 stage 4). */
+#define MV_HALF_DATA 1
+#define MV_HALF_DICT 2
+#define MV_HALF_BOTH (MV_HALF_DATA | MV_HALF_DICT)
+
+static void voc_register(const char *name, int halves) {
     size_t nl = strlen(name);
     if (strcmp(name, "VOC") == 0 || strcmp(name, "MD") == 0) return;
     if (nl > 5 && strcmp(name + nl - 5, ".DICT") == 0) return;
@@ -4226,23 +4627,44 @@ static void voc_register(const char *name) {
     mvx_file *v = drv->open(vspec, err, sizeof err);
     if (!v) return;
 
+    char dataloc[1800] = "", dictloc[1800] = "", parms[600] = "";
+    int was = g_derive_only;
+    g_derive_only = 1;              /* describe where it lives, do not echo */
+    if (halves & MV_HALF_DATA)
+        location_of(name, 0, dataloc, sizeof dataloc, parms, sizeof parms);
+    if (halves & MV_HALF_DICT)
+        location_of(name, 1, dictloc, sizeof dictloc, NULL, 0);
+    g_derive_only = was;
+
+    char rec[4096];
+    int n = snprintf(rec, sizeof rec, "F%c%s%c%s",
+                     (char)0xFE, dataloc, (char)0xFE, dictloc);
+    if (parms[0])
+        n += snprintf(rec + n, sizeof rec - (size_t)n, "%c%s",
+                      (char)0xFE, parms);
+
+    /* REWRITE ONLY WHAT WE WROTE.  A pointer already there is either ours and
+       out of date -- every account carries "F / name / name.DICT", which was
+       inaccurate for a hash file the day it was written, since its dictionary
+       is DICT.<name> inside the backend -- or it is somebody's own edit, and
+       overwriting that would be taking their account off them.  So the stale
+       form is recognised exactly, byte for byte, and anything else is left. */
     mv_value existing;
     mv_init(&existing);
-    if (drv->read(v, name, (int64_t)nl, &existing)) {   /* already present */
+    if (drv->read(v, name, (int64_t)nl, &existing)) {
+        char legacy[1300];
+        int ln = snprintf(legacy, sizeof legacy, "F%c%s%c%s.DICT",
+                          (char)0xFE, name, (char)0xFE, name);
+        char nb[40];
+        const char *ep;
+        int64_t elen = mv_val_chars(&existing, nb, sizeof nb, &ep);
+        int ours = (halves == MV_HALF_BOTH && elen == ln &&
+                    memcmp(ep, legacy, (size_t)ln) == 0);
         mv_clear(&existing);
-        drv->close(v);
-        return;
+        if (!ours) { drv->close(v); return; }
+    } else {
+        mv_clear(&existing);
     }
-    mv_clear(&existing);
-
-    char rec[600];
-    size_t n = 0;
-    rec[n++] = 'F';
-    rec[n++] = (char)0xFE;                 /* attribute mark */
-    memcpy(rec + n, name, nl); n += nl;
-    rec[n++] = (char)0xFE;
-    memcpy(rec + n, name, nl); n += nl;
-    memcpy(rec + n, ".DICT", 5); n += 5;
 
     mv_value rv;
     mv_init(&rv);
@@ -4250,6 +4672,7 @@ static void voc_register(const char *name) {
     drv->write(v, name, (int64_t)nl, &rv);
     mv_clear(&rv);
     drv->close(v);
+    pointer_cache_drop();           /* what resolve() remembers is now stale */
 }
 
 /* Remove a file's VOC pointer on DELETE-FILE — but only if the record is in
@@ -4268,8 +4691,10 @@ static void voc_unregister(const char *name) {
         char nb[40];
         const char *p;
         int64_t len = mv_val_chars(&rec, nb, sizeof nb, &p);
-        if (len >= 1 && p[0] == 'F' && (len == 1 || p[1] == (char)0xFE))
+        if (len >= 1 && p[0] == 'F' && (len == 1 || p[1] == (char)0xFE)) {
             drv->del(v, name, (int64_t)nl);
+            pointer_cache_drop();
+        }
     }
     mv_clear(&rec);
     drv->close(v);
@@ -4546,12 +4971,74 @@ static int driver_substitute(const char *file, const char *want,
  *
  * Returns 1 when the file is bound (to `want`, or to whatever was chosen in its
  * place), 0 when the user declined or there was nobody to ask. */
+/* CAN THIS `@name` BINDING ACTUALLY WORK? (mvx#319)
+ *
+ * A profile names a driver, and the reference is handed to that driver as its
+ * params so the driver can resolve the address, namespace and credentials
+ * itself.  A driver that does not read profiles takes the reference for its own
+ * location instead, and says nothing: sqlite created a database file literally
+ * called `@salesdb` while the profile's `address` was ignored.
+ *
+ * Refused here rather than at open, for the same reason the availability check
+ * is here -- the person who typed the binding is still standing there, and a
+ * binding is recorded once but resolved for ever.
+ *
+ * Returns 1 when the binding is usable; 0 with `err` set when it is not. */
+static int conn_usable(const char *want, char *err, size_t ecap) {
+    if (!want || want[0] != '@') return 1;
+    const char *cn = want + 1;
+    char cdrv[64] = "";
+    if (!mvx_conn_lookup(cn, "driver", cdrv, sizeof cdrv) || !cdrv[0]) {
+        /* Absent and incomplete are different mistakes, and "is not defined"
+           sends someone looking for a profile that is sitting right there with
+           a field missing.  Any other field answering proves it exists. */
+        char probe[256] = "";
+        int exists = mvx_conn_lookup(cn, "address", probe, sizeof probe) ||
+                     mvx_conn_lookup(cn, "namespace", probe, sizeof probe) ||
+                     mvx_conn_lookup(cn, "token", probe, sizeof probe);
+        if (exists)
+            snprintf(err, ecap,
+                     "connection '%s' does not say which driver it uses "
+                     "(SET-CONNECTION %s driver=...)", cn, cn);
+        else
+            snprintf(err, ecap,
+                     "connection '%s' is not defined "
+                     "(SET-CONNECTION %s driver=... address=...)", cn, cn);
+        return 0;
+    }
+    if (!mvx_driver_available(cdrv)) {
+        snprintf(err, ecap, "connection '%s' names driver %s, "
+                 "which this host does not have", cn, cdrv);
+        return 0;
+    }
+    const mvx_driver *d = driver_load(cdrv);
+    if (d && !d->takes_connection) {
+        snprintf(err, ecap,
+                 "connection '%s' names driver %s, which does not read "
+                 "connection profiles -- it would take \"%s\" for a location "
+                 "of its own.  Bind to %s directly instead.",
+                 cn, cdrv, want, cdrv);
+        return 0;
+    }
+    return 1;
+}
+
 static int bind_driver(const char *file, const char *want,
                        char *instead, size_t icap, int may_ask) {
     if (instead && icap) instead[0] = '\0';
     if (!file || !file[0] || !want || !want[0]) return 0;
-    /* A connection profile resolves its own driver later; nothing to check. */
-    if (want[0] == '@') { binding_add(file, want, ""); return 1; }
+    /* A connection profile resolves its own driver later -- but whether that
+       driver can read a profile at all is checkable now, and has to be
+       (mvx#319). */
+    if (want[0] == '@') {
+        char cerr[320] = "";
+        if (!conn_usable(want, cerr, sizeof cerr)) {
+            fprintf(stderr, "%s: %s\n", file, cerr);
+            return 0;
+        }
+        binding_add(file, want, "");
+        return 1;
+    }
 
     /* Already what this account would use: no binding, nothing to say.  An
        entry here would only record what was true anyway, on every file. */
@@ -4601,7 +5088,53 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
         mvx_account_hash(defbuf, sizeof defbuf);
         if (defbuf[0]) tp = defbuf;
     }
+    /* WHICH HALVES (#318 stage 4).  U2 spells this CREATE.FILE DICT name and
+       CREATE.FILE DATA name, and each half stands alone: a dictionary with no
+       data is how a SHARED dictionary is made before anything uses it, and data
+       with no dictionary is how a file borrows someone else's.
+       Parsed as a whole word, not by first letter -- "DIR" is also a D. */
+    int halves = MV_HALF_BOTH;
+    {
+        const char *q = tp;
+        size_t qn = 0;
+        while (q[qn] && q[qn] != ' ' && q[qn] != '\t') qn++;
+        if (qn == 4 && strncasecmp(q, "DICT", 4) == 0) halves = MV_HALF_DICT;
+        else if (qn == 4 && strncasecmp(q, "DATA", 4) == 0) halves = MV_HALF_DATA;
+        if (halves != MV_HALF_BOTH) {
+            tp += qn;
+            while (*tp == ' ' || *tp == '\t') tp++;
+            /* the rest is the ordinary type; with nothing left, the account
+               default applies -- but a dictionary is always a hash file, so
+               "DICT ... DIR" is a contradiction rather than a shorthand */
+            if (halves == MV_HALF_DICT && tp[0] &&
+                (strcasecmp(tp, "DIR") == 0 || strcasecmp(tp, "DIRECTORY") == 0)) {
+                fprintf(stderr, "CREATE-FILE DICT: a dictionary is a hash "
+                                "file, never a directory\n");
+                return 0;
+            }
+            if (!tp[0] && halves == MV_HALF_DATA) {
+                mvx_account_hash(defbuf, sizeof defbuf);
+                if (defbuf[0]) tp = defbuf;
+            }
+        }
+    }
+
     char err[256] = "";
+
+    /* A DICTIONARY ON ITS OWN: no data half, so nothing to create but the
+       dictionary, and it resolves as a hash file like any other. */
+    if (halves == MV_HALF_DICT) {
+        char dictspec[1720];
+        const mvx_driver *ddrv = resolve(cspec, 1, dictspec, sizeof dictspec);
+        if (!ddrv->create(dictspec, err, sizeof err)) {
+            if (err[0]) fprintf(stderr, "CREATE-FILE DICT: %s\n", err);
+            return 0;
+        }
+        write_file_meta(ddrv, dictspec, ddrv->name ? ddrv->name : "", "",
+                        "halves=dict");
+        voc_register(cspec, MV_HALF_DICT);
+        return 1;
+    }
 
     /* CREATE-FILE name USING <driver> {params}: bind at creation and
        create through that driver.  The binding is recorded in BINDINGS
@@ -4633,9 +5166,17 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
            Ask rather than abort, and bind to whatever is chosen so every later
            OPEN resolves there (mvx#113).  The connection params belong to the
            backend that is gone, so they do not travel with the substitution. */
-        /* NOT for `@name`: that is a connection PROFILE, not a driver — the
-           driver comes from the profile when the binding is resolved, so there
-           is nothing here to check and "@conn1" is not a file on disk. */
+        /* NOT the availability check for `@name`: that is a connection PROFILE,
+           not a driver, and "@conn1" is not a driver on disk.  Its own check is
+           above -- the profile has to exist and to name a driver that reads
+           one (mvx#319). */
+        if (drvname[0] == '@') {
+            char cerr[320] = "";
+            if (!conn_usable(drvname, cerr, sizeof cerr)) {
+                fprintf(stderr, "CREATE-FILE: %s\n", cerr);
+                return 0;
+            }
+        }
         if (drvname[0] != '@' && !mvx_driver_available(drvname)) {
             char sub[64];
             int r = driver_substitute(cspec, drvname, sub, sizeof sub, 1);
@@ -4652,14 +5193,21 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
             binding_remove(cspec);
             return 0;
         }
-        resolve(cspec, 1, dictspec, sizeof dictspec);
-        if (!drv->create(dictspec, err, sizeof err)) {
-            drv->remove(dataspec, err, sizeof err);
-            binding_remove(cspec);
-            return 0;
+        /* THE DICTIONARY'S OWN DRIVER (#318).  This used to reuse the data
+           file's, which was right only while the two could never differ.  A
+           directory file's dictionary is a local hash file, so they differ
+           now, and reusing drv would ask the dir driver to make a table. */
+        if (halves & MV_HALF_DICT) {
+            const mvx_driver *ddrv =
+                resolve(cspec, 1, dictspec, sizeof dictspec);
+            if (!ddrv->create(dictspec, err, sizeof err)) {
+                drv->remove(dataspec, err, sizeof err);
+                binding_remove(cspec);
+                return 0;
+            }
+            write_file_meta(ddrv, dictspec, drvname, ap, NULL);
         }
-        write_file_meta(drv, dictspec, drvname, ap);
-        voc_register(cspec);
+        voc_register(cspec, halves);
         /* If this was VOC, the account's record of where VOC lives is now
            stale, and VOC is the one file nothing else can describe -- it has
            to be opened before anything that could (#187).  CONVERT-FILE goes
@@ -4671,19 +5219,38 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
 
     if (tp[0] == 'D' || tp[0] == 'd') {
         const mvx_driver *drv = driver_load("dir");
+        /* DID IT EXIST BEFORE WE TOUCHED IT?  dir_create() is idempotent by
+           design, so it cannot tell us, and the rollback below must never
+           remove a directory -- and the records in it -- that we did not
+           create.  This is not hypothetical: a checkout calls createfile once
+           per committed subtree, so the second call for a file arrives with
+           the data already there and the dictionary already made, and a
+           rollback then deleted the file it had just materialised. */
+        int preexisting = dir_already_there(cspec);
         if (!drv->create(cspec, err, sizeof err)) return 0;
         /* A dictionary directory (NAME.DICT) is a file but needs no
            dictionary of its own — never create NAME.DICT.DICT. */
         size_t cl = strlen(cspec);
         if (cl > 5 && strcmp(cspec + cl - 5, ".DICT") == 0) return 1;
-        char dspec[1152];
-        snprintf(dspec, sizeof dspec, "%s.DICT", cspec);
-        if (!drv->create(dspec, err, sizeof err)) {
-            drv->remove(cspec, err, sizeof err);
-            return 0;
+        /* THE DICTIONARY IS A LOCAL HASH FILE, not a sibling directory (#318).
+           resolve() picks it, and answers <name>.DICT on dir when an older
+           account already has one there -- so this is also the route by which
+           an existing account keeps the dictionary it has.
+           %FILE% still records "dir": that is the DATA file's class, which is
+           what a checkout reads to know what to recreate. */
+        if (halves & MV_HALF_DICT) {
+            char dspec[1720];
+            const mvx_driver *ddrv = resolve(cspec, 1, dspec, sizeof dspec);
+            if (!ddrv->create(dspec, err, sizeof err)) {
+                /* A hash backend reports "already exists" as a failed create
+                   -- which is right for CREATE-FILE -- so this is the ordinary
+                   second call, not a fault.  Undo only what this call made. */
+                if (!preexisting) drv->remove(cspec, err, sizeof err);
+                return 0;
+            }
+            write_file_meta(ddrv, dspec, "dir", "", NULL);
         }
-        write_file_meta(drv, dspec, "dir", "");
-        voc_register(cspec);
+        voc_register(cspec, halves);
         return 1;
     }
 
@@ -4706,10 +5273,13 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
     char dataspec[1720], dictspec[1720];
     const mvx_driver *drv = resolve(cspec, 0, dataspec, sizeof dataspec);
     if (!drv->create(dataspec, err, sizeof err)) return 0;
-    resolve(cspec, 1, dictspec, sizeof dictspec);
-    if (!drv->create(dictspec, err, sizeof err)) {
-        drv->remove(dataspec, err, sizeof err);
-        return 0;
+    const mvx_driver *ddrv = NULL;
+    if (halves & MV_HALF_DICT) {
+        ddrv = resolve(cspec, 1, dictspec, sizeof dictspec);
+        if (!ddrv->create(dictspec, err, sizeof err)) {
+            drv->remove(dataspec, err, sizeof err);
+            return 0;
+        }
     }
     /* THE DRIVER THAT ACTUALLY HOLDS IT, not a guess (mvx#307).  This was the
        literal string "lmdb", so a plain CREATE-FILE on an account whose default
@@ -4718,8 +5288,11 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
        it, so the wrong answer travelled: mv_git's %FILE% said lmdb while LISTF
        said sqlite.  drv is the driver that just created the file and it knows
        its own name. */
-    write_file_meta(drv, dictspec, drv->name ? drv->name : "", "");
-    voc_register(cspec);
+    /* %FILE% lives IN the dictionary, so a data-only file has nowhere to put
+       one.  The pointer carries the location now, which is what MVX resolves
+       from; %FILE% remains for the committed open-account form. */
+    if (ddrv) write_file_meta(ddrv, dictspec, drv->name ? drv->name : "", "", NULL);
+    voc_register(cspec, halves);
     return 1;
 }
 
@@ -4729,11 +5302,18 @@ int64_t mvx_deletefile(mvx_ctx *ctx, const mv_value *spec) {
     if (!spec_cstr(spec, cspec, sizeof cspec)) return 0;
 
     char dspec[1720], rspec[1720];
-    const mvx_driver *drv = resolve(cspec, 1, dspec, sizeof dspec);
+    /* EACH HALF WITH ITS OWN DRIVER (#318): a directory file's dictionary is a
+       local hash file, so one driver can no longer remove both. */
+    const mvx_driver *ddrv = resolve(cspec, 1, dspec, sizeof dspec);
     char err[256] = "";
-    drv->remove(dspec, err, sizeof err);        /* dict first, may be absent */
-    resolve(cspec, 0, rspec, sizeof rspec);
+    int64_t gone_dict = ddrv->remove(dspec, err, sizeof err);
+    const mvx_driver *drv = resolve(cspec, 0, rspec, sizeof rspec);
     int64_t r = drv->remove(rspec, err, sizeof err);
+    /* EITHER HALF COUNTS (#318 stage 4).  A file may now be one half only -- a
+       shared dictionary with no data, or data borrowing another file's
+       dictionary -- and reporting failure because the absent half could not be
+       removed would leave something creatable that cannot be deleted. */
+    if (!r && gone_dict) r = 1;
     if (r) {
         binding_remove(cspec);              /* binding dies with it */
         voc_unregister(cspec);              /* and its VOC file pointer (#71) */

@@ -7,35 +7,48 @@
 * the extent permitted by law; see the LICENSE file for details.
 *
 * SPDX-License-Identifier: GPL-2.0-only
-* CREATE-FILE name {DIR | DIRECTORY | USING <driver> {connection}}
+* CREATE-FILE {DICT | DATA} name {DIR | DIRECTORY | USING <driver> {connection}}
+*
+* DICT and DATA make one half of the file, as they do on U2.  A dictionary on
+* its own is how a SHARED dictionary is made -- several files can name it, and
+* then one set of D-items serves all of them -- and data on its own is how a
+* file borrows someone else's.  With neither word, both halves are made.
 * The file's backend is decided at creation: a directory file, a
 * local LMDB file (the default), or a file on another driver
 * (lmdbnet, and later postgres/mongo) bound in the account's BINDINGS
 * record. For lmdbnet the connection defaults to $MVXDAEMON.
 S = TRIM(SENTENCE())
-NAME = FIELD(S, " ", 2)
-TYPE = OCONV(FIELD(S, " ", 3), "MCU")
+USAGE = "usage: CREATE-FILE {DICT|DATA} name {DIR | DIRECTORY | USING driver {connection}}"
+HALF = ""
+N = 2
+W = OCONV(FIELD(S, " ", 2), "MCU")
+IF W = "DICT" OR W = "DATA" THEN
+   HALF = W
+   N = 3
+END
+NAME = FIELD(S, " ", N)
+TYPE = OCONV(FIELD(S, " ", N + 1), "MCU")
 IF NAME = "" THEN
-   PRINT "usage: CREATE-FILE name {DIR | DIRECTORY | USING driver {connection}}"
+   PRINT USAGE
    STOP
 END
 BEGIN CASE
 CASE TYPE = "DIR" OR TYPE = "DIRECTORY"
-   OK = CREATEFILE(NAME, "DIR")
+   OK = CREATEFILE(NAME, TRIM(HALF:" DIR"))
 CASE TYPE = "USING"
-   DRV = FIELD(S, " ", 4)
-   CONN = FIELD(S, " ", 5, 99)
+   DRV = FIELD(S, " ", N + 2)
+   CONN = FIELD(S, " ", N + 3, 99)
    IF DRV = "" THEN
-      PRINT "usage: CREATE-FILE name USING driver {connection}"
+      PRINT USAGE
       STOP
    END
-   TV = "USING ":DRV
+   TV = TRIM(HALF:" USING "):" ":DRV
    IF CONN # "" THEN TV = TV:" ":CONN
    OK = CREATEFILE(NAME, TV)
 CASE TYPE = ""
-   OK = CREATEFILE(NAME)
+   IF HALF = "" THEN OK = CREATEFILE(NAME) ELSE OK = CREATEFILE(NAME, HALF)
 CASE 1
-   PRINT "usage: CREATE-FILE name {DIR | DIRECTORY | USING driver {connection}}"
+   PRINT USAGE
    STOP
 END CASE
 IF OK THEN
