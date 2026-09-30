@@ -58,6 +58,21 @@ FROMD = FN
 TOD = TMP
 GOSUB 3000                          ;* copy dictionary FN -> TMP (skip %FILE%)
 
+* ---- keep whatever the ACCOUNT put in the file's VOC pointer (#322) ---
+*  Attributes 1 to 4 are MVX's: the type, the data location, the
+*  dictionary location, and the options slot.  Attribute 5 onwards is the
+*  account's -- a description, a site convention, anything.  A convert is a
+*  DELETE and a CREATE, and the delete took the whole record with it, so
+*  everything past MVX's own was quietly lost.  Nothing MVX writes put
+*  anything there, which is why it went unnoticed; #318 gave attribute 4 a
+*  meaning and made the loss matter.
+KEPT = ""
+OPEN "VOC" TO VOCF THEN
+   READ VR FROM VOCF, FN THEN
+      IF DCOUNT(VR, @AM) > 4 THEN KEPT = FIELD(VR, @AM, 5, 999)
+   END
+END
+
 * ---- replace the file: drop the old backend, recreate as the new type -
 SRC = ""
 JUNK = DELETEFILE(FN)
@@ -79,6 +94,19 @@ FROMD = TMP
 TOD = FN
 GOSUB 3000                          ;* copy dictionary TMP -> FN (skip %FILE%)
 JUNK = DELETEFILE(TMP)
+
+*  put the account's own attributes back on the freshly written pointer
+IF KEPT # "" THEN
+   OPEN "VOC" TO VOCF2 THEN
+      READ VR2 FROM VOCF2, FN THEN
+         LOOP
+         WHILE DCOUNT(VR2, @AM) < 4 DO
+            VR2 = VR2:@AM
+         REPEAT
+         WRITE VR2:@AM:KEPT ON VOCF2, FN
+      END
+   END
+END
 PRINT FN:" converted to ":NT:" (":N:" record(s))"
 STOP
 

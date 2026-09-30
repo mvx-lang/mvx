@@ -1237,6 +1237,42 @@ check tcl-dict-only "$( \
   "$TCL" -a "$DCO" -c 'CREATE-FILE BOTHH' >/dev/null 2>&1; \
   "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -c 'BOTHH')"
 
+# A CONVERT KEEPS WHAT THE ACCOUNT PUT IN THE FILE'S POINTER (#322).
+#
+# Attributes 1 to 4 of a VOC file pointer are MVX's -- the type, the data
+# location, the dictionary location, and the options slot -- and attribute 5
+# onwards is the account's.  A convert is a DELETE and a CREATE, and the delete
+# took the whole record with it, so everything past MVX's own was quietly lost.
+# Nothing MVX wrote ever put anything there, which is why it went unnoticed;
+# mvx#318 gave attribute 4 a meaning and made the loss matter.
+#
+# Reproduced on the released binary before being called a regression: it loses
+# them there too, so this is long-standing rather than new.
+CVK="$TESTROOT/cvtkeep"
+"$ROOT/scripts/mkaccount.sh" "$CVK" >/dev/null 2>&1
+"$TCL" -a "$CVK" -c 'CREATE-FILE KEEPF' >/dev/null 2>&1
+cvkseed="$TESTROOT/cvkseed.b"
+cat > "$cvkseed" <<'EOF'
+OPEN "VOC" TO V ELSE STOP
+READ R FROM V,"KEEPF" THEN
+   R<5> = "the account put this here"
+   WRITE R ON V,"KEEPF"
+   PRINT "planted"
+END ELSE
+   PRINT "no pointer to plant on"
+END
+EOF
+"$MVX" "$cvkseed" -o "$TESTROOT/cvkseedbin" 2>/dev/null
+check tcl-convert-keeps-pointer "$( \
+  (cd "$CVK" && MVXACCOUNT=. "$TESTROOT/cvkseedbin" 2>&1); \
+  echo '--- the location before'; \
+  "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^002'; \
+  "$TCL" -a "$CVK" -c 'CONVERT-FILE KEEPF lmdb' 2>&1 | tail -1; \
+  echo '--- the location moved'; \
+  "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^002'; \
+  echo '--- and the account keeps its own'; \
+  "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^005')"
+
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
 # is the bootstrap file -- opened before anything that could describe it -- and
