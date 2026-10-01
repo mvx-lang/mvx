@@ -689,8 +689,17 @@ static void handle(int fd, uint8_t op, inbuf *in, outbuf *out,
         if (mdb_cursor_open(txn, main_dbi, &cur) == 0) {
             MDB_val k, v;
             while (mdb_cursor_get(cur, &k, &v, MDB_NEXT) == 0) {
-                o16(out, (uint16_t)k.mv_size);
-                oput(out, k.mv_data, k.mv_size);
+                /* The name, not the key: LMDB 1.0 keeps the terminating NUL
+                   in a sub-database's name key.  Sending it would put it on
+                   the wire and into FILELIST(), where a name that compares
+                   equal to nothing double-lists the file (mvx#307).  Same
+                   reasoning as lmdb_names() in runtime/src/mvx_drv_lmdb.c. */
+                size_t kn = k.mv_size;
+                while (kn > 0 && ((const char *)k.mv_data)[kn - 1] == '\0')
+                    kn--;
+                if (kn == 0) continue;
+                o16(out, (uint16_t)kn);
+                oput(out, k.mv_data, kn);
                 count++;
             }
             mdb_cursor_close(cur);
