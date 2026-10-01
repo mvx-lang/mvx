@@ -5572,8 +5572,16 @@ EXECUTE "OE3" RETURNING RC ON ERROR
 END
 PRINT "stop: rc=":RC
 OEEOF
+# Reported, not swallowed.  When mvx#337 stopped ON ERROR from compiling, the
+# discarded output left every assertion below failing with "./CATALOG/OESTOP:
+# No such file or directory" -- a missing-file error two steps from a compiler
+# fault, which is the wrong thing to go looking at.
 for v in OEAB OEOK OE3 OESHELL OEBARE OESTOP; do
-  MVXPRIV=developer "$TCL" -a "$OEA" -c "CATALOG BP $v" >/dev/null 2>&1
+  oecat="$(MVXPRIV=developer "$TCL" -a "$OEA" -c "CATALOG BP $v" 2>&1)"
+  case "$oecat" in
+    *"compilation of"*|*"invalid IR"*|*rror*)
+      FAIL=$((FAIL + 1)); echo "FAIL on-error catalog $v: $oecat" ;;
+  esac
 done
 
 shout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OESHELL 2>&1)"
@@ -5605,6 +5613,31 @@ stop: rc=3" ]; then
   PASS=$((PASS + 1)); echo "  a non-zero STOP is a status, not an error"
 else
   FAIL=$((FAIL + 1)); echo "FAIL on-error stop: [$stopout]"
+fi
+
+# AN EMPTY ON ERROR CLAUSE STILL COMPILES (mvx#337).
+#
+# Swallowing the abort and carrying on is a legitimate thing to write, and it
+# is the case that exposes whether codegen closes the error block: there is
+# nothing in the block to close it by accident.  Every fixture above has a
+# body, which is why all of them passed while `getTerminator()` silently
+# stopped answering the question the compiler was asking it.
+#
+# Asserted as a COMPILE, not a run: the fault was invalid IR, and the verifier
+# rejects it before anything can be executed.
+printf 'EXECUTE "OEAB" ON ERROR\nEND\nPRINT "swallowed"\n' > "$OEA/BP/OEEMPTY"
+emptyout="$(MVXPRIV=developer "$TCL" -a "$OEA" -c 'CATALOG BP OEEMPTY' 2>&1)"
+emptyrun="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OEEMPTY 2>&1)"
+case "$emptyout$emptyrun" in
+  *"invalid IR"*|*"failed"*) emptyok=0 ;;
+  *swallowed*)               emptyok=1 ;;
+  *)                         emptyok=0 ;;
+esac
+if [ "$emptyok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  an empty ON ERROR clause compiles and swallows the abort"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL on-error empty: [$emptyout] [$emptyrun]"
 fi
 
 # ---------------------------------------------------------------------------
