@@ -2010,7 +2010,7 @@ RGEOF
 
   # #58: an account that is a subdirectory of a larger repo (it has a .mvx but
   # no .git of its own) is tracked by that repo — mvx-git forwards to it and
-  # never creates a nested .git; the account is rebuilt with mvx-convert-acct
+  # never creates a nested .git; the account is rebuilt with mvx-git-adopt
   # (or an mvx-git clone) instead.
   MGSUB="$TESTROOT/mgsub"
   mkdir -p "$MGSUB/acct/BP"
@@ -6215,10 +6215,16 @@ mklgc bothway; printf 'PA\nDISPLAY a\n' > "$LGC/bothway/VOC/bothway"
 mklgc plainlg; printf 'PA\nDISPLAY b\n' > "$LGC/plainlg/VOC/LOGIN"
 mklgc verbnam; printf 'V\nCATALOG/verbnam\n' > "$LGC/verbnam/VOC/verbnam"
 
-lc1="$(MVXPRIV=developer "$CONV" "$LGC/uvstyle" 2>&1 | grep -c "named")"
+# lc1 GREPS THE PROGRAM'S OWN NAME, not just the words of the complaint.
+# The only places the name was asserted were lc3/lc4 below, which check it is
+# ABSENT -- so when the tool was renamed mvx-convert-acct -> mvx-git-adopt the
+# messages kept the old name, every assertion here still passed, and the suite
+# held the stale name in place for five releases (mvx#339).  An absence check
+# cannot notice a name going out of date; this one can.
+lc1="$(MVXPRIV=developer "$CONV" "$LGC/uvstyle" 2>&1 | grep -c "mvx-git-adopt: this account's login")"
 lc2="$(MVXPRIV=developer "$CONV" "$LGC/bothway" 2>&1 | grep -c "BOTH")"
-lc3="$(MVXPRIV=developer "$CONV" "$LGC/plainlg" 2>&1 | grep -c "mvx-convert-acct:")"
-lc4="$(MVXPRIV=developer "$CONV" "$LGC/verbnam" 2>&1 | grep -c "mvx-convert-acct:")"
+lc3="$(MVXPRIV=developer "$CONV" "$LGC/plainlg" 2>&1 | grep -c "mvx-git-adopt:")"
+lc4="$(MVXPRIV=developer "$CONV" "$LGC/verbnam" 2>&1 | grep -c "mvx-git-adopt:")"
 
 if [ "$lc1" -ge 1 ]; then
   PASS=$((PASS + 1)); echo "  a UniVerse-style account-named login is reported"

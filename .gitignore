@@ -13,7 +13,7 @@ packages/*/bin/
 
 # LMDB hash-file stores are binary and account-local: never commit them.
 # An account is version-controlled in its legible directory form and
-# rebuilt into hash files by mvx-git / mvx-convert-acct.
+# rebuilt into hash files by mvx-git / mvx-git-adopt.
 mvxdata.lmdb/
 # ...and every other backend's local store.  lmdb's is a DIRECTORY and was
 # named as one; sqlite's is a FILE with -shm and -wal beside it, so running
