@@ -1736,14 +1736,20 @@ private:
             b_.CreateCondBr(bad, errBB, doneBB);
             b_.SetInsertPoint(errBB);
             emitBlock(s.errorBody);
-            /* hasTerminator(), NOT getTerminator() (mvx#337).  LLVM 23
-               redefined getTerminator() to assume the block is well formed
-               and return &InstList.back() regardless; with assertions off
-               that is the list sentinel, so the old `!getTerminator()` test
-               was always false on an empty block and this branch was never
-               emitted -- every ON ERROR clause produced invalid IR.  The
-               null-returning form is now called getTerminatorOrNull(). */
-            if (!b_.GetInsertBlock()->hasTerminator()) b_.CreateBr(doneBB);
+            /* ASKED THE LONG WAY ROUND, AND IT HAS TO BE (mvx#337).
+               LLVM 23 redefined getTerminator() to assume the block is well
+               formed and return &InstList.back() regardless; with assertions
+               off that is the list sentinel, so `!getTerminator()` was always
+               false on an empty block, this branch was never emitted, and
+               every ON ERROR clause produced invalid IR.
+               LLVM 23 offers hasTerminator()/getTerminatorOrNull() for the
+               old meaning, but neither exists on 21, which CI builds against.
+               empty() + back().isTerminator() is what getTerminator() used to
+               do internally and compiles on both, so there is no version
+               test here. */
+            BasicBlock *cur = b_.GetInsertBlock();
+            if (cur->empty() || !cur->back().isTerminator())
+                b_.CreateBr(doneBB);
             b_.SetInsertPoint(doneBB);
             break;
         }
