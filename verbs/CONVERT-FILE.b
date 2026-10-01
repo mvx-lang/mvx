@@ -19,7 +19,7 @@
 * so a hash file converts to and from a directory file (and back)
 * without loss; the dictionary comes across too, but the %FILE% control
 * record is left as the new backend stamped it, not the old one.  This
-* is the per-file companion to the account converter (mvx-convert-acct).
+* is the per-file companion to CONVERT-ACCOUNT, which does the account.
 S = TRIM(SENTENCE())
 FN = FIELD(S, " ", 2)
 NT = FIELD(S, " ", 3)

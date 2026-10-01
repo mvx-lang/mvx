@@ -1300,6 +1300,73 @@ check tcl-convert-keeps-pointer "$( \
   echo '--- and the account keeps its own'; \
   "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^005')"
 
+# A WHOLE ACCOUNT MOVES BACKEND IN ONE COMMAND (#335).
+#
+# Deprecating a driver otherwise reads "run CONVERT-FILE once for every file
+# you have", which is an invitation to miss one.  The three rules worth
+# asserting are the ones that are not obvious from the name:
+#
+#   A DIRECTORY FILE IS SKIPPED unless FROM dir names it.  The point of a dir
+#   file is that its records are OS files a person reads and git diffs, so the
+#   obvious command must do the useful thing and not the destructive one.
+#
+#   VOC GOES LAST.  Resolution starts there, so moving it mid-run would change
+#   where every later file is looked up under a loop still iterating.  Asserted
+#   from a FRESH process, which is the only thing that proves `voc =` was
+#   updated rather than the open handle still working.
+#
+#   CATALOG IS NEVER CONVERTED, not even by FROM dir, because the dispatcher
+#   reaches a cataloged verb by PATH -- converting it to a hash backend stops
+#   every verb in the account from running.  Asserted by RUNNING one afterwards,
+#   not by reading the listing: the listing cannot tell you the account still
+#   works.
+#
+# LISTONLY is checked by what did NOT happen -- the file is still on its old
+# backend afterwards.  A plan that prints correctly and converts anyway would
+# pass a test that only reads the plan.
+CAA="$TESTROOT/cvtaccount"
+"$ROOT/scripts/mkaccount.sh" "$CAA" >/dev/null 2>&1
+"$TCL" -a "$CAA" -c 'CREATE-FILE CAOLD USING lmdb' >/dev/null 2>&1
+"$TCL" -a "$CAA" -c 'CREATE-FILE CABP USING dir'   >/dev/null 2>&1
+mkdir -p "$CAA/BP"
+cat > "$CAA/BP/CASEED" <<'CAEOF'
+OPEN "CAOLD" TO F ELSE STOP "no CAOLD"
+FOR I = 1 TO 5
+   WRITE "row ":I ON F, "K":I
+NEXT I
+PRINT "caseed ran"
+CAEOF
+MVXPRIV=developer "$TCL" -a "$CAA" -c 'CATALOG BP CASEED' >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$CAA" -c 'CASEED' >/dev/null 2>&1
+check tcl-convert-account "$( \
+  echo '--- the plan, which changes nothing'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT sqlite LISTONLY' 2>&1; \
+  echo '--- so CAOLD is still where it was'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CAOLD'; \
+  echo '--- FROM names one backend and leaves the rest alone'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT lmdb FROM sqlite LISTONLY' 2>&1; \
+  echo '--- FROM and the target agreeing is nothing to do'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT lmdb FROM lmdb' 2>&1; \
+  echo '--- VOC moves, and it moves last'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT lmdb' 2>&1; \
+  echo '--- a FRESH process finds the moved VOC, and every record is still there'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^VOC'; \
+  "$TCL" -a "$CAA" -c 'COUNT CAOLD' 2>&1; \
+  echo '--- the whole account, VOC last again'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT sqlite' 2>&1; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CAOLD'; \
+  "$TCL" -a "$CAA" -c 'COUNT CAOLD' 2>&1; \
+  echo '--- the directory file was left alone throughout'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CABP'; \
+  echo '--- a wrong target converts nothing and says so once'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT nosuchdrv' 2>&1 \
+    | grep -E 'FAILED|stopping|target is wrong'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CAOLD'; \
+  echo '--- FROM dir includes the source directories and still refuses CATALOG'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT sqlite FROM dir' 2>&1; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CATALOG'; \
+  MVXPRIV=developer "$TCL" -a "$CAA" -c 'CASEED' 2>&1)"
+
 # A LEGACY DICTIONARY DIRECTORY IS FURNITURE; AN EXPORTED ONE IS NOT (#316).
 #
 # Before mvx#318 a directory file's dictionary was a sibling directory,

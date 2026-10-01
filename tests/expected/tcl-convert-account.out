@@ -1,0 +1,44 @@
+--- the plan, which changes nothing
+CONVERT-ACCOUNT: 1 file(s) to sqlite
+  CAOLD
+  2 directory file(s) left alone -- name FROM dir to include them
+listonly: nothing was changed
+--- so CAOLD is still where it was
+CAOLD                    lmdb
+--- FROM names one backend and leaves the rest alone
+CONVERT-ACCOUNT: 1 file(s) to lmdb
+  VOC (last)
+listonly: nothing was changed
+--- FROM and the target agreeing is nothing to do
+CONVERT-ACCOUNT: FROM and the new type are both lmdb -- nothing to do
+--- VOC moves, and it moves last
+CONVERT-ACCOUNT: 1 file(s) to lmdb
+  VOC (last)
+  2 directory file(s) left alone -- name FROM dir to include them
+converted 1 file(s) to lmdb
+--- a FRESH process finds the moved VOC, and every record is still there
+VOC                      lmdb
+5 record(s) counted
+--- the whole account, VOC last again
+CONVERT-ACCOUNT: 2 file(s) to sqlite
+  CAOLD
+  VOC (last)
+  2 directory file(s) left alone -- name FROM dir to include them
+converted 2 file(s) to sqlite
+CAOLD                    sqlite
+5 record(s) counted
+--- the directory file was left alone throughout
+CABP                     dir
+--- a wrong target converts nothing and says so once
+  FAILED CAOLD: cannot create the new nosuchdrv file (bad type or connection?)
+CONVERT-ACCOUNT: stopping -- the first file failed, so the
+  target is wrong rather than the file.  Nothing was converted.
+CAOLD                    sqlite
+--- FROM dir includes the source directories and still refuses CATALOG
+CONVERT-ACCOUNT: 2 file(s) to sqlite
+  BP
+  CABP
+  CATALOG is never converted -- it holds executables
+converted 2 file(s) to sqlite
+CATALOG                  dir
+caseed ran
