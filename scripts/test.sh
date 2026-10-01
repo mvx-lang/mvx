@@ -1055,6 +1055,33 @@ check tcl-bind-dir "$( \
   echo '--- with nothing named for the binding parameters'; \
   "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -c 'params')"
 
+# A FILE HELD BY lmdb IS LISTED ONCE (#307).
+#
+# FILELIST() asks each local backend what it holds and then asks the bindings
+# table, deduping the second against the first BY NAME.  LMDB 1.0 writes a
+# sub-database's name key WITH its terminating NUL where 0.9 wrote only the
+# characters, so the first pass offered `PARTS\0`, the second offered `PARTS`,
+# and nothing matched: the file was listed twice and carried a stray byte into
+# LISTF's columns.  The dedupe was already there -- a library upgrade walked
+# underneath it, which is why this is asserted and not assumed.
+#
+# Counted, not grepped for presence: the fault was a DUPLICATE, so a test that
+# only asks whether PARTS is listed passes while it is listed twice.
+BLA="$TESTROOT/bindlmdbacct"
+"$ROOT/scripts/mkaccount.sh" "$BLA" >/dev/null 2>&1
+check tcl-bind-lmdb-once "$( \
+  "$TCL" -a "$BLA" -c 'CREATE-FILE PARTS USING lmdb' 2>&1; \
+  echo '--- listed once, on lmdb'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | grep -ca '^PARTS'; \
+  echo '--- and the account holds it plus VOC, nothing more'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | grep -aE 'file\(s\)'; \
+  echo '--- with the dictionary kept out of the listing'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | grep -c 'DICT'; \
+  echo '--- and no unprintable byte anywhere in it'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | tr -d '[:print:]\n' | wc -c | tr -d ' '; \
+  echo '--- the name reaching a verb is the name, so the file opens'; \
+  "$TCL" -a "$BLA" -c 'COUNT PARTS' 2>&1)"
+
 # A CONNECTION PROFILE IS REFUSED BY A DRIVER THAT CANNOT READ ONE (#319),
 # AND HONOURED BY ONE THAT CAN -- INCLUDING THE LOCAL ONES (#326).
 #
