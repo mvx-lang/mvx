@@ -1,0 +1,8 @@
+planted
+--- the location before
+002 sqlite:KEEPF
+KEEPF converted to lmdb (0 record(s))
+--- the location moved
+002 lmdb:KEEPF
+--- and the account keeps its own
+005 the account put this here

@@ -1,0 +1,7 @@
+legacy pointer set
+--- the file is listed once, its dictionary not at all
+1
+--- and the dictionary still resolves, out of that directory
+004 Name
+--- an exported dictionary with no data half stays visible
+1

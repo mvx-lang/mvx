@@ -13,7 +13,7 @@
 /* Account conversion between the git-legible directory form and live
  * hash files.  The directory form — NAME/ (records) beside NAME.DICT/
  * (dictionary) — is only ever what git tracks; a live account is hash
- * files with no .DICT.  mvx-convert-acct and mvx-git call these.
+ * files with no .DICT.  mvx-git-adopt calls these.
  *
  *   mvx_acct_import  directory form  ->  hash files  (clone / checkout)
  *
@@ -362,17 +362,17 @@ static void login_check(mvx_ctx *ctx, const char *acct) {
 
     if (!lt[0]) {
         fprintf(stderr,
-            "mvx-convert-acct: this account's login is the record `%s', named\n"
-            "                  after the account -- which is how UniVerse names\n"
-            "                  one.  MVX runs only `LOGIN', so nothing will run\n"
-            "                  on entry here.  Copy it to `LOGIN' to keep it.\n",
+            "mvx-git-adopt: this account's login is the record `%s', named\n"
+            "               after the account -- which is how UniVerse names\n"
+            "               one.  MVX runs only `LOGIN', so nothing will run\n"
+            "               on entry here.  Copy it to `LOGIN' to keep it.\n",
             nm);
         return;
     }
     fprintf(stderr,
-        "mvx-convert-acct: this account has BOTH `LOGIN' and `%s'.  MVX runs\n"
-        "                  `LOGIN'; UniVerse would run `%s' and ignore LOGIN,\n"
-        "                  so the two systems do different things here.\n",
+        "mvx-git-adopt: this account has BOTH `LOGIN' and `%s'.  MVX runs\n"
+        "               `LOGIN'; UniVerse would run `%s' and ignore LOGIN,\n"
+        "               so the two systems do different things here.\n",
         nm, nm);
 }
 
@@ -383,7 +383,7 @@ int mvx_acct_import(mvx_ctx *ctx) {
     char (*names)[256] = NULL;
     size_t nn = 0, ncap = 0;
     DIR *d = opendir(acct);
-    if (!d) { fprintf(stderr, "mvx-convert-acct: cannot open %s\n", acct); return 1; }
+    if (!d) { fprintf(stderr, "mvx-git-adopt: cannot open %s\n", acct); return 1; }
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t l = strlen(e->d_name);
@@ -455,7 +455,7 @@ int mvx_acct_import(mvx_ctx *ctx) {
         snprintf(p, sizeof p, "%s/%s.DICT", acct, nm); rm_rf(p);
 
         if (!createfile(ctx, nm, type, conn)) {
-            fprintf(stderr, "mvx-convert-acct: cannot create %s\n", nm);
+            fprintf(stderr, "mvx-git-adopt: cannot create %s\n", nm);
             stash_free(&data); stash_free(&dict); continue;
         }
         if (open_lit(ctx, nm, &f))  { pour(ctx, &f, &data); mv_clear(&f); }

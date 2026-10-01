@@ -403,7 +403,16 @@ static int lmdb_remove(const char *spec, char *err, size_t errlen) {
     return mdb_txn_commit(txn) == 0;
 }
 
-/* Named-DB names are the keys of the environment's unnamed main DB. */
+/* Named-DB names are the keys of the environment's unnamed main DB.
+   NOT the key verbatim: LMDB 1.0 writes a sub-database's name key WITH its
+   terminating NUL, where 0.9 wrote only the characters.  A name that keeps
+   the NUL is a name that compares equal to nothing -- which is how mvx#307
+   survived its own fix: FILELIST() dedupes the driver pass against the
+   bindings pass by name, `X\0` never matched `X`, and the file was listed
+   twice.  It also put a stray byte in LISTF's columns, the "blank entries
+   between rows" recorded on that issue.
+   Stripping the terminator is right for both versions, and no MV file name
+   can end in NUL -- every spec reaches a driver as a C string. */
 static int lmdb_names(const char *loc, mv_value *out, char *err, size_t errlen) {
     MDB_env *env = env_get(loc, err, errlen);
     if (!env) return 0;
@@ -430,9 +439,12 @@ static int lmdb_names(const char *loc, mv_value *out, char *err, size_t errlen) 
             if (!nb) mvx_fatal("out of memory in LISTF");
             buf = nb;
         }
+        size_t kn = k.mv_size;
+        while (kn > 0 && ((const char *)k.mv_data)[kn - 1] == '\0') kn--;
+        if (kn == 0) continue;
         if (len) buf[len++] = (char)0xFE;
-        memcpy(buf + len, k.mv_data, k.mv_size);
-        len += k.mv_size;
+        memcpy(buf + len, k.mv_data, kn);
+        len += kn;
     }
     mdb_cursor_close(cur);
     mdb_txn_abort(txn);

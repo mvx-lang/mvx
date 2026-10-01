@@ -617,11 +617,12 @@ void mvx_account_namespace(char *out, size_t outlen) {
 
 /* Does this file have a backend binding?  Consult the account's
    BINDINGS record, whose lines are "SPEC driver {params...}" (an exact
-   spec, or "*" for every LMDB file); driver names a storage driver
-   (lmdbnet, and later postgres, mongo, ...) and params is its
-   connection string, opaque to the runtime.  With no BINDINGS record,
-   bare $MVXDAEMON binds the whole account to lmdbnet.  Returns 1 when
-   bound, filling driver and params. */
+   spec, or "*" for every file); driver names a storage driver and params is
+   its connection string, opaque to the runtime.  With no BINDINGS record,
+   bare $MVXDAEMON binds the whole account to lmdbnet -- deprecated (#327) and
+   warned about once, but kept because the operator chose it.  A line naming no
+   driver USED to mean the same thing; it does not any more, because nobody
+   chose that.  Returns 1 when bound, filling driver and params. */
 static int binding_for(const char *cspec, char *driver, size_t dcap,
                        char *params, size_t pcap) {
     const char *envd = getenv("MVXDAEMON");
@@ -632,6 +633,21 @@ static int binding_for(const char *cspec, char *driver, size_t dcap,
     FILE *fp = fopen(path, "r");
     if (!fp) {
         if (envd && envd[0]) {
+            /* THE WHOLE-ACCOUNT NETWORKED DEPLOYMENT (#327).  Kept, because the
+               operator chose it by setting $MVXDAEMON -- unlike a BINDINGS line
+               with no driver, which nobody chose and which no longer means this.
+               Said once per process: this is on the resolve path, so warning per
+               open would bury it in its own noise. */
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr,
+                        "mvx: warning: $MVXDAEMON binds this account to lmdbnet, "
+                        "which is deprecated (mvx#327) and will be removed. It "
+                        "pushes no filtering or sorting into the backend, so "
+                        "every WITH is filtered in the verb. Use postgres for a "
+                        "shared database; CONVERT-FILE moves a file.\n");
+            }
             char nsb[128];
             mvx_account_namespace(nsb, sizeof nsb);
             snprintf(driver, dcap, "lmdbnet");
@@ -694,7 +710,14 @@ static int binding_for(const char *cspec, char *driver, size_t dcap,
         snprintf(params, pcap, "@%s", cn);
         return 1;
     }
-    if (!ud[0]) ud = "lmdbnet";         /* default backend */
+    /* A LINE WITH NO DRIVER NAMES NOTHING (#327).  It used to mean lmdbnet at
+       $MVXDAEMON -- a networked backend, chosen by nobody, for a line that only
+       gives a file name.  A binding that says no driver is not a binding, so
+       fall through and let the file take the account's default like any other.
+       lmdbnet is being deprecated: it pushes nothing down, so every WITH streams
+       the whole id list to the verb and filters there, and unlike lmdb it pays
+       network latency to do it.  postgres answers those in SQL. */
+    if (!ud[0]) return 0;
     if (!up[0] && strcmp(ud, "lmdbnet") == 0)
         up = envd && envd[0] ? envd : "";
     if (strcmp(ud, "lmdbnet") == 0 && !up[0])
@@ -4205,12 +4228,41 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
     int ne = scandir(acct, &ents, NULL, alphasort);
     for (int i = 0; i < ne; i++) {
         const char *nm = ents[i]->d_name;
+        size_t nml = strlen(nm);
         if (nm[0] != '.' && strcmp(nm, "mvxdata.lmdb") != 0) {
             char p[4096];
             snprintf(p, sizeof p, "%s/%s", acct, nm);
             struct stat sb;
-            if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode))
-                FL_PUTS(nm, strlen(nm), "dir");
+            int isdir = stat(p, &sb) == 0 && S_ISDIR(sb.st_mode);
+            /* A LEGACY DICTIONARY DIRECTORY IS FURNITURE (#316).
+             *
+             * Before mvx#318 a directory file's dictionary was a sibling
+             * directory, <name>.DICT, and this pass listed it as a file of its
+             * own -- so every such file appeared twice and the count was wrong.
+             * New files have a hash dictionary, which fl_internal() already
+             * hides, so this is only ever an account made before that.
+             *
+             * THE CONDITION IS resolve()'s, EXACTLY: it answers <name>.DICT for
+             * a directory file when <name>.DICT is itself a directory, so the
+             * listing hides precisely what resolution calls the dictionary and
+             * the two cannot disagree.
+             *
+             * Which is also why an EXPORTED dictionary is still listed, and
+             * must be: `EXPORT DICT PARTS` writes a directory called PARTS.DICT
+             * as tracked source, and BUILD reads its %FILE% to learn what to
+             * create.  There the data half is absent or on a hash backend, so
+             * <name> is not a directory, the condition is false, and the export
+             * stays visible.  An earlier attempt at this filtered the suffix
+             * unconditionally and broke exactly that. */
+            if (isdir && nml > 5 && memcmp(nm + nml - 5, ".DICT", 5) == 0) {
+                char bp[4096];
+                size_t pl = strlen(p);          /* the PATH's length, not the
+                                                   name's -- p is acct/name */
+                snprintf(bp, sizeof bp, "%.*s", (int)(pl - 5), p);
+                struct stat bb;
+                if (stat(bp, &bb) == 0 && S_ISDIR(bb.st_mode)) isdir = 0;
+            }
+            if (isdir) FL_PUTS(nm, nml, "dir");
         }
         free(ents[i]);
     }
@@ -5161,6 +5213,19 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
                             "address (give one, or set $MVXDAEMON)\n");
             return 0;
         }
+        /* SAID ONCE, WHERE THE CHOICE IS MADE (#327).  lmdbnet pushes nothing
+           down -- no select_where, select_order, count_where, sum_where, join or
+           explain -- so every WITH streams the whole id list to the verb and
+           filters there, and unlike lmdb it pays network latency to do it.
+           postgres answers those in SQL and needs no code of ours.  At BIND
+           time, not on every open: a binding is recorded once and resolved for
+           ever, so this is the moment somebody can still choose differently. */
+        if (strcmp(drvname, "lmdbnet") == 0)
+            fprintf(stderr, "CREATE-FILE: lmdbnet is deprecated (mvx#327) and "
+                            "will be removed; it pushes no filtering or sorting "
+                            "into the backend. Use postgres for a shared "
+                            "database, or lmdb for a local one. Move an existing "
+                            "file with CONVERT-FILE %s postgres\n", cspec);
         /* The named backend may not be on this host — a clone of an account
            whose files were migrated elsewhere is the ordinary way to get here.
            Ask rather than abort, and bind to whatever is chosen so every later

@@ -104,9 +104,9 @@ The compiler and the environment are both well advanced. Highlights:
   set (all written in MVX BASIC), `EXECUTE` and a runtime privilege
   gate, packages with dependency manifests, full-screen terminal
   support, and git version control of records (branch/merge/cherry-pick
-  for multi-site delivery). A whole account round-trips through git: mvx-git (or mvx-convert-acct)
-  exports it to a legible directory form and rebuilds a clone into hash
-  files.
+  for multi-site delivery). A whole account round-trips through git:
+  mvx-git writes it out as a legible directory form and rebuilds a clone
+  into hash files, which mvx-git-adopt also does for a plain git checkout.
 
 ## Build
 

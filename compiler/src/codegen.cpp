@@ -1736,7 +1736,20 @@ private:
             b_.CreateCondBr(bad, errBB, doneBB);
             b_.SetInsertPoint(errBB);
             emitBlock(s.errorBody);
-            if (!b_.GetInsertBlock()->getTerminator()) b_.CreateBr(doneBB);
+            /* ASKED THE LONG WAY ROUND, AND IT HAS TO BE (mvx#337).
+               LLVM 23 redefined getTerminator() to assume the block is well
+               formed and return &InstList.back() regardless; with assertions
+               off that is the list sentinel, so `!getTerminator()` was always
+               false on an empty block, this branch was never emitted, and
+               every ON ERROR clause produced invalid IR.
+               LLVM 23 offers hasTerminator()/getTerminatorOrNull() for the
+               old meaning, but neither exists on 21, which CI builds against.
+               empty() + back().isTerminator() is what getTerminator() used to
+               do internally and compiles on both, so there is no version
+               test here. */
+            BasicBlock *cur = b_.GetInsertBlock();
+            if (cur->empty() || !cur->back().isTerminator())
+                b_.CreateBr(doneBB);
             b_.SetInsertPoint(doneBB);
             break;
         }
@@ -2858,9 +2871,16 @@ void CodeGen::run(const std::string &outPath) {
 
     std::string verifyErr;
     raw_string_ostream vos(verifyErr);
-    if (verifyModule(mod_, &vos))
+    if (verifyModule(mod_, &vos)) {
+        /* An internal error with nothing to look at is a day of guessing:
+           diagnosing mvx#337 meant patching this line in to see the block
+           the verifier was complaining about.  Behind a switch because the
+           dump is the whole module and a user hitting this wants the one
+           line, not ten thousand. */
+        if (getenv("MVX_DUMP_BAD_IR")) mod_.print(errs(), nullptr);
         report_fatal_error(Twine("internal error: invalid IR generated:\n") +
                            vos.str());
+    }
 
     // Target setup.
     InitializeNativeTarget();

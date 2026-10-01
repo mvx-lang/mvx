@@ -1055,6 +1055,33 @@ check tcl-bind-dir "$( \
   echo '--- with nothing named for the binding parameters'; \
   "$TCL" -a "$BDA" -c 'LISTF' 2>&1 | grep -c 'params')"
 
+# A FILE HELD BY lmdb IS LISTED ONCE (#307).
+#
+# FILELIST() asks each local backend what it holds and then asks the bindings
+# table, deduping the second against the first BY NAME.  LMDB 1.0 writes a
+# sub-database's name key WITH its terminating NUL where 0.9 wrote only the
+# characters, so the first pass offered `PARTS\0`, the second offered `PARTS`,
+# and nothing matched: the file was listed twice and carried a stray byte into
+# LISTF's columns.  The dedupe was already there -- a library upgrade walked
+# underneath it, which is why this is asserted and not assumed.
+#
+# Counted, not grepped for presence: the fault was a DUPLICATE, so a test that
+# only asks whether PARTS is listed passes while it is listed twice.
+BLA="$TESTROOT/bindlmdbacct"
+"$ROOT/scripts/mkaccount.sh" "$BLA" >/dev/null 2>&1
+check tcl-bind-lmdb-once "$( \
+  "$TCL" -a "$BLA" -c 'CREATE-FILE PARTS USING lmdb' 2>&1; \
+  echo '--- listed once, on lmdb'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | grep -ca '^PARTS'; \
+  echo '--- and the account holds it plus VOC, nothing more'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | grep -aE 'file\(s\)'; \
+  echo '--- with the dictionary kept out of the listing'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | grep -c 'DICT'; \
+  echo '--- and no unprintable byte anywhere in it'; \
+  "$TCL" -a "$BLA" -c 'LISTF' 2>&1 | tr -d '[:print:]\n' | wc -c | tr -d ' '; \
+  echo '--- the name reaching a verb is the name, so the file opens'; \
+  "$TCL" -a "$BLA" -c 'COUNT PARTS' 2>&1)"
+
 # A CONNECTION PROFILE IS REFUSED BY A DRIVER THAT CANNOT READ ONE (#319),
 # AND HONOURED BY ONE THAT CAN -- INCLUDING THE LOCAL ONES (#326).
 #
@@ -1236,6 +1263,152 @@ check tcl-dict-only "$( \
   echo '--- a file with both halves is still listed once'; \
   "$TCL" -a "$DCO" -c 'CREATE-FILE BOTHH' >/dev/null 2>&1; \
   "$TCL" -a "$DCO" -c 'LISTF' 2>&1 | grep -c 'BOTHH')"
+
+# A CONVERT KEEPS WHAT THE ACCOUNT PUT IN THE FILE'S POINTER (#322).
+#
+# Attributes 1 to 4 of a VOC file pointer are MVX's -- the type, the data
+# location, the dictionary location, and the options slot -- and attribute 5
+# onwards is the account's.  A convert is a DELETE and a CREATE, and the delete
+# took the whole record with it, so everything past MVX's own was quietly lost.
+# Nothing MVX wrote ever put anything there, which is why it went unnoticed;
+# mvx#318 gave attribute 4 a meaning and made the loss matter.
+#
+# Reproduced on the released binary before being called a regression: it loses
+# them there too, so this is long-standing rather than new.
+CVK="$TESTROOT/cvtkeep"
+"$ROOT/scripts/mkaccount.sh" "$CVK" >/dev/null 2>&1
+"$TCL" -a "$CVK" -c 'CREATE-FILE KEEPF' >/dev/null 2>&1
+cvkseed="$TESTROOT/cvkseed.b"
+cat > "$cvkseed" <<'EOF'
+OPEN "VOC" TO V ELSE STOP
+READ R FROM V,"KEEPF" THEN
+   R<5> = "the account put this here"
+   WRITE R ON V,"KEEPF"
+   PRINT "planted"
+END ELSE
+   PRINT "no pointer to plant on"
+END
+EOF
+"$MVX" "$cvkseed" -o "$TESTROOT/cvkseedbin" 2>/dev/null
+check tcl-convert-keeps-pointer "$( \
+  (cd "$CVK" && MVXACCOUNT=. "$TESTROOT/cvkseedbin" 2>&1); \
+  echo '--- the location before'; \
+  "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^002'; \
+  "$TCL" -a "$CVK" -c 'CONVERT-FILE KEEPF lmdb' 2>&1 | tail -1; \
+  echo '--- the location moved'; \
+  "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^002'; \
+  echo '--- and the account keeps its own'; \
+  "$TCL" -a "$CVK" -c 'CT VOC KEEPF' 2>&1 | grep -E '^005')"
+
+# A WHOLE ACCOUNT MOVES BACKEND IN ONE COMMAND (#335).
+#
+# Deprecating a driver otherwise reads "run CONVERT-FILE once for every file
+# you have", which is an invitation to miss one.  The three rules worth
+# asserting are the ones that are not obvious from the name:
+#
+#   A DIRECTORY FILE IS SKIPPED unless FROM dir names it.  The point of a dir
+#   file is that its records are OS files a person reads and git diffs, so the
+#   obvious command must do the useful thing and not the destructive one.
+#
+#   VOC GOES LAST.  Resolution starts there, so moving it mid-run would change
+#   where every later file is looked up under a loop still iterating.  Asserted
+#   from a FRESH process, which is the only thing that proves `voc =` was
+#   updated rather than the open handle still working.
+#
+#   CATALOG IS NEVER CONVERTED, not even by FROM dir, because the dispatcher
+#   reaches a cataloged verb by PATH -- converting it to a hash backend stops
+#   every verb in the account from running.  Asserted by RUNNING one afterwards,
+#   not by reading the listing: the listing cannot tell you the account still
+#   works.
+#
+# LISTONLY is checked by what did NOT happen -- the file is still on its old
+# backend afterwards.  A plan that prints correctly and converts anyway would
+# pass a test that only reads the plan.
+CAA="$TESTROOT/cvtaccount"
+"$ROOT/scripts/mkaccount.sh" "$CAA" >/dev/null 2>&1
+"$TCL" -a "$CAA" -c 'CREATE-FILE CAOLD USING lmdb' >/dev/null 2>&1
+"$TCL" -a "$CAA" -c 'CREATE-FILE CABP USING dir'   >/dev/null 2>&1
+mkdir -p "$CAA/BP"
+cat > "$CAA/BP/CASEED" <<'CAEOF'
+OPEN "CAOLD" TO F ELSE STOP "no CAOLD"
+FOR I = 1 TO 5
+   WRITE "row ":I ON F, "K":I
+NEXT I
+PRINT "caseed ran"
+CAEOF
+MVXPRIV=developer "$TCL" -a "$CAA" -c 'CATALOG BP CASEED' >/dev/null 2>&1
+MVXPRIV=developer "$TCL" -a "$CAA" -c 'CASEED' >/dev/null 2>&1
+check tcl-convert-account "$( \
+  echo '--- the plan, which changes nothing'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT sqlite LISTONLY' 2>&1; \
+  echo '--- so CAOLD is still where it was'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CAOLD'; \
+  echo '--- FROM names one backend and leaves the rest alone'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT lmdb FROM sqlite LISTONLY' 2>&1; \
+  echo '--- FROM and the target agreeing is nothing to do'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT lmdb FROM lmdb' 2>&1; \
+  echo '--- VOC moves, and it moves last'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT lmdb' 2>&1; \
+  echo '--- a FRESH process finds the moved VOC, and every record is still there'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^VOC'; \
+  "$TCL" -a "$CAA" -c 'COUNT CAOLD' 2>&1; \
+  echo '--- the whole account, VOC last again'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT sqlite' 2>&1; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CAOLD'; \
+  "$TCL" -a "$CAA" -c 'COUNT CAOLD' 2>&1; \
+  echo '--- the directory file was left alone throughout'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CABP'; \
+  echo '--- a wrong target converts nothing and says so once'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT nosuchdrv' 2>&1 \
+    | grep -E 'FAILED|stopping|target is wrong'; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CAOLD'; \
+  echo '--- FROM dir includes the source directories and still refuses CATALOG'; \
+  "$TCL" -a "$CAA" -c 'CONVERT-ACCOUNT sqlite FROM dir' 2>&1; \
+  "$TCL" -a "$CAA" -c 'LISTF' 2>&1 | grep -E '^CATALOG'; \
+  MVXPRIV=developer "$TCL" -a "$CAA" -c 'CASEED' 2>&1)"
+
+# A LEGACY DICTIONARY DIRECTORY IS FURNITURE; AN EXPORTED ONE IS NOT (#316).
+#
+# Before mvx#318 a directory file's dictionary was a sibling directory,
+# <name>.DICT, and the listing showed it as a file of its own -- so the file
+# appeared twice and the count was wrong.  New files have a hash dictionary,
+# which the listing already hides, so this only ever affects an account made
+# before that.
+#
+# THE TWO CASES SHARE A SPELLING AND MUST DIVERGE, which is why an earlier
+# attempt at this failed: filtering the suffix unconditionally also hid the
+# directory `EXPORT DICT` writes as tracked source, and BUILD reads its %FILE%
+# to learn what to create.  The condition is resolve()'s own -- <name>.DICT is
+# the dictionary when <name> is ALSO a directory -- so the listing hides exactly
+# what resolution calls the dictionary, and an export, whose data half is absent
+# or on a hash backend, stays visible.
+#
+# The legacy account is built with the PRE-#318 pointer form, because stage 3
+# reads the pointer first: with a modern pointer the dictionary is wherever that
+# says, and the directory beside it is not consulted at all.
+LGD="$TESTROOT/legacydict"
+"$ROOT/scripts/mkaccount.sh" "$LGD" >/dev/null 2>&1
+"$TCL" -a "$LGD" -c 'CREATE-FILE LEGF DIR' >/dev/null 2>&1
+mkdir -p "$LGD/LEGF.DICT"
+printf 'D\n1\n\nName\n20L\n' > "$LGD/LEGF.DICT/NAME"
+lgdseed="$TESTROOT/lgdseed.b"
+cat > "$lgdseed" <<'EOF'
+OPEN "VOC" TO V ELSE STOP
+R = "F":@AM:"LEGF":@AM:"LEGF.DICT"
+WRITE R ON V,"LEGF"
+PRINT "legacy pointer set"
+EOF
+"$MVX" "$lgdseed" -o "$TESTROOT/lgdseedbin" 2>/dev/null
+check tcl-legacy-dict "$( \
+  (cd "$LGD" && MVXACCOUNT=. "$TESTROOT/lgdseedbin" 2>&1); \
+  echo '--- the file is listed once, its dictionary not at all'; \
+  "$TCL" -a "$LGD" -c 'LISTF' 2>&1 | grep -c 'LEGF'; \
+  echo '--- and the dictionary still resolves, out of that directory'; \
+  "$TCL" -a "$LGD" -c 'CT DICT LEGF NAME' 2>&1 | grep -E '^004'; \
+  echo '--- an exported dictionary with no data half stays visible'; \
+  mkdir -p "$LGD/EXPORTED.DICT"; \
+  printf 'FILE\375dir\n' > "$LGD/EXPORTED.DICT/%FILE%"; \
+  "$TCL" -a "$LGD" -c 'LISTF' 2>&1 | grep -c 'EXPORTED.DICT')"
 
 # An account records which transport it uses (#187): `driver` for a file
 # nothing else placed, and `voc` for VOC itself.  VOC needs its own because it
@@ -1837,7 +2010,7 @@ RGEOF
 
   # #58: an account that is a subdirectory of a larger repo (it has a .mvx but
   # no .git of its own) is tracked by that repo — mvx-git forwards to it and
-  # never creates a nested .git; the account is rebuilt with mvx-convert-acct
+  # never creates a nested .git; the account is rebuilt with mvx-git-adopt
   # (or an mvx-git clone) instead.
   MGSUB="$TESTROOT/mgsub"
   mkdir -p "$MGSUB/acct/BP"
@@ -5399,8 +5572,16 @@ EXECUTE "OE3" RETURNING RC ON ERROR
 END
 PRINT "stop: rc=":RC
 OEEOF
+# Reported, not swallowed.  When mvx#337 stopped ON ERROR from compiling, the
+# discarded output left every assertion below failing with "./CATALOG/OESTOP:
+# No such file or directory" -- a missing-file error two steps from a compiler
+# fault, which is the wrong thing to go looking at.
 for v in OEAB OEOK OE3 OESHELL OEBARE OESTOP; do
-  MVXPRIV=developer "$TCL" -a "$OEA" -c "CATALOG BP $v" >/dev/null 2>&1
+  oecat="$(MVXPRIV=developer "$TCL" -a "$OEA" -c "CATALOG BP $v" 2>&1)"
+  case "$oecat" in
+    *"compilation of"*|*"invalid IR"*|*rror*)
+      FAIL=$((FAIL + 1)); echo "FAIL on-error catalog $v: $oecat" ;;
+  esac
 done
 
 shout="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OESHELL 2>&1)"
@@ -5432,6 +5613,31 @@ stop: rc=3" ]; then
   PASS=$((PASS + 1)); echo "  a non-zero STOP is a status, not an error"
 else
   FAIL=$((FAIL + 1)); echo "FAIL on-error stop: [$stopout]"
+fi
+
+# AN EMPTY ON ERROR CLAUSE STILL COMPILES (mvx#337).
+#
+# Swallowing the abort and carrying on is a legitimate thing to write, and it
+# is the case that exposes whether codegen closes the error block: there is
+# nothing in the block to close it by accident.  Every fixture above has a
+# body, which is why all of them passed while `getTerminator()` silently
+# stopped answering the question the compiler was asking it.
+#
+# Asserted as a COMPILE, not a run: the fault was invalid IR, and the verifier
+# rejects it before anything can be executed.
+printf 'EXECUTE "OEAB" ON ERROR\nEND\nPRINT "swallowed"\n' > "$OEA/BP/OEEMPTY"
+emptyout="$(MVXPRIV=developer "$TCL" -a "$OEA" -c 'CATALOG BP OEEMPTY' 2>&1)"
+emptyrun="$(cd "$OEA" && MVXPRIV=developer MVXACCOUNT=. ./CATALOG/OEEMPTY 2>&1)"
+case "$emptyout$emptyrun" in
+  *"invalid IR"*|*"failed"*) emptyok=0 ;;
+  *swallowed*)               emptyok=1 ;;
+  *)                         emptyok=0 ;;
+esac
+if [ "$emptyok" = 1 ]; then
+  PASS=$((PASS + 1)); echo "  an empty ON ERROR clause compiles and swallows the abort"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL on-error empty: [$emptyout] [$emptyrun]"
 fi
 
 # ---------------------------------------------------------------------------
@@ -6009,10 +6215,16 @@ mklgc bothway; printf 'PA\nDISPLAY a\n' > "$LGC/bothway/VOC/bothway"
 mklgc plainlg; printf 'PA\nDISPLAY b\n' > "$LGC/plainlg/VOC/LOGIN"
 mklgc verbnam; printf 'V\nCATALOG/verbnam\n' > "$LGC/verbnam/VOC/verbnam"
 
-lc1="$(MVXPRIV=developer "$CONV" "$LGC/uvstyle" 2>&1 | grep -c "named")"
+# lc1 GREPS THE PROGRAM'S OWN NAME, not just the words of the complaint.
+# The only places the name was asserted were lc3/lc4 below, which check it is
+# ABSENT -- so when the tool was renamed mvx-convert-acct -> mvx-git-adopt the
+# messages kept the old name, every assertion here still passed, and the suite
+# held the stale name in place for five releases (mvx#339).  An absence check
+# cannot notice a name going out of date; this one can.
+lc1="$(MVXPRIV=developer "$CONV" "$LGC/uvstyle" 2>&1 | grep -c "mvx-git-adopt: this account's login")"
 lc2="$(MVXPRIV=developer "$CONV" "$LGC/bothway" 2>&1 | grep -c "BOTH")"
-lc3="$(MVXPRIV=developer "$CONV" "$LGC/plainlg" 2>&1 | grep -c "mvx-convert-acct:")"
-lc4="$(MVXPRIV=developer "$CONV" "$LGC/verbnam" 2>&1 | grep -c "mvx-convert-acct:")"
+lc3="$(MVXPRIV=developer "$CONV" "$LGC/plainlg" 2>&1 | grep -c "mvx-git-adopt:")"
+lc4="$(MVXPRIV=developer "$CONV" "$LGC/verbnam" 2>&1 | grep -c "mvx-git-adopt:")"
 
 if [ "$lc1" -ge 1 ]; then
   PASS=$((PASS + 1)); echo "  a UniVerse-style account-named login is reported"

@@ -1,6 +1,6 @@
 # VOC is a hash (LMDB) file and BP a directory file — see each
 # X.DICT/%FILE%.  The live LMDB store holds the hash files and is rebuilt
-# from the tracked legible form (mvx-convert-acct), so it — along with the
+# from the tracked legible form (mvx-git-adopt), so it — along with the
 # compiled objects and the cataloged binary — is derived and not versioned.
 mvxdata.lmdb
 BP.O/
