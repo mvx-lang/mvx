@@ -2875,6 +2875,52 @@ if [ -n "${MVX_PG:-}" ]; then
     printf 'COUNT ORDERS\nSELECT ORDERS\nLIST ORDERS\n' | \
       "$TCL" -a "$PGACCT" 2>&1)"
 
+  # A BACKEND REFUSES A BAD CREDENTIAL (mvx#345).
+  #
+  # Nothing asserted this after mvx#327 took the daemon.  tcl-auth proved both
+  # directions -- the right token read and wrote, the wrong one was denied --
+  # and only the positive direction survived in the backends that remain, which
+  # is the half that cannot catch authentication silently doing nothing.
+  #
+  # BOTH DIRECTIONS IN ONE CHECK, deliberately.  A wrong-password test on its
+  # own passes just as well when the server is unreachable, the driver is
+  # missing or the whole block is misconfigured -- it asserts a failure, and
+  # everything fails.  Pairing it with the good password in the same check
+  # means the refusal only counts when a correct credential is demonstrably
+  # working against the same server a line earlier.
+  printf 'SET-CONNECTION pgbad driver=postgres address=%s dbname=%s user=%s password=wrong-%s namespace=mvxtest\n' \
+    "$PG_ADDR" "$PG_DB" "$PG_USER" "$PG_PASS" | "$TCL" -a "$PGACCT" >/dev/null 2>&1
+  # A REAL FILE to read through the bad profile.  Reading one that does not
+  # exist fails whatever the credential, so it would assert nothing.
+  printf 'AUTHF @pgtest\n' >> "$PGACCT/BINDINGS"
+  "$TCL" -a "$PGACCT" -c 'DELETE-FILE AUTHF' >/dev/null 2>&1
+  "$TCL" -a "$PGACCT" -c 'CREATE-FILE AUTHF USING @pgtest' >/dev/null 2>&1
+  printf 'OPEN "AUTHF" TO F ELSE STOP\nWRITE "x" ON F,"A1"\n' > "$TESTROOT/pgauth.b"
+  "$MVX" "$TESTROOT/pgauth.b" -o "$TESTROOT/pgauthbin" 2>/dev/null
+  (cd "$PGACCT" && MVXACCOUNT=. "$TESTROOT/pgauthbin")
+  # Answers, not line counts: how MANY lines a driver spends on a refusal is
+  # the driver's business and changes without the behaviour changing.
+  check tcl-pg-authfail "$( \
+    echo '--- the right password works, against this very server'; \
+    "$TCL" -a "$PGACCT" -c 'COUNT ORDERS' 2>&1; \
+    echo '--- the wrong one is refused'; \
+    if "$TCL" -a "$PGACCT" -c 'CREATE-FILE NOPE USING @pgbad' 2>&1 \
+         | grep -qiE "password|authentication|fail|refus|cannot"; \
+      then echo refused; else echo "NOT REFUSED"; fi; \
+    echo '--- and no file was left behind for it'; \
+    if "$TCL" -a "$PGACCT" -c 'LISTF' 2>&1 | grep -qa "^NOPE"; \
+      then echo "LEFT BEHIND"; else echo "no file"; fi; \
+    echo '--- and a file that DOES exist cannot be read through it'; \
+    sed -i.bak "s#^AUTHF @pgtest\$#AUTHF @pgbad#" "$PGACCT/BINDINGS"; \
+    rm -f "$PGACCT/BINDINGS.bak"; \
+    if "$TCL" -a "$PGACCT" -c 'COUNT AUTHF' 2>&1 \
+         | grep -qiE "^[0-9]+ record"; \
+      then echo "READ SUCCEEDED"; else echo "read refused"; fi; \
+    sed -i.bak "s#^AUTHF @pgbad\$#AUTHF @pgtest#" "$PGACCT/BINDINGS"; \
+    rm -f "$PGACCT/BINDINGS.bak"; \
+    echo '--- which is the credential, not the file: the good profile reads it'; \
+    "$TCL" -a "$PGACCT" -c 'COUNT AUTHF' 2>&1)"
+
   # TRANS() JOIN push-down (#40 phase 2): a WITH filter on a TRANS I-type,
   # with source and target co-located on the same Postgres, compiles to one
   # JOIN — the filter runs server-side, only matching ids return. Result must
