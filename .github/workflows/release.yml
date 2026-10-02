@@ -254,8 +254,8 @@ jobs:
                 # a driver may, because a driver whose client library is absent
                 # is skipped and mvx runs on without that backend.  libpq in
                 # particular is coupled to somebody else's server version and
-                # is the host's to choose.  (liblmdb is not in this list:
-                # mvx-lmdbd links it and an executable does not degrade.)
+                # is the host's to choose.  (liblmdb is not in this list: it
+                # is linked by the lmdb driver, which the same rule covers.)
                 libpq.so.*|libsqlite3.so.*) continue ;;
                 # Ours, installed above.
                 libmvx*) continue ;;
@@ -306,7 +306,7 @@ jobs:
       - name: Assert the drivers that must ship
         run: |
           miss=
-          for d in dir lmdb lmdbnet postgres sqlite; do
+          for d in dir lmdb postgres sqlite; do
             [ -f "stage/mvx-lang/lib/libmvxdrv_$d.so" ] || miss="$miss $d"
           done
           ls stage/mvx-lang/lib/
@@ -609,18 +609,6 @@ jobs:
           tags: |
             ghcr.io/mvx-lang/mvx:${{ steps.v.outputs.tag }}
             ghcr.io/mvx-lang/mvx:latest
-
-      - name: Daemon image (ghcr.io/mvx-lang/mvx-lmdbd)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.lmdbd
-          build-args: BASE=ghcr.io/mvx-lang/mvx:${{ steps.v.outputs.tag }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/mvx-lang/mvx-lmdbd:${{ steps.v.outputs.tag }}
-            ghcr.io/mvx-lang/mvx-lmdbd:latest
 
       - name: Demo image (ghcr.io/mvx-lang/mvx-demo)
         uses: docker/build-push-action@v6

@@ -13,10 +13,11 @@
 * its own is how a SHARED dictionary is made -- several files can name it, and
 * then one set of D-items serves all of them -- and data on its own is how a
 * file borrows someone else's.  With neither word, both halves are made.
-* The file's backend is decided at creation: a directory file, a
-* local LMDB file (the default), or a file on another driver
-* (lmdbnet, and later postgres/mongo) bound in the account's BINDINGS
-* record. For lmdbnet the connection defaults to $MVXDAEMON.
+* The file's backend is decided at creation: a directory file, a local
+* hash file on the account's default backend, or a file on a named driver
+* (sqlite, postgres, mongo, mysql) bound in the account's BINDINGS
+* record.  A networked driver takes a connection profile -- `USING
+* @salesdb` -- so the address lives in one local place.
 S = TRIM(SENTENCE())
 USAGE = "usage: CREATE-FILE {DICT|DATA} name {DIR | DIRECTORY | USING driver {connection}}"
 HALF = ""

@@ -486,8 +486,9 @@ int     mvx_cred_lookup(const char *driver, const char *target,
                         const char *key, const char *field, char *out,
                         size_t outlen);
 
-/* The account's default daemon namespace (basename of MVXACCOUNT); used
-   by the store and the lmdbnet driver.  See mvx_store.c. */
+/* The account's own namespace (basename of MVXACCOUNT): mongo takes it as
+   the database, postgres as the schema, messaging as the port prefix.  See
+   mvx_store.c. */
 void    mvx_account_namespace(char *out, size_t outlen);
 
 /* Named connection profiles, .mvx-private/connections (see mvx_conn.c).

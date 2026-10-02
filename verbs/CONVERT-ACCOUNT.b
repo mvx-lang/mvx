@@ -18,8 +18,8 @@
 * "run CONVERT-FILE once for every file you have", which invites missing
 * one.
 *
-* FROM is the deprecation case: convert what is on lmdbnet and leave the
-* rest alone.  LISTONLY prints the plan and changes nothing -- a
+* FROM is the deprecation case: convert what is on the backend being
+* retired and leave the rest alone.  LISTONLY prints the plan and changes nothing -- a
 * whole-account conversion is not something to learn the shape of by
 * running it.
 *

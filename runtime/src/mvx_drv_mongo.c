@@ -21,7 +21,7 @@
  * database and each file to a collection.  The connection is a named profile
  * (BINDINGS `ORDERS @mongomain`, .mvx-private/connections carries
  * driver/address/namespace/user/password) — the same indirection the postgres
- * and lmdbnet drivers use, or a raw mongodb:// URI.
+ * and postgres drivers use, or a raw mongodb:// URI.
  *
  * Beyond the minimal contract this driver also provides, in *mirror* mode
  * (the record blob stays authoritative; the columns are a derived projection):

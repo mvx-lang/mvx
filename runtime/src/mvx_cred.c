@@ -25,7 +25,7 @@
  * spaces and other characters (a CI step can write an arbitrary GitHub
  * Actions secret verbatim):
  *
- *     lmdbnet  mvxdb-a:4300  SALES  token=abc123
+ *     mongo    mvxdb-a:27017 SALES  token=abc123
  *     postgres db:5432       mvx    user=app
  *     postgres db:5432       mvx    password=p@ss w0rd :/@
  *

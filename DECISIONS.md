@@ -84,9 +84,31 @@
   no list is active, falling back to a scan; the result feeds the same
   select-list machinery either way.
 
-## Networked daemon (ARCHITECTURE.md 4.3)
+## Networked daemon (ARCHITECTURE.md 4.3) — REVERSED (mvx#327)
 
-- **mvx-lmdbd owns its LMDB environment exclusively** and serialises client
+> **This whole section was undone.** `lmdbnet`, `mvx-lmdbd` and
+> `mvx-lmdbd-admin` were removed after v0.6.0 and nothing replaced them as a
+> *daemon*: `postgres` answers the same need with no code of ours. The
+> reason was pushdown. `lmdbnet` supplied none of `select_where`,
+> `select_order`, `count_where`, `sum_where`, `select_join` or `explain`, so
+> every `WITH` streamed the whole id list to the verb and filtered it there
+> — and unlike embedded `lmdb` it paid network latency to do so. That is the
+> worst of both.
+>
+> Kept from it: the poll-loop daemon pattern, which `daemon/mvx_msgd.c` was
+> forked from; the optional `lock`/`unlock` driver slots, which a SQL backend
+> can answer with advisory locks; and `mvx_account_namespace()`, which mongo
+> takes as its database and postgres as its schema.
+>
+> Lost with it: a backend arbitrating record locks across sessions (the
+> process-local lock table applies to every driver now), and bearer-token
+> rejection at the backend, which the suite could exercise offline because
+> the daemon shipped with us. Recorded on mvx#327.
+>
+> What follows is the record of what was decided, left standing because the
+> reasoning is why the pieces above are shaped as they are.
+
+- **mvx-lmdbd owned its LMDB environment exclusively** and serialises client
   access over unix-socket or TCP; a file is either embedded-access or
   daemon-owned, never both. The daemon speaks raw record bytes — MV
   semantics stay in the client runtime — and links only liblmdb.
@@ -100,7 +122,8 @@
   transport is a property of the driver, not a separate axis. Params
   are opaque to the runtime, carried in the driver-level spec as
   "params\nspec" and parsed by the driver. Bare `$MVXDAEMON` with no
-  BINDINGS record binds the whole account to lmdbnet. LISTF shows each
+  BINDINGS record bound the whole account to lmdbnet (removed in two steps:
+  the default went in v0.6.0, the driver in the release after it). LISTF shows each
   file's driver by name. The daemon address travels inside the
   driver-level spec ("addr\nspec"), so lock keys and index metadata
   stay distinct across daemons, and `lmdbnet` keeps one connection
@@ -279,7 +302,7 @@ parent columns and child rows — is already atomic) across statements.
   the way to give up deliberately.
 - **A backend with no bracket refuses the write and says so.** `sqlite`,
   `postgres` and `mysql` implement `bulk_begin`/`bulk_commit`/`rollback`;
-  `dir`, `lmdb`, `lmdbnet` and `mongo` do not. A write to one of those inside
+  `dir`, `lmdb` and `mongo` do not. A write to one of those inside
   a transaction is diagnosed on stderr and fails — soft under `ON ERROR`,
   fatal without. A transaction must never be silently downgraded to a series
   of independent writes, because the program has already been told it has one.

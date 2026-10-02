@@ -2,9 +2,9 @@
 *
 * This is the guard on the invariant the whole feature rests on: a missing
 * mvx-msgd must cost a program nothing.  Every phase-1 test runs without a
-* daemon, so if anyone ever makes the client fatal -- the way the lmdbnet
-* driver is fatal when its daemon goes, which is right for storage and
-* catastrophic here -- this file fails first and loudest.
+* daemon, so if anyone ever makes the client fatal -- which is right for a
+* storage driver losing its database and catastrophic here -- this file
+* fails first and loudest.
 PRINT "port=":@USERNO
 S = MSGSTATUS()
 PRINT "state=":S<1,1>
