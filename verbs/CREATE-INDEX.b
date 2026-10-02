@@ -44,13 +44,38 @@ IF NUM(DI<2>) = 0 OR DI<2> < 1 THEN
    STOP
 END
 READ XL FROM DC, "%INDEXES%" ELSE XL = ""
+ADDED = 0
 LOCATE(IT, XL; POS) ELSE
    XL<-1> = IT
    WRITE XL ON DC, "%INDEXES%"
+   ADDED = 1
 END
 N = INDEXBUILD(F, IT)
-IF N < 0 THEN
-   PRINT "index build failed (backend without index capability?)"
-END ELSE
-   PRINT "index ":FN:".":IT:" built, ":N:" record(s)"
+* A FAILED BUILD MUST NOT LEAVE THE ITEM LISTED (mvx#347).  %INDEXES% is
+* written before the build, because the runtime reads it to learn which
+* item it is building -- and nothing took it back out again, so a build
+* that failed still left LIST-INDEXES reporting an index that exists in no
+* backend.  Measured on MariaDB: `CITY / 1 index(es)` against a table whose
+* only key was PRIMARY.  Only what this run added is removed; an index that
+* was already there is not disturbed by a failure to rebuild it.
+IF N < 0 AND ADDED THEN
+   READ XL2 FROM DC, "%INDEXES%" THEN
+      LOCATE(IT, XL2; P2) THEN
+         XL2 = DELETE(XL2, P2, 0, 0)
+         WRITE XL2 ON DC, "%INDEXES%"
+      END
+   END
 END
+BEGIN CASE
+CASE N >= 0
+   PRINT "index ":FN:".":IT:" built, ":N:" record(s)"
+CASE N = -2
+   * The backend says it cannot index THIS KIND of field.  Not a fault, and
+   * not something to retry: say what still works so the reader does not go
+   * looking for a broken driver.
+   PRINT FN:".":IT:" cannot be indexed by this backend"
+   PRINT "the query still works -- the filter runs in the backend or the"
+   PRINT "verb, unindexed, so only speed is lost"
+CASE 1
+   PRINT "index build failed (backend without index capability?)"
+END CASE
