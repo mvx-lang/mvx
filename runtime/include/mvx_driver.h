@@ -116,9 +116,11 @@ typedef struct mvx_driver {
     int (*index_drop)(mvx_file *f, const char *item);
 
     /* Optional lock authority (may be NULL): a backend that arbitrates
-       between sessions (the mvx-lmdbd daemon) grants and releases record
-       locks itself; lock returns 0 while another session holds it.
-       When NULL, the runtime's process-local lock table applies. */
+       between sessions grants and releases record locks itself; lock
+       returns 0 while another session holds it.  When NULL, the runtime's
+       process-local lock table applies, which coordinates within one
+       process only.  postgres answers these with session-level advisory
+       locks (mvx#16); the embedded and directory backends do not. */
     int (*lock)(mvx_file *f, const char *id, int64_t idlen);
     int (*unlock)(mvx_file *f, const char *id, int64_t idlen);
 

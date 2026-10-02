@@ -1,13 +1,13 @@
-credential stored: lmdbnet mvxdb-a:4300 SALES
+credential stored: mongo mvxdb-a:27017 SALES
 credential stored: postgres db:5432 mvx
 driver     target             key        fields
-lmdbnet mvxdb-a:4300 SALES token=****
+mongo mvxdb-a:27017 SALES token=****
 postgres db:5432 mvx user=****
 postgres db:5432 mvx password=****
 3 credential(s)
-credential stored: lmdbnet mvxdb-a:4300 SALES
+credential stored: mongo mvxdb-a:27017 SALES
 driver     target             key        fields
 postgres db:5432 mvx user=****
 postgres db:5432 mvx password=****
-lmdbnet mvxdb-a:4300 SALES token=****
+mongo mvxdb-a:27017 SALES token=****
 3 credential(s)

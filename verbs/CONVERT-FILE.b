@@ -14,7 +14,7 @@
 * CONVERT-FILE file newtype {connection} — change one file's storage
 * backend, moving its records and dictionary into the new one.  Types
 * are the driver names LISTF shows: "lmdb" (local hash file), "dir" (a
-* legible directory file), or a driver such as "lmdbnet" with a
+* legible directory file), or a driver such as "postgres" with a
 * connection.  The records are re-keyed into the new backend verbatim,
 * so a hash file converts to and from a directory file (and back)
 * without loss; the dictionary comes across too, but the %FILE% control
@@ -26,7 +26,7 @@ NT = FIELD(S, " ", 3)
 CONN = TRIM(FIELD(S, " ", 4, 99))
 IF FN = "" OR NT = "" THEN
    PRINT "usage: CONVERT-FILE file newtype {connection}"
-   PRINT "       newtype: lmdb | dir | <driver> (e.g. lmdbnet)"
+   PRINT "       newtype: lmdb | dir | <driver> (e.g. postgres)"
    STOP
 END
 OPEN FN TO SRC ELSE

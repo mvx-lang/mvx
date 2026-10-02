@@ -943,10 +943,10 @@ check tcl-map "$(printf '%s\n' \
 # account credential store (.mvx-private): set/list with values masked,
 # and upsert replacing an existing entry in place
 check tcl-cred "$(printf '%s\n' \
-  'SET-CREDENTIAL lmdbnet mvxdb-a:4300 SALES token=abc123' \
+  'SET-CREDENTIAL mongo mvxdb-a:27017 SALES token=abc123' \
   'SET-CREDENTIAL postgres db:5432 mvx user=app password=s3cret' \
   'LIST-CREDENTIALS' \
-  'SET-CREDENTIAL lmdbnet mvxdb-a:4300 SALES token=NEWTOK' \
+  'SET-CREDENTIAL mongo mvxdb-a:27017 SALES token=NEWTOK' \
   'LIST-CREDENTIALS' | tclrun)"
 
 # record verbs + ED scripted session
@@ -2462,84 +2462,6 @@ EOF
 check tcl-session "$(cd "$ACCT" && \
   MVXACCOUNT=. MVXSESSION="$TESTROOT/sess" "$TESTROOT/progsel" 2>&1)"
 
-# the networked daemon: same account flow through mvx-lmdbd, plus the lock
-# lease (holder dies without releasing; next session proceeds)
-DSOCK="/tmp/mvx-lmdbd-test-$$.sock"
-DACCT="$TESTROOT/dacct"
-mkdir -p "$DACCT"
-"$ROOT/build/bin/mvx-lmdbd" -d "$TESTROOT/ddata" -s "$DSOCK" 2>/dev/null &
-DPID=$!
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  [ -S "$DSOCK" ] && break
-  sleep 0.1
-done
-dlock="$TESTROOT/dlock.b"
-cat > "$dlock" <<'EOF'
-OPEN "PARTS" TO F ELSE STOP
-READU R FROM F, "W100" THEN PRINT "locked, exiting without RELEASE"
-EOF
-"$MVX" "$dlock" -o "$TESTROOT/dlockbin" 2>/dev/null
-check tcl-daemon "$( \
-  export MVXDAEMON="$DSOCK"; \
-  "$TCL" -a "$DACCT" -c "CREATE-FILE VOC" >/dev/null 2>&1; \
-  printf 'CREATE-FILE PARTS\n' | "$TCL" -a "$DACCT" 2>&1; \
-  (cd "$DACCT" && MVXACCOUNT=. MVXDAEMON="$DSOCK" "$TESTROOT/seedbin"); \
-  printf 'LIST PARTS NAME COLOR\nCREATE-INDEX PARTS COLOR\nLIST PARTS NAME WITH COLOR = blue\nLISTF\n' | \
-    "$TCL" -a "$DACCT" 2>&1; \
-  (cd "$DACCT" && MVXACCOUNT=. MVXDAEMON="$DSOCK" "$TESTROOT/dlockbin"); \
-  (cd "$DACCT" && MVXACCOUNT=. MVXDAEMON="$DSOCK" "$TESTROOT/dlockbin"); \
-  unset MVXDAEMON)"
-# mixed local/remote: per-file REMOTE binding with an explicit daemon
-# address and NO $MVXDAEMON - locals stay local, the bound file goes
-# through the daemon, one program reads both
-MACCT="$TESTROOT/mixacct"
-mkdir -p "$MACCT"
-"$TCL" -a "$MACCT" -c "CREATE-FILE VOC" >/dev/null 2>&1
-mixprog="$TESTROOT/mix.b"
-cat > "$mixprog" <<'MIXEOF'
-OPEN "LOCALF" TO L ELSE STOP
-WRITE "local data" ON L, "L1"
-OPEN "SHARED" TO R ELSE STOP
-WRITE "remote data" ON R, "R1"
-READ A FROM L, "L1" THEN PRINT "local read: ":A
-READ B FROM R, "R1" THEN PRINT "remote read: ":B
-MIXEOF
-"$MVX" "$mixprog" -o "$TESTROOT/mixbin" 2>/dev/null
-check tcl-mixed "$( \
-  printf "CREATE-FILE LOCALF\nCREATE-FILE SHARED USING lmdbnet $DSOCK\nLISTF\n" | \
-    "$TCL" -a "$MACCT" 2>&1 | sed "s#$DSOCK#@DSOCK@#g"; \
-  (cd "$MACCT" && MVXACCOUNT=. "$TESTROOT/mixbin"); \
-  printf 'LISTF\n' | "$TCL" -a "$MACCT" 2>&1)"
-
-# namespace isolation: two accounts (nsa, nsb) with different names share
-# ONE daemon; the same file name ORDERS holds different data in each and
-# is mutually invisible.  A third account (nsc) names nsa's namespace
-# explicitly in BINDINGS and reads nsa's data — the Q-pointer analog.
-NSA="$TESTROOT/nsa"; NSB="$TESTROOT/nsb"; NSC="$TESTROOT/nsc"
-mkdir -p "$NSA" "$NSB" "$NSC"
-printf 'OPEN "ORDERS" TO F ELSE STOP\nWRITE "from A" ON F, "O1"\n' > "$TESTROOT/wa.b"
-printf 'OPEN "ORDERS" TO F ELSE STOP\nWRITE "from B" ON F, "O1"\n' > "$TESTROOT/wb.b"
-printf 'OPEN "ORDERS" TO F ELSE STOP\nREAD V FROM F, "O1" THEN PRINT V ELSE PRINT "(none)"\n' > "$TESTROOT/rd.b"
-"$MVX" "$TESTROOT/wa.b" -o "$TESTROOT/wa" 2>/dev/null
-"$MVX" "$TESTROOT/wb.b" -o "$TESTROOT/wb" 2>/dev/null
-"$MVX" "$TESTROOT/rd.b" -o "$TESTROOT/rd" 2>/dev/null
-check tcl-namespace "$( \
-  export MVXDAEMON="$DSOCK"; \
-  "$TCL" -a "$NSA" -c "CREATE-FILE VOC" >/dev/null 2>&1; \
-  "$TCL" -a "$NSA" -c "CREATE-FILE ORDERS" >/dev/null 2>&1; \
-  "$TCL" -a "$NSB" -c "CREATE-FILE VOC" >/dev/null 2>&1; \
-  "$TCL" -a "$NSB" -c "CREATE-FILE ORDERS" >/dev/null 2>&1; \
-  (cd "$NSA" && MVXACCOUNT=. "$TESTROOT/wa"); \
-  (cd "$NSB" && MVXACCOUNT=. "$TESTROOT/wb"); \
-  printf 'A reads: '; (cd "$NSA" && MVXACCOUNT=. "$TESTROOT/rd"); \
-  printf 'B reads: '; (cd "$NSB" && MVXACCOUNT=. "$TESTROOT/rd"); \
-  unset MVXDAEMON; \
-  printf 'ORDERS lmdbnet %s nsa\n' "$DSOCK" > "$NSC/BINDINGS"; \
-  printf 'C via nsa: '; (cd "$NSC" && MVXACCOUNT=. "$TESTROOT/rd") )"
-
-kill $DPID 2>/dev/null
-rm -f "$DSOCK"
-
 # the session registry (mvx#226): ports, the roster, and the lease.  Offline
 # and deterministic -- ports are allocated lowest-free, so a fresh daemon
 # always hands out 1, 2, 3 -- and sessions are never run in parallel.
@@ -2878,47 +2800,29 @@ PRINT "sent=":X
 fi
 rm -f "$MSOCK" "$TESTROOT/mfifo"
 
-# daemon authentication: mvx-lmdbd-admin provisions a namespace token
-# (offline, into <datadir>/accounts); a client with the token in
-# .mvx-private reads/writes, a client with the wrong token is denied.
-ADATA="$TESTROOT/adata"; ASOCK="/tmp/mvx-auth-test-$$.sock"
-AACCT="$TESTROOT/aacct"; BACCT="$TESTROOT/bacct"
-mkdir -p "$AACCT/.mvx-private" "$BACCT/.mvx-private"
-chmod 700 "$AACCT/.mvx-private" "$BACCT/.mvx-private"
-ATOK="$("$ROOT/build/bin/mvx-lmdbd-admin" -d "$ADATA" create-account acct1 2>/dev/null)"
-"$ROOT/build/bin/mvx-lmdbd" -d "$ADATA" -s "$ASOCK" 2>/dev/null &
-APID=$!
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  [ -S "$ASOCK" ] && break
-  sleep 0.1
-done
-printf 'lmdbnet %s acct1 token=%s\n' "$ASOCK" "$ATOK" > "$AACCT/.mvx-private/credentials"
-printf 'ORDERS lmdbnet %s acct1\n' "$ASOCK" > "$AACCT/BINDINGS"
-printf 'lmdbnet %s acct1 token=deadbeefwrong\n' "$ASOCK" > "$BACCT/.mvx-private/credentials"
-printf 'ORDERS lmdbnet %s acct1\n' "$ASOCK" > "$BACCT/BINDINGS"
-chmod 600 "$AACCT/.mvx-private/credentials" "$BACCT/.mvx-private/credentials"
+# NAMED CONNECTION PROFILES: the committed binding names the profile, not the
+# database (#290, #326).  SET-CONNECTION writes it, LIST-CONNECTIONS masks the
+# secret fields, BINDINGS records `@conn1`, and a program reads and writes
+# through it.
+#
+# Against sqlite, because the daemon this used to run against is gone (#327).
+# That costs the one thing sqlite has no equivalent for -- a backend REFUSING a
+# client whose token is wrong, which mvx-lmdbd arbitrated and no remaining
+# driver can be made to do offline.  The profile mechanism itself is covered
+# either way; bearer-token rejection is not covered any more, and is recorded
+# on #327 rather than left to be noticed.
+CACCT="$TESTROOT/cacct"; mkdir -p "$CACCT" "$TESTROOT/connvol"
 printf 'OPEN "ORDERS" TO F ELSE STOP\nWRITE "hi" ON F, "O1"\nREAD V FROM F, "O1" THEN PRINT "read: ":V\n' > "$TESTROOT/wauth.b"
-printf 'OPEN "ORDERS" TO F ELSE PRINT "denied"\n' > "$TESTROOT/rauth.b"
 "$MVX" "$TESTROOT/wauth.b" -o "$TESTROOT/wauth" 2>/dev/null
-"$MVX" "$TESTROOT/rauth.b" -o "$TESTROOT/rauth" 2>/dev/null
-check tcl-auth "$( \
-  "$TCL" -a "$AACCT" -c "CREATE-FILE ORDERS" 2>&1 | sed "s#$ASOCK#@SOCK@#g"; \
-  (cd "$AACCT" && MVXACCOUNT=. "$TESTROOT/wauth"); \
-  printf 'wrong token: '; (cd "$BACCT" && MVXACCOUNT=. "$TESTROOT/rauth" 2>/dev/null); \
-  "$ROOT/build/bin/mvx-lmdbd-admin" -d "$ADATA" list-accounts)"
-
-# named connection profiles: BINDINGS references @conn1, and the host +
-# namespace + token live in the local connection profile — so the
-# committed binding never names the daemon.
-CTOK="$("$ROOT/build/bin/mvx-lmdbd-admin" -d "$ADATA" create-account connns 2>/dev/null)"
-CACCT="$TESTROOT/cacct"; mkdir -p "$CACCT"
 check tcl-conn "$( \
-  printf 'SET-CONNECTION conn1 driver=lmdbnet address=%s namespace=connns token=%s\nLIST-CONNECTIONS\nCREATE-FILE ORDERS USING @conn1\n' \
-    "$ASOCK" "$CTOK" | "$TCL" -a "$CACCT" 2>&1 | sed "s#$ASOCK#@SOCK@#g"; \
+  printf 'SET-CONNECTION conn1 driver=sqlite address=%s/connvol/profiled.sqlite namespace=connns password=s3cret\nLIST-CONNECTIONS\nCREATE-FILE ORDERS USING @conn1\n' \
+    "$TESTROOT" | "$TCL" -a "$CACCT" 2>&1 | sed "s#$TESTROOT#@ROOT@#g"; \
   printf 'BINDINGS: '; cat "$CACCT/BINDINGS"; \
-  (cd "$CACCT" && MVXACCOUNT=. "$TESTROOT/wauth"))"
-kill $APID 2>/dev/null
-rm -f "$ASOCK"
+  (cd "$CACCT" && MVXACCOUNT=. "$TESTROOT/wauth"); \
+  echo '--- and the database is where the profile said, not in the account'; \
+  { [ -f "$TESTROOT/connvol/profiled.sqlite" ] && echo 'on the volume'; }; \
+  { [ ! -e "$CACCT/@conn1" ] && echo 'nothing named for the reference'; })"
+
 
 # A BACKEND THIS HOST DOES NOT HAVE is a question, not a fatal error (mvx#113).
 # Migration is per file, so a repository's files need not all live on the same

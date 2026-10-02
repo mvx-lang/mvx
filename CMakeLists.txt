@@ -74,13 +74,11 @@ separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 # above the driver couples to it.  Each new backend adds one flag and one
 # guarded block.  MVX_WITH_POSTGRES is tri-state: AUTO builds it when
 # libpq is present, ON requires it (hard error if missing), OFF skips it.
-option(MVX_MINIMAL "Core only: skip optional backends and the daemon" OFF)
+option(MVX_MINIMAL "Core only: skip the optional backends" OFF)
 if(MVX_MINIMAL)
   set(_mvx_pg_default OFF)
-  set(_mvx_daemon_default OFF)
 else()
   set(_mvx_pg_default AUTO)
-  set(_mvx_daemon_default ON)
 endif()
 set(MVX_WITH_POSTGRES "${_mvx_pg_default}" CACHE STRING
   "Postgres driver: AUTO (build if libpq present), ON (require it), OFF")
@@ -94,8 +92,6 @@ set_property(CACHE MVX_WITH_SQLITE PROPERTY STRINGS AUTO ON OFF)
 set(MVX_WITH_MYSQL "${_mvx_pg_default}" CACHE STRING
   "MySQL/MariaDB driver: AUTO (build if a client library is present), ON, OFF")
 set_property(CACHE MVX_WITH_MYSQL PROPERTY STRINGS AUTO ON OFF)
-option(MVX_WITH_DAEMON "Build the mvx-lmdbd daemon and admin tool"
-  ${_mvx_daemon_default})
 # Packages built into the system account at build time (#54): always available
 # to every compile and process (their EXPORTS + verbs + extension libraries),
 # with no LINK-PKG.  Set to "" to exclude them, or add more (semicolon-
@@ -190,7 +186,7 @@ add_library(mvxrt SHARED
   runtime/src/mvx_term.c
   runtime/src/mvx_os.c
   runtime/src/mvx_acct.c
-  daemon/sha256.c)
+  runtime/src/sha256.c)
 target_include_directories(mvxrt PUBLIC runtime/include)
 
 # --- the client library (#289) ------------------------------------------
@@ -203,7 +199,6 @@ target_include_directories(mvxrt PUBLIC runtime/include)
 add_library(mvxc SHARED client/mvxc.c)
 target_include_directories(mvxc PUBLIC client/include)
 target_link_libraries(mvxc PRIVATE mvxrt)
-target_include_directories(mvxrt PRIVATE daemon)   # sha256.h for program identity
 # The runtime calls libm (sin/pow/sqrt/... for the numeric intrinsics);
 # glibc keeps libm separate, so link it explicitly (a no-op on macOS,
 # where it lives in libSystem).
@@ -249,7 +244,6 @@ mvx_driver(lmdb runtime/src/mvx_drv_lmdb.c)
 target_include_directories(mvxdrv_lmdb PRIVATE ${LMDB_INCLUDE_DIR})
 target_link_libraries(mvxdrv_lmdb PRIVATE ${LMDB_LIBRARY})
 
-mvx_driver(lmdbnet runtime/src/mvx_drv_lmdbnet.c)
 
 # postgres driver — gated by MVX_WITH_POSTGRES.  libpq is keg-only on
 # Homebrew, so also probe its opt prefix.
@@ -403,25 +397,9 @@ if(MVX_MQTT_ENABLED)
   endif()
 endif()
 
-# --- the networked LMDB daemon (optional) ------------------------------
-if(MVX_WITH_DAEMON)
-  add_executable(mvx-lmdbd daemon/mvxd.c daemon/sha256.c)
-  target_include_directories(mvx-lmdbd PRIVATE ${LMDB_INCLUDE_DIR})
-  target_link_libraries(mvx-lmdbd PRIVATE ${LMDB_LIBRARY})
-  set_target_properties(mvx-lmdbd PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-  # mvx-lmdbd-admin: standalone credential provisioning for the daemon
-  # host (libc + vendored SHA-256 only — no MVX runtime, no LMDB).
-  add_executable(mvx-lmdbd-admin daemon/mvxd_admin.c daemon/sha256.c)
-  set_target_properties(mvx-lmdbd-admin PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-endif()
-
 # --- the session registry (mvx#226) ------------------------------------
-# Not gated behind an option and not part of MVX_WITH_DAEMON: it is libc and a
-# poll loop with no third-party dependency, so it builds wherever the runtime
-# does.  A transport that needs a library arrives later as its own dlopen'd
+# Not gated behind an option: it is libc and a poll loop with no third-party
+# dependency, so it builds wherever the runtime does.  A transport that needs a library arrives later as its own dlopen'd
 # driver, and that is what gets an option.
 add_executable(mvx-msgd daemon/mvx_msgd.c daemon/msgdrv_loop.c)
 target_include_directories(mvx-msgd PRIVATE runtime/include)
@@ -574,23 +552,20 @@ endif()
 # copies it beside a cataloged program, so a tree without it cannot catalog
 # on a platform that needs the loader (mvx#248).
 set(MVX_INSTALL_BINS mvx mvx-basic mvx-git-adopt mvx-msgd mvx-launch)
-if(MVX_WITH_DAEMON)
-  list(APPEND MVX_INSTALL_BINS mvx-lmdbd mvx-lmdbd-admin)
-endif()
 
 # EVERY INSTALLED BINARY, NOT THREE OF THEM (mvx#297).  The rpath used to name
 # mvx, mvx-basic and mvx-git-adopt, so the published v0.4.0 shipped an
-# mvx-launch that could not find libmvxrt.so and an mvx-lmdbd that could not
-# find liblmdb -- neither would start from an unpacked tarball.  mvx-launch got
-# away with it because libmvxrt's constructor puts the runtime directory on the
-# loader path for children (runtime/src/mvx_ctx.c) and mvx is what spawns it;
-# mvx-lmdbd has no parent to inherit from and simply failed.  A binary we
-# install into bin/ resolves ../lib, full stop.
+# mvx-launch that could not find libmvxrt.so, and an mvx-lmdbd (since removed,
+# mvx#327) that could not find liblmdb -- neither would start from an unpacked
+# tarball.  mvx-launch got away with it because libmvxrt's constructor puts the
+# runtime directory on the loader path for children (runtime/src/mvx_ctx.c) and
+# mvx is what spawns it; a daemon has no parent to inherit from and simply
+# failed.  A binary we install into bin/ resolves ../lib, full stop.
 set_target_properties(${MVX_INSTALL_BINS} PROPERTIES
   INSTALL_RPATH "${MVX_INSTALL_RPATH}")
 install(TARGETS ${MVX_INSTALL_BINS} RUNTIME DESTINATION bin)
 
-set(MVX_INSTALL_DRIVERS mvxrt mvxc mvxdrv_dir mvxdrv_lmdb mvxdrv_lmdbnet)
+set(MVX_INSTALL_DRIVERS mvxrt mvxc mvxdrv_dir mvxdrv_lmdb)
 if(MVX_MQTT_ENABLED)
   list(APPEND MVX_INSTALL_DRIVERS mvxmsg_mqtt)
 endif()
@@ -632,7 +607,6 @@ message(STATUS "")
 message(STATUS "MVX components:")
 message(STATUS "  postgres driver : ${MVX_POSTGRES_ENABLED}")
 message(STATUS "  mongo driver    : ${MVX_MONGO_ENABLED}")
-message(STATUS "  lmdbd daemon    : ${MVX_WITH_DAEMON}")
 message(STATUS "  mqtt transport  : ${MVX_MQTT_ENABLED}")
 message(STATUS "")
 

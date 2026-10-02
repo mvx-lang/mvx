@@ -139,7 +139,7 @@ jobs:
       - name: Assert the drivers that must ship
         run: |
           miss=
-          for d in dir lmdb lmdbnet postgres sqlite; do
+          for d in dir lmdb postgres sqlite; do
             [ -f "stage/mvx-lang/lib/libmvxdrv_$d.so" ] || miss="$miss $d"
           done
           ls stage/mvx-lang/lib/

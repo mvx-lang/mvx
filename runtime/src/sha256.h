@@ -10,11 +10,13 @@
  * SPDX-License-Identifier: GPL-2.0-only
  */
 
-/* Minimal, self-contained SHA-256 — shared by mvx-lmdbd (verify a token)
- * and mvx-lmdbd-admin (hash a token on create).  No external
- * dependencies, so both stay standalone and Pick-agnostic. */
-#ifndef MVXD_SHA256_H
-#define MVXD_SHA256_H
+/* Minimal, self-contained SHA-256 — the privilege gate hashes a verb's own
+ * binary with it to decide whether that binary is the blessed one
+ * (mvx_perm.c).  It lived in daemon/ while mvx-lmdbd and its admin tool
+ * hashed tokens with it; those are gone (mvx#327) and this is runtime
+ * code, so it lives here.  No external dependencies. */
+#ifndef MVX_SHA256_H
+#define MVX_SHA256_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -33,4 +35,4 @@ void sha256_final(sha256_ctx *c, uint8_t out[32]);
 /* Hex(SHA-256(salt || token)) into out (65 bytes incl. NUL). */
 void sha256_salted_hex(const char *salt, const char *token, char out[65]);
 
-#endif /* MVXD_SHA256_H */
+#endif /* MVX_SHA256_H */

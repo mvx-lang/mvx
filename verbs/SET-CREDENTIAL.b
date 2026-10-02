@@ -12,7 +12,7 @@
 * (.mvx-private/credentials, git-ignored, mode 0600).  BINDINGS names
 * only the non-secret reference (driver, target, key); the secret lives
 * here.  Example:
-*   SET-CREDENTIAL lmdbnet mvxdb-a:4300 SALES token=abc123
+*   SET-CREDENTIAL mongo mvxdb-a:27017 SALES token=abc123
 S = TRIM(SENTENCE())
 DRV = FIELD(S, " ", 2)
 TGT = FIELD(S, " ", 3)

@@ -13,12 +13,12 @@
 /* The session's side of mvx-msgd (mvx#226): register at logon, and answer
  * @USERNO, MSGWHO and MSGSTATUS.
  *
- * NOTHING HERE MAY EVER BE FATAL.  mvx_drv_lmdbnet.c calls mvx_fatal when the
- * daemon connection drops, and for STORAGE that is right -- losing the database
- * mid-transaction is not something a program can carry on from.  This is the
- * opposite case: a missing or broken message daemon must leave every program
- * running exactly as it runs today, because messaging is not what the program
- * is for.  Every call here degrades to a value the caller can branch on.
+ * NOTHING HERE MAY EVER BE FATAL.  A storage driver losing its connection
+ * mid-transaction is right to call mvx_fatal -- there is no carrying on from
+ * losing the database.  This is the opposite case: a missing or broken message
+ * daemon must leave every program running exactly as it runs today, because
+ * messaging is not what the program is for.  Every call here degrades to a
+ * value the caller can branch on.
  *
  * Nor may it block.  Every exchange with the daemon has a 250 ms budget and a
  * timeout is simply a soft failure, so a wedged daemon cannot stall a BASIC

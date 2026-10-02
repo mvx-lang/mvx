@@ -2,29 +2,51 @@
 #
 #   docker compose -f docker/compose.demo.yaml up -d
 #   docker compose -f docker/compose.demo.yaml exec app1 mvx -a /acct
-#   app1> COUNT ORDERS            # 2 records, served by the daemon
+#   app1> COUNT ORDERS            # 2 records, served by postgres
 #   ... in another terminal ...
 #   docker compose -f docker/compose.demo.yaml exec app2 mvx -a /acct
 #   app2> COUNT ORDERS            # app2 sees the same shared data
 #
-# Each app keeps its own VOC and BP (source) in a *local* LMDB database;
-# the ORDERS and CUSTOMERS *data* files live on the shared mvx-lmdbd
-# daemon over the network, so both apps read and write the same records.
+# Each app keeps its own VOC and BP (source) in a *local* database; the
+# ORDERS and CUSTOMERS *data* files live on the shared postgres server, so
+# both apps read and write the same records.
+#
+# This ran on mvx-lmdbd until mvx#327 removed it.  postgres is what replaced
+# it, and is the better demonstration anyway: it answers WITH and BY in SQL,
+# where the old daemon streamed every id to the verb and filtered there.
+#
+# THE ADDRESS AND THE PASSWORD ARE NOT IN BINDINGS.  BINDINGS says `@shared`
+# and nothing else, so it is committable; the profile holds the rest, and the
+# password comes from the environment through MVXCONN_SHARED_PASSWORD rather
+# than being written to disk at all.
 #
 # SPDX-License-Identifier: GPL-2.0-only
 services:
-  # The shared database server.  Its LMDB data persists on a volume.
+  # The shared database server.  Its data persists on a volume.
   mvxdb:
-    image: ghcr.io/mvx-lang/mvx-lmdbd:latest
+    image: postgres:16-alpine
     restart: unless-stopped
+    environment:
+      POSTGRES_DB: mvx
+      POSTGRES_USER: mvx
+      POSTGRES_PASSWORD: demo-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mvx -d mvx"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     volumes:
-      - mvxdata:/data
+      - mvxdata:/var/lib/postgresql/data
 
-  # One-shot: create the shared data files on the daemon and seed a few
+  # One-shot: create the shared data files on the server and seed a few
   # records.  Runs once, then exits; the apps wait for it to finish.
   init:
     image: ghcr.io/mvx-lang/mvx:latest
-    depends_on: [mvxdb]
+    depends_on:
+      mvxdb:
+        condition: service_healthy
+    environment:
+      MVXCONN_SHARED_PASSWORD: demo-only
     command:
       - sh
       - -c
@@ -33,11 +55,9 @@ services:
         A=/tmp/init
         mkdir -p "$$A"
         mvx -a "$$A" -c "CREATE-FILE VOC" >/dev/null
-        # wait for the daemon to accept connections, then create the files
-        until mvx -a "$$A" -c "CREATE-FILE ORDERS USING lmdbnet mvxdb:4300" 2>/dev/null; do
-          sleep 1
-        done
-        mvx -a "$$A" -c "CREATE-FILE CUSTOMERS USING lmdbnet mvxdb:4300"
+        mvx -a "$$A" -c "SET-CONNECTION shared driver=postgres address=mvxdb:5432 dbname=mvx user=mvx namespace=shared" >/dev/null
+        mvx -a "$$A" -c "CREATE-FILE ORDERS USING @shared"
+        mvx -a "$$A" -c "CREATE-FILE CUSTOMERS USING @shared"
         printf 'OPEN "ORDERS" TO F ELSE STOP\nWRITE "Widget":@AM:"9.99" ON F,"O1"\nWRITE "Gadget":@AM:"4.50" ON F,"O2"\nOPEN "CUSTOMERS" TO C ELSE STOP\nWRITE "Acme Corp" ON C,"C1"\n' > /tmp/seed.b
         mvx-basic /tmp/seed.b -o /tmp/seed
         cd "$$A" && MVXACCOUNT=. /tmp/seed
@@ -54,16 +74,18 @@ services:
       - app1:/acct
     environment:
       APPNAME: app1
+      MVXCONN_SHARED_PASSWORD: demo-only
     command: &provision
       - sh
       - -c
       - |
         if [ ! -f /acct/.mvx ]; then
-          # VOC and BP (source) are local to this account's LMDB
+          # VOC and BP (source) are local to this account
           mvx -a /acct -c "CREATE-FILE VOC"
           mvx -a /acct -c "CREATE-FILE BP"
-          # ORDERS and CUSTOMERS resolve to the shared daemon
-          printf 'ORDERS lmdbnet mvxdb:4300\nCUSTOMERS lmdbnet mvxdb:4300\n' > /acct/BINDINGS
+          # the profile names the server; BINDINGS names only the profile
+          mvx -a /acct -c "SET-CONNECTION shared driver=postgres address=mvxdb:5432 dbname=mvx user=mvx namespace=shared"
+          printf 'ORDERS @shared\nCUSTOMERS @shared\n' > /acct/BINDINGS
           printf 'name = %s\nversion = 1\n' "$${APPNAME}" > /acct/.mvx
         fi
         exec tail -f /dev/null
@@ -79,6 +101,7 @@ services:
       - app2:/acct
     environment:
       APPNAME: app2
+      MVXCONN_SHARED_PASSWORD: demo-only
     command: *provision
 
 volumes:
