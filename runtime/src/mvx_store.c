@@ -592,10 +592,10 @@ static void lock_drop(store_state *st, const char *key) {
 
 /* ----------------------------------------------------------------- API */
 
-/* The account's default namespace on a daemon: the basename of the
-   resolved MVXACCOUNT path (so ".", "./acct", and "/x/acct" all agree),
-   or "default".  Shared by the store and the lmdbnet driver so a
-   whole-account binding and its LISTF land in the same namespace. */
+/* The account's own namespace: the basename of the resolved MVXACCOUNT path
+   (so ".", "./acct", and "/x/acct" all agree), or "default".  mongo takes it
+   as the database, postgres as the schema, messaging as the port prefix --
+   one answer, so they cannot disagree about which account this is. */
 void mvx_account_namespace(char *out, size_t outlen) {
     const char *a = getenv("MVXACCOUNT");
     if (!a || !a[0]) a = ".";
@@ -618,44 +618,22 @@ void mvx_account_namespace(char *out, size_t outlen) {
 /* Does this file have a backend binding?  Consult the account's
    BINDINGS record, whose lines are "SPEC driver {params...}" (an exact
    spec, or "*" for every file); driver names a storage driver and params is
-   its connection string, opaque to the runtime.  With no BINDINGS record,
-   bare $MVXDAEMON binds the whole account to lmdbnet -- deprecated (#327) and
-   warned about once, but kept because the operator chose it.  A line naming no
-   driver USED to mean the same thing; it does not any more, because nobody
-   chose that.  Returns 1 when bound, filling driver and params. */
+   its connection string, opaque to the runtime.  Returns 1 when bound,
+   filling driver and params.
+   $MVXDAEMON IS NOT CONSULTED ANY MORE (#327).  It bound a whole account to
+   lmdbnet, and that driver and its daemon are gone: nothing pushed down, so
+   every WITH streamed the id list to the verb and filtered there, over a
+   network.  An account that still sets the variable is simply unbound and
+   takes the account's default, which is the same answer a BINDINGS line
+   naming no driver has given since step 1 of that issue. */
 static int binding_for(const char *cspec, char *driver, size_t dcap,
                        char *params, size_t pcap) {
-    const char *envd = getenv("MVXDAEMON");
     const char *acct = getenv("MVXACCOUNT");
     if (!acct || !acct[0]) acct = ".";
     char path[4096];
     snprintf(path, sizeof path, "%s/BINDINGS", acct);
     FILE *fp = fopen(path, "r");
-    if (!fp) {
-        if (envd && envd[0]) {
-            /* THE WHOLE-ACCOUNT NETWORKED DEPLOYMENT (#327).  Kept, because the
-               operator chose it by setting $MVXDAEMON -- unlike a BINDINGS line
-               with no driver, which nobody chose and which no longer means this.
-               Said once per process: this is on the resolve path, so warning per
-               open would bury it in its own noise. */
-            static int said;
-            if (!said) {
-                said = 1;
-                fprintf(stderr,
-                        "mvx: warning: $MVXDAEMON binds this account to lmdbnet, "
-                        "which is deprecated (mvx#327) and will be removed. It "
-                        "pushes no filtering or sorting into the backend, so "
-                        "every WITH is filtered in the verb. Use postgres for a "
-                        "shared database; CONVERT-FILE moves a file.\n");
-            }
-            char nsb[128];
-            mvx_account_namespace(nsb, sizeof nsb);
-            snprintf(driver, dcap, "lmdbnet");
-            snprintf(params, pcap, "%s %s", envd, nsb);
-            return 1;
-        }
-        return 0;
-    }
+    if (!fp) return 0;
     int star = 0, exact = 0;
     char stardrv[64] = "", starparm[512] = "";
     char exactdrv[64] = "", exactparm[512] = "";
@@ -713,31 +691,9 @@ static int binding_for(const char *cspec, char *driver, size_t dcap,
     /* A LINE WITH NO DRIVER NAMES NOTHING (#327).  It used to mean lmdbnet at
        $MVXDAEMON -- a networked backend, chosen by nobody, for a line that only
        gives a file name.  A binding that says no driver is not a binding, so
-       fall through and let the file take the account's default like any other.
-       lmdbnet is being deprecated: it pushes nothing down, so every WITH streams
-       the whole id list to the verb and filters there, and unlike lmdb it pays
-       network latency to do it.  postgres answers those in SQL. */
+       fall through and let the file take the account's default like any other. */
     if (!ud[0]) return 0;
-    if (!up[0] && strcmp(ud, "lmdbnet") == 0)
-        up = envd && envd[0] ? envd : "";
-    if (strcmp(ud, "lmdbnet") == 0 && !up[0])
-        mvx_fatal("file %s is bound to lmdbnet but no daemon address "
-                  "is configured (BINDINGS line or $MVXDAEMON)", cspec);
     snprintf(driver, dcap, "%s", ud);
-    /* lmdbnet params are "addr [namespace]"; supply the account's
-       default namespace when the binding names only an address. */
-    static char nsparm[640];
-    if (strcmp(ud, "lmdbnet") == 0) {
-        const char *sp = up;
-        while (*sp && *sp != ' ' && *sp != '\t') sp++;
-        while (*sp == ' ' || *sp == '\t') sp++;
-        if (!*sp) {
-            char nsb[128];
-            mvx_account_namespace(nsb, sizeof nsb);
-            snprintf(nsparm, sizeof nsparm, "%s %s", up, nsb);
-            up = nsparm;
-        }
-    }
     snprintf(params, pcap, "%s", up);
     return 1;
 }
@@ -4328,8 +4284,8 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
         mv_clear(&names);
     }
     /* Bound files: the BINDINGS record names them (exactly).  Their
-       type is the driver name, so LISTF distinguishes lmdbnet from
-       postgres and the like.  A "*" entry is a policy, not a file. */
+       type is the driver name, so LISTF distinguishes postgres from
+       mongo and the like.  A "*" entry is a policy, not a file. */
     int listed_bound = 0;
     {
         const char *acct2 = getenv("MVXACCOUNT");
@@ -4414,11 +4370,6 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             }
         }
     }
-    /* The bare-$MVXDAEMON case used to be enumerated by a third block that
-       loaded "lmdbnet" by name.  It is gone: binding_for() already resolves a
-       daemon with no BINDINGS record to that driver, so the block above covers
-       it — and running both listed every file twice. */
-
     mv_set_str(dst, buf ? buf : "", (int64_t)len);
     free(buf);
 }
@@ -5203,29 +5154,9 @@ int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,
         while (*ap == ' ' || *ap == '\t') ap++;
         if (!drvname[0]) {
             fprintf(stderr, "CREATE-FILE USING: name a driver "
-                            "(e.g. lmdbnet)\n");
+                            "(e.g. sqlite)\n");
             return 0;
         }
-        const char *envd = getenv("MVXDAEMON");
-        if (strcmp(drvname, "lmdbnet") == 0 && !ap[0] &&
-            (!envd || !envd[0])) {
-            fprintf(stderr, "CREATE-FILE USING lmdbnet: no daemon "
-                            "address (give one, or set $MVXDAEMON)\n");
-            return 0;
-        }
-        /* SAID ONCE, WHERE THE CHOICE IS MADE (#327).  lmdbnet pushes nothing
-           down -- no select_where, select_order, count_where, sum_where, join or
-           explain -- so every WITH streams the whole id list to the verb and
-           filters there, and unlike lmdb it pays network latency to do it.
-           postgres answers those in SQL and needs no code of ours.  At BIND
-           time, not on every open: a binding is recorded once and resolved for
-           ever, so this is the moment somebody can still choose differently. */
-        if (strcmp(drvname, "lmdbnet") == 0)
-            fprintf(stderr, "CREATE-FILE: lmdbnet is deprecated (mvx#327) and "
-                            "will be removed; it pushes no filtering or sorting "
-                            "into the backend. Use postgres for a shared "
-                            "database, or lmdb for a local one. Move an existing "
-                            "file with CONVERT-FILE %s postgres\n", cspec);
         /* The named backend may not be on this host — a clone of an account
            whose files were migrated elsewhere is the ordinary way to get here.
            Ask rather than abort, and bind to whatever is chosen so every later

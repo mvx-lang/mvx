@@ -222,7 +222,7 @@ static int dbi_open(unsigned flags, const char *loc, const char *spec,
    spec, separated by a newline, and leaves the driver to parse it (see
    mvx_store.c: "opaque to the runtime, parsed by the driver").  lmdb is local
    and takes no params, but it still has to SKIP them, and it was the only
-   driver that did not: sqlite has split_spec() and lmdbnet splits too.
+   driver that did not: sqlite has split_spec(), and so does postgres.
    Without this a BOUND file became a named DB called "\nPARTS" -- a different
    database from the "PARTS" the same file uses unbound, so binding an existing
    local file walked away from its records.  It also put a blank line in LISTF,

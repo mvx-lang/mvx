@@ -19,11 +19,12 @@
  * byte (#236).  The connection is a named profile
  * (BINDINGS `ORDERS @pgmain`, .mvx-private/connections carries
  * driver/address/dbname/user/password/namespace) — the same indirection
- * the lmdbnet driver uses.
+ * the other networked drivers use.
  *
  * Minimal contract only: no native secondary indexes (the runtime falls
- * back to a scan) and no lock authority (the process-local lock table
- * applies) in this first cut — both are follow-ups.
+ * back to a scan) in this first cut.  The lock authority arrived with
+ * mvx#16: pg_lock/pg_unlock below take session-level advisory locks, so a
+ * READU on a postgres file is honoured across processes.
  */
 #include "../include/mvx_driver.h"
 #include "../include/mvx_doc.h"

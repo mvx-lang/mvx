@@ -1,8 +1,11 @@
 connection stored: conn1
-conn1 driver=lmdbnet
-conn1 address=@SOCK@
+conn1 driver=sqlite
+conn1 address=@ROOT@/connvol/profiled.sqlite
 conn1 namespace=connns
-conn1 token=****
+conn1 password=****
 [417] file ORDERS created
 BINDINGS: ORDERS @conn1
 read: hi
+--- and the database is where the profile said, not in the account
+on the volume
+nothing named for the reference

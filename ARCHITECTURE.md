@@ -41,8 +41,8 @@ runtime) is the only part currently in scope for implementation.
        |
   +----+----+----------+-------------+
   |         |          |             |
- LMDB    LMDB via   Directory     Mongo / SQL
-(embed)  daemon    (source files)   (networked)
+ SQLite    LMDB     Directory     Mongo / SQL
+(default) (embed)  (source files)   (networked)
 ```
 
 Above this sit the shells:
@@ -223,38 +223,46 @@ unchanged regardless of backend.
   long.
 - Max key size defaults to 511 bytes — validate record ids on write.
 
-### 4.3 Networked LMDB daemon
+### 4.3 Multi-host storage
 
-LMDB is embedded and single-host; a network filesystem will corrupt it. For
-multi-host deployment, a daemon owns the environment exclusively and
-serialises client access.
+LMDB is embedded and single-host; a network filesystem will corrupt it. An
+account that must be reached from more than one host puts its files on a
+backend built for that — **postgres**, or mongo or mysql — with the address
+in a named connection profile so the committed `BINDINGS` record names only
+the profile.
 
-- Same `liblmdb` core, two transport drivers — embedded and networked —
-  presenting the identical storage interface. Deployment is a config swap.
-- The daemon becomes the **single lock authority** for its files, which
-  removes the need for an external distributed lock manager in
-  single-daemon deployments.
-- Locks are **leased** and tied to session/connection. Kubernetes kills
-  pods routinely; orphaned locks must be reaped on connection loss.
-- `SELECT` snapshots inside the daemon, then streams — never hold a read
-  txn open while streaming to a slow client.
-- Costs accepted knowingly: single point of failure, single-writer
-  throughput ceiling that networking cannot transcend, and **you own the
-  HA/replication story** that Mongo and Postgres provide natively.
-- Invariant: a file is *either* embedded-access *or* daemon-owned, never
-  both.
+This was once our own daemon, `mvx-lmdbd`, reached through an `lmdbnet`
+driver. Both were removed (mvx#327). The argument against them was
+pushdown: `lmdbnet` supplied none of `select_where`, `select_order`,
+`count_where`, `sum_where`, `select_join` or `explain`, so every `WITH`
+streamed the whole id list to the verb and filtered it there — paying
+network latency for the privilege. postgres answers those in SQL. The
+decision and what was kept from it are recorded in `DECISIONS.md`.
+
+Cross-session record locking survived the change: the driver contract's
+optional `lock`/`unlock` slots are answered by **postgres**, with
+session-level advisory locks (mvx#16), so a `READU` is honoured across
+processes and released when the holding session ends. What did not survive
+is the *lease* — the daemon dropped a dead client's locks the moment its
+connection closed, which is what made a killed pod safe. A postgres session
+ends with its connection too, so the property largely carries over, but it
+is the server's behaviour now rather than ours to guarantee. Backends with
+no lock authority (embedded LMDB, directory files) use the process-local
+lock table, which coordinates within one process only.
 
 ### 4.4 The migration curve
 
 ```
-embedded LMDB  ->  networked LMDB  ->  sharded daemons  ->  Mongo/Postgres
+SQLite  ->  Postgres / MySQL / Mongo
 ```
 
 Each step is a config swap because the driver interface is the boundary.
-The migration trigger is knowable in advance: **single-writer throughput
-or a need for native HA**. Until then LMDB carries the workload with
-almost no operational surface. Migration can be done **per file**, moving
-one hot file to a heavier backend while the rest stay on LMDB.
+The migration trigger is knowable in advance: **more than one host, or a
+need for native HA**. Until then SQLite carries the workload with almost no
+operational surface — one local file, no server, and it answers `WITH` and
+`BY` in SQL. Migration can be done **per file**, moving one hot file to a
+heavier backend while the rest stay local (`CONVERT-FILE`), or a whole
+account at once (`CONVERT-ACCOUNT`).
 
 ---
 
@@ -694,7 +702,6 @@ common core; treat exotic conversions as a long tail.
 
 - `mvx-basic` — compiler and CLI
 - `mvx` — classic TCL shell (the interactive environment; MVX TCL)
-- `mvx-lmdbd` — LMDB daemon
 - MVX BASIC — the language implementation
 - XTCL — extended shell
 

@@ -19,8 +19,8 @@
  * profile changes, not the committed bindings.
  *
  *     .mvx-private/connections, one field per line, value to end-of-line:
- *     salesdb  driver     lmdbnet
- *     salesdb  address    mvxdb:4300
+ *     salesdb  driver     postgres
+ *     salesdb  address    mvxdb:5432
  *     salesdb  namespace  SALES
  *     salesdb  token      abc123
  *

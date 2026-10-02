@@ -11,7 +11,7 @@
 * Define a named connection profile in .mvx-private/connections (local,
 * git-ignored).  BINDINGS references it by name (@name), so the daemon
 * host and credentials live in one place.  Example:
-*   SET-CONNECTION salesdb driver=lmdbnet address=mvxdb:4300 namespace=SALES token=abc123
+*   SET-CONNECTION salesdb driver=postgres address=mvxdb:5432 namespace=SALES user=app
 S = TRIM(SENTENCE())
 CN = FIELD(S, " ", 2)
 NT = DCOUNT(S, " ")

@@ -96,10 +96,11 @@ The compiler and the environment are both well advanced. Highlights:
   1M prime-sieve benchmark runs at ~99% of an equivalent C program via
   two tiers of numeric specialisation over the boxed value
   representation.
-- **Storage** — a pluggable driver contract with embedded LMDB, a
-  networked `mvx-lmdbd` daemon, and directory backends; dictionaries,
-  secondary indexes, record locks, and select lists; mixed
-  local/remote per file (`CREATE-FILE … USING <driver>`).
+- **Storage** — a pluggable driver contract over sqlite, LMDB, postgres,
+  MySQL, MongoDB and directory backends; dictionaries, secondary indexes,
+  record locks, and select lists; mixed local/remote per file
+  (`CREATE-FILE … USING <driver>`), with the address in a named
+  connection profile rather than in the committed binding.
 - **Environment** — classic TCL with VOC dispatch, the standard verb
   set (all written in MVX BASIC), `EXECUTE` and a runtime privilege
   gate, packages with dependency manifests, full-screen terminal
@@ -130,7 +131,6 @@ what's enabled prints at the end of configuration:
 | flag | default | effect |
 |---|---|---|
 | `MVX_WITH_POSTGRES` | `AUTO` | Postgres driver: `AUTO` builds it when libpq is found, `ON` requires it (errors if missing), `OFF` skips it |
-| `MVX_WITH_DAEMON` | `ON` | the `mvx-lmdbd` daemon and `mvx-lmdbd-admin` |
 | `MVX_MINIMAL` | `OFF` | core only — sets the defaults above to `OFF` |
 
 ```sh
@@ -232,7 +232,7 @@ package, libgit2 (`brew install libgit2`). See the
 - `compiler/` — lexer, parser, LLVM codegen, `mvx-basic` driver (C++17)
 - `runtime/` — value type, arrays, storage, intrinsics (C11);
   `mvx_runtime.h` is the permanent ABI surface
-- `daemon/` — `mvx-lmdbd`, the networked LMDB storage daemon
+- `daemon/` — `mvx-msgd`, the session registry and message daemon
 - `tcl/` — `mvx`, the classic shell
 - `verbs/` — the standard verb set (MVX BASIC)
 - `packages/` — packages built into the system account (`http`, `sample`).
