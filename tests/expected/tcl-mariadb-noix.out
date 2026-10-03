@@ -1,0 +1,13 @@
+--- the index is refused, by name, and not as a fault
+MRIX.CITY cannot be indexed by this backend
+the query still works -- the filter runs in the backend or the
+verb, unindexed, so only speed is lost
+--- nothing is listed afterwards
+no indexes on MRIX
+--- the filter still runs in MariaDB, not the verb
+1
+--- and the answers are right, multivalue semantics and all
+2 record(s) counted
+1 record(s) counted
+--- and a WRITE still maintains nothing it should not
+3 record(s) counted

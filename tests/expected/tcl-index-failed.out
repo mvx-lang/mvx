@@ -1,0 +1,9 @@
+--- a backend that cannot index says so
+index build failed (backend without index capability?)
+--- and nothing is listed afterwards
+no indexes on IXD
+--- while the query it was meant to speed up still answers
+1 record(s) counted
+--- but an entry it did NOT add is left alone
+CITY
+1 index(es)

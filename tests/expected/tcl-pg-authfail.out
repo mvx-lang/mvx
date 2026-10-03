@@ -1,0 +1,10 @@
+--- the right password works, against this very server
+2 record(s) counted
+--- the wrong one is refused
+refused
+--- and no file was left behind for it
+no file
+--- and a file that DOES exist cannot be read through it
+read refused
+--- which is the credential, not the file: the good profile reads it
+1 record(s) counted

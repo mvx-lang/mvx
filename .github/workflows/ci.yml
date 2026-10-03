@@ -35,6 +35,44 @@ jobs:
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
           --health-interval 5s --health-timeout 5s --health-retries 10
+      # The mysql driver was BUILT here and never exercised (mvx#345): libmariadb
+      # is installed, so the block's own `ls build/lib/libmvxdrv_mysql.*` guard
+      # passed, but with no server and no MVX_MYSQL it printed "skipped" on every
+      # run.  A driver that compiles is not a driver that works.
+      #
+      # MYSQL, NOT MARIADB, and the difference is not cosmetic.  Indexing an
+      # un-mapped attribute needs a MULTI-VALUED index -- `CAST(doc->'$."2"' AS
+      # CHAR(255) ARRAY)` -- which is MySQL 8.0.17+ and which MariaDB does not
+      # implement at all, so CREATE-INDEX fails there and tcl-mysql-rawindex is
+      # red.  Measured on mariadb:11.8.9 while adding this.  libmariadb stays as
+      # the CLIENT library; it is wire-compatible with a MySQL server.  The
+      # MariaDB gap is mvx#347.
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: mvx
+          MYSQL_DATABASE: mvxtest
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -pmvx"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      # AND MARIADB, because the driver is written to support it (attr_expr
+      # avoids the ->> shorthand expressly "which MariaDB does not accept")
+      # and one statement did not.  mvx#347 makes that refusal explicit, and
+      # flavour-specific behaviour behind a block nobody runs is what mvx#345
+      # was about -- so the refusal, and everything that must keep working
+      # around it, is asserted against a real MariaDB here.
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: mvx
+          MARIADB_DATABASE: mvxtest
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -86,6 +124,8 @@ jobs:
         env:
           MVX_PG: "address=localhost:5432 dbname=mvx user=mvx password=mvx"
           MVX_MONGO: "address=localhost:27017 namespace=mvxtest"
+          MVX_MYSQL: "host=127.0.0.1 port=3306 user=root password=mvx dbname=mvxtest"
+          MVX_MARIADB: "host=127.0.0.1 port=3307 user=root password=mvx dbname=mvxtest"
           MVX_SIEVE_OPTIONAL: "1"   # perf benchmark: report, don't gate CI
           # The install lists package releases through the GitHub API (mvx#212),
           # which is rate-limited per IP; runners share IPs.

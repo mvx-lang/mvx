@@ -169,7 +169,14 @@ typedef struct mvx_driver {
        the mapping) and its own index, so there is no per-record backfill and
        no write_ix/del_ix maintenance.  A driver providing this advertises
        index_select/index_drop but leaves write_ix/del_ix NULL.  Returns the
-       indexed row count, or -1 on error (e.g. the column is not mapped).
+       indexed row count, -1 on error (e.g. the column is not mapped), or -2
+       for THIS BACKEND CANNOT INDEX THIS KIND OF FIELD, which is not a
+       fault: the query still runs, pushed down or scanned, and only speed is
+       lost.  mysql returns it for an un-mapped attribute on MariaDB, which
+       has no multi-valued index (mvx#347).  A new return value, not a new
+       slot, so no ABI bump -- a driver that never returns -2 is unaffected,
+       and a caller that does not distinguish it reads it as an error, which
+       is what it did before.
        `col` names a mapped identity column to index (NULL to index the raw
        record attribute `attr` via an expression index on the blob), so any
        dictionary field is indexable, not only mapped ones. */
