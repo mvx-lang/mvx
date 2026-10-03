@@ -1,7 +1,31 @@
 # Release pipeline: on a v* tag, build Linux binaries for amd64 and arm64
-# and publish the three container images to the GitHub Container Registry
+# and publish the container images to the GitHub Container Registry
 # (ghcr.io/mvx-lang/...).  No external secrets — the built-in GITHUB_TOKEN
 # authenticates to ghcr.io.
+#
+# TAG THE COMMIT BEING RELEASED, NOT THE MERGE THAT BRINGS IT TO MAIN
+# (mvx#343).  Merge develop into main as usual, then tag the merge's SECOND
+# PARENT -- develop's HEAD -- which is what `git tag -a vX.Y.Z <sha>` on that
+# commit does:
+#
+#     git checkout main && git merge develop        # as before
+#     git tag -a v0.7.2 "$(git rev-parse main^2)"   # NOT main
+#
+# Main only ever receives develop merges, so the two have the SAME TREE and a
+# checkout of either is byte-for-byte identical -- but only the second parent
+# is an ancestor of develop as well as main.  Tagging the merge left every
+# build from develop reporting v0.2.1, the last v* tag on develop's own line,
+# for five minor versions: `git describe` walks back to the nearest REACHABLE
+# tag and a merge commit on main is not one.
+#
+# It also lets ci-gate below find a run that already exists.  Develop's HEAD
+# has been through ci on the way in; the merge commit has to earn its own
+# green run first, which is pure waiting for an identical tree.
+#
+# If main ever carries something develop does not -- a hotfix committed there
+# directly -- the trees differ and the merge itself is what to tag.  The check
+# in `tag-placement` below says when that has happened rather than leaving it
+# to be noticed at the next release.
 name: release
 
 on:
@@ -89,6 +113,49 @@ jobs:
           done
 
   # ---- native Linux binaries, one job per architecture -------------------
+  # ---- is the tag where a build from develop can see it? (mvx#343) -------
+  # The symptom this prevents is silent and long-lived: tag main's merge
+  # commit instead of develop's HEAD and every build from develop reports the
+  # last tag on ITS line, which went unnoticed for five minor versions.
+  #
+  # REPORTS, DOES NOT BLOCK.  A tag main alone can reach is legitimate -- a
+  # hotfix committed straight to main is exactly that -- and refusing to
+  # publish one would be a worse failure than a stale version string.  So this
+  # says what develop will now call itself, in the run summary where whoever
+  # cut the release is already looking, and warns when that is not this tag.
+  tag-placement:
+    name: develop can see this tag
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0        # describe needs the history and the tags
+      - name: What develop will call itself
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin develop || {
+            echo "no develop branch here; nothing to check" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          desc="$(git describe --tags --match 'v*' origin/develop 2>/dev/null || echo '(none)')"
+          echo "develop describes as \`$desc\`" >> "$GITHUB_STEP_SUMMARY"
+          case "$desc" in
+            "$TAG"|"$TAG"-*)
+              echo "develop can see $TAG." >> "$GITHUB_STEP_SUMMARY" ;;
+            *)
+              echo "::warning title=develop cannot see $TAG::develop describes as '$desc', so builds from it will report that and not $TAG. If this was meant to be a develop release, the tag belongs on the merge's second parent -- see the header of this workflow. If it is a main-only hotfix, this is expected."
+              {
+                echo
+                echo "**develop cannot see \`$TAG\`.** Builds from develop will"
+                echo "report \`$desc\`. For a develop release the tag belongs on"
+                echo "the merge's second parent (\`git rev-parse main^2\`); for a"
+                echo "main-only hotfix this is expected."
+              } >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
   binaries:
     needs: ci-gate
     strategy:
