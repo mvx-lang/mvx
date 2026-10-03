@@ -1279,8 +1279,22 @@ static int my_index_create(mvx_file *fh, const char *item, const char *col,
            create a functional index on an expression that returns a BLOB or
            TEXT" — which is why raw attributes were not indexable at all. */
         if (attr < 1) return -1;
+        /* NOT ON MARIADB, AND IT IS WORTH SAYING SO RATHER THAN FAILING
+           (mvx#347).  A multi-valued index is MySQL 8.0.17+; MariaDB does
+           not implement one under any syntax, so `CAST(... ARRAY)` is a
+           PARSE error there (1064), not an unsupported-feature error.  There
+           is also no substitute: a STORED generated column holding the
+           attribute's text can be indexed, but it answers a whole-attribute
+           compare, and what the push-down asks is whether any ONE of the
+           attribute's values matches (#173) -- so such an index would give
+           wrong answers for a multivalued attribute rather than slow ones.
+           Nothing is lost but speed: attr_expr() already avoids the ->>
+           shorthand for MariaDB's sake, so the filter still pushes down and
+           simply scans.  -2 says that, where -1 would claim a fault. */
+        const char *srv = mysql_get_server_info(f->db);
+        if (srv && strstr(srv, "MariaDB")) return -2;
         snprintf(sql, sizeof sql,
-                 "CREATE INDEX %s ON %s ((CAST(doc->'$.\"%lld\"' "
+                 "CREATE INDEX %s ON %s ((CAST(JSON_EXTRACT(doc, '$.\"%lld\"') "
                  "AS CHAR(255) ARRAY)))", qn, qt, (long long)attr);
         if (!exec_sql(f->db, sql) && mysql_errno(f->db) != 1061) return -1;
         char csql2[400];

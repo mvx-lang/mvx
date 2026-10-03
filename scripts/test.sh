@@ -2409,6 +2409,52 @@ check tcl-index "$(printf '%s\n' \
   'LIST PARTS NAME WITH COLOR = blue BY @ID' \
   'DELETE-INDEX PARTS NAME' | tclrun)"
 
+# A FAILED INDEX BUILD LEAVES NOTHING LISTED (mvx#347).
+#
+# CREATE-INDEX writes %INDEXES% BEFORE building, because the runtime reads it
+# to learn which item it is building.  Nothing took it back out again, so a
+# build that failed still left LIST-INDEXES reporting an index that exists in
+# no backend -- a listing that lies about what the file has.
+#
+# ASSERTED ON dir, WHICH NEEDS NO SERVER.  The fault was found on MariaDB
+# (mvx#327's CI work), but it has nothing to do with MariaDB: a directory file
+# has no index capability at all, so INDEXBUILD refuses, and every account
+# holding BP source could reproduce it.  Reverting the verb turns this red
+# with "CITY / 1 index(es)" against a backend that cannot index anything.
+#
+# The query is asserted too.  A refusal that quietly broke the WITH would be
+# a worse bug than the listing, and nothing else here would catch it.
+IXFA="$TESTROOT/ixfail"
+"$ROOT/scripts/mkaccount.sh" "$IXFA" >/dev/null 2>&1
+"$TCL" -a "$IXFA" -c 'CREATE-FILE IXD USING dir' >/dev/null 2>&1
+cat > "$TESTROOT/ixfail.b" <<'IXFEOF'
+OPEN "DICT", "IXD" TO D ELSE STOP "no dict"
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+OPEN "IXD" TO F ELSE STOP "no IXD"
+WRITE "Ada":@AM:"London" ON F, "R1"
+WRITE "Grace":@AM:"York" ON F, "R2"
+IXFEOF
+"$MVX" "$TESTROOT/ixfail.b" -o "$TESTROOT/ixfailbin" 2>/dev/null
+(cd "$IXFA" && MVXACCOUNT=. "$TESTROOT/ixfailbin")
+# Planted by hand, so the verb's LOCATE finds it and the rollback must not
+# fire: only what THIS run added may be removed.
+cat > "$TESTROOT/ixseed.b" <<'IXSEOF'
+OPEN "DICT", "IXD" TO D ELSE STOP "no dict"
+WRITE "CITY" ON D, "%INDEXES%"
+IXSEOF
+"$MVX" "$TESTROOT/ixseed.b" -o "$TESTROOT/ixseedbin" 2>/dev/null
+check tcl-index-failed "$( \
+  echo '--- a backend that cannot index says so'; \
+  "$TCL" -a "$IXFA" -c 'CREATE-INDEX IXD CITY' 2>&1; \
+  echo '--- and nothing is listed afterwards'; \
+  "$TCL" -a "$IXFA" -c 'LIST-INDEXES IXD' 2>&1; \
+  echo '--- while the query it was meant to speed up still answers'; \
+  "$TCL" -a "$IXFA" -c 'COUNT IXD WITH CITY = "London"' 2>&1; \
+  echo '--- but an entry it did NOT add is left alone'; \
+  (cd "$IXFA" && MVXACCOUNT=. "$TESTROOT/ixseedbin"); \
+  "$TCL" -a "$IXFA" -c 'CREATE-INDEX IXD CITY' >/dev/null 2>&1; \
+  "$TCL" -a "$IXFA" -c 'LIST-INDEXES IXD' 2>&1)"
+
 # EXPORT/IMPORT: a hash file round-trips through a git-native
 # directory file; an external edit and a delete both mirror back
 exacct_prog="$TESTROOT/exseed.b"
@@ -4565,6 +4611,68 @@ MYJEOF
     "$TCL" -a "$MYA" -c 'SELECT MYORDMV WITH CITY = "Melbourne"' 2>&1)"
 else
   echo "  (mysql test skipped — set MVX_MYSQL to run)"
+fi
+
+# MARIADB IS THE SAME DRIVER AGAINST A DIFFERENT SERVER (mvx#347).
+#
+# The mysql driver already avoids the ->> shorthand "which MariaDB does not
+# accept" -- supporting MariaDB is stated policy, not an accident.  One
+# statement broke it: indexing an un-mapped attribute needs a MULTI-VALUED
+# index, `CAST(... AS CHAR(255) ARRAY)`, which is MySQL 8.0.17+ and which
+# MariaDB does not implement under any syntax.  It is a PARSE error there.
+#
+# There is no substitute, which is why this asserts a refusal rather than a
+# fallback: a STORED generated column holding the attribute's text indexes
+# fine, but answers a whole-attribute compare, while the push-down asks
+# whether any ONE of the values matches (#173) -- so it would give WRONG
+# answers for a multivalued attribute, not slower ones.
+#
+# WHAT MUST STILL BE TRUE is the point of the block: only the index is lost.
+# The filter is still pushed into MariaDB and the counts are still right.
+# Run in CI against a real mariadb, because shipping flavour-specific
+# behaviour behind a block nobody runs is what mvx#345 was about.
+if [ -n "${MVX_MARIADB:-}" ] && ls "$ROOT"/build/lib/libmvxdrv_mysql.* >/dev/null 2>&1; then
+  echo "== mariadb: the same driver, one capability short"
+  MRA="$TESTROOT/mracct"; mkdir -p "$MRA"
+  printf '# MVX account descriptor\nname=mracct\nversion=1\n' > "$MRA/.mvx"
+  printf '* mysql %s\n' "$MVX_MARIADB" > "$MRA/BINDINGS"
+  "$TCL" -a "$MRA" -c 'DELETE-FILE MRIX' >/dev/null 2>&1
+  "$TCL" -a "$MRA" -c 'CREATE-FILE MRIX' >/dev/null 2>&1
+  cat > "$TESTROOT/mrix.b" <<'MREOF'
+OPEN "MRIX" TO F ELSE STOP
+OPEN "DICT", "MRIX" TO D ELSE STOP
+WRITE "D":@AM:"2":@AM:"":@AM:"City":@AM:"12L":@AM:"S" ON D, "CITY"
+WRITE "Ada":@AM:"London" ON F, "R1"
+WRITE "Grace":@AM:"York" ON F, "R2"
+WRITE "Alan":@AM:"London" ON F, "R3"
+MREOF
+  "$MVX" "$TESTROOT/mrix.b" -o "$TESTROOT/mrixbin" 2>/dev/null
+  (cd "$MRA" && MVXACCOUNT=. "$TESTROOT/mrixbin")
+  # A write AFTER the refusal.  The runtime maintains its own index through
+  # write_ix when a backend has none; this backend HAS index_create and said
+  # no, so there is nothing to maintain -- and the write must neither fail nor
+  # start maintaining a phantom.
+  cat > "$TESTROOT/mrmore.b" <<'MRMEOF'
+OPEN "MRIX" TO F ELSE STOP
+WRITE "Zoe":@AM:"London" ON F, "R4"
+MRMEOF
+  "$MVX" "$TESTROOT/mrmore.b" -o "$TESTROOT/mrmorebin" 2>/dev/null
+  check tcl-mariadb-noix "$( \
+    echo '--- the index is refused, by name, and not as a fault'; \
+    "$TCL" -a "$MRA" -c 'CREATE-INDEX MRIX CITY' 2>&1; \
+    echo '--- nothing is listed afterwards'; \
+    "$TCL" -a "$MRA" -c 'LIST-INDEXES MRIX' 2>&1; \
+    echo '--- the filter still runs in MariaDB, not the verb'; \
+    "$TCL" -a "$MRA" -c 'LIST DESCRIBE MRIX WITH CITY = "London"' 2>&1 \
+      | grep -c "JSON_CONTAINS"; \
+    echo '--- and the answers are right, multivalue semantics and all'; \
+    "$TCL" -a "$MRA" -c 'COUNT MRIX WITH CITY = "London"' 2>&1; \
+    "$TCL" -a "$MRA" -c 'COUNT MRIX WITH CITY = "York"' 2>&1; \
+    echo '--- and a WRITE still maintains nothing it should not'; \
+    (cd "$MRA" && MVXACCOUNT=. "$TESTROOT/mrmorebin"); \
+    "$TCL" -a "$MRA" -c 'COUNT MRIX WITH CITY = "London"' 2>&1)"
+else
+  echo "  (mariadb test skipped — set MVX_MARIADB to run)"
 fi
 
 # mongo backend — only when MVX_MONGO names a reachable MongoDB, e.g.
