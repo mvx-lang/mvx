@@ -1185,6 +1185,52 @@ EOF
 "$MVX" "$ptrread" -o "$TESTROOT/ptrreadbin" 2>/dev/null
 check tcl-voc-pointer "$( (cd "$PTR" && MVXACCOUNT=. "$TESTROOT/ptrreadbin" 2>&1) )"
 
+# LISTF REPORTS WHAT RESOLUTION WILL USE (#318, the FILELIST limit).
+#
+# FILELIST asks each backend what it holds, so the type column was whichever
+# backend ANSWERED.  Since stage 3 the pointer decides, and the two can
+# disagree -- which made the listing name a backend the account does not use,
+# for a file it cannot open:
+#
+#   pointer:  lmdb:PARTS        LISTF: PARTS sqlite      COUNT: cannot open
+#
+# ASSERTED BY REWRITING ONLY THE POINTER, nothing else: no CONVERT-FILE, no
+# BINDINGS, no data moved.  That is the one edit that makes the pointer and
+# the backends disagree, so it is the only thing that can tell which one the
+# listing is reading.
+#
+# THE FALLBACK IS ASSERTED TOO, because "shadowing, not replacing" is half the
+# rule: a pre-stage-2 pointer is ignored, and that file must still be listed
+# by the backend holding it rather than vanishing or going blank.
+PLF="$TESTROOT/lfptr"
+"$ROOT/scripts/mkaccount.sh" "$PLF" >/dev/null 2>&1
+"$TCL" -a "$PLF" -c 'CREATE-FILE PARTS' >/dev/null 2>&1
+"$TCL" -a "$PLF" -c 'CREATE-FILE LEGACY' >/dev/null 2>&1
+cat > "$TESTROOT/lfptr.b" <<'LFEOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+* only the pointer moves; the table stays in sqlite
+READ R FROM V, "PARTS" THEN
+   R<2> = "lmdb:PARTS"
+   R<3> = "lmdb:DICT.PARTS"
+   WRITE R ON V, "PARTS"
+END
+* and LEGACY gets the form every pre-stage-2 account carries
+WRITE "F":@AM:"LEGACY":@AM:"LEGACY.DICT" ON V, "LEGACY"
+LFEOF
+"$MVX" "$TESTROOT/lfptr.b" -o "$TESTROOT/lfptrbin" 2>/dev/null
+check tcl-listf-pointer "$( \
+  echo '--- before: the pointer and the backend agree'; \
+  "$TCL" -a "$PLF" -c 'LISTF' 2>&1 | grep -E '^PARTS'; \
+  (cd "$PLF" && MVXACCOUNT=. "$TESTROOT/lfptrbin"); \
+  echo '--- after rewriting ONLY the pointer, the listing follows it'; \
+  "$TCL" -a "$PLF" -c 'LISTF' 2>&1 | grep -E '^PARTS'; \
+  echo '--- and resolution agrees -- it looks in lmdb, where the table is not'; \
+  "$TCL" -a "$PLF" -c 'COUNT PARTS' 2>&1; \
+  echo '--- a pre-stage-2 pointer is ignored, so the backend still answers'; \
+  "$TCL" -a "$PLF" -c 'LISTF' 2>&1 | grep -E '^LEGACY'; \
+  echo '--- and that file still opens'; \
+  "$TCL" -a "$PLF" -c 'COUNT LEGACY' 2>&1)"
+
 # HALF A FILE, AND A DICTIONARY SEVERAL FILES SHARE (#318 stage 4).
 #
 # U2 spells this CREATE.FILE DICT name and CREATE.FILE DATA name, and each half
