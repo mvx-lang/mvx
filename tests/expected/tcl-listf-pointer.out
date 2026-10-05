@@ -1,0 +1,10 @@
+--- before: the pointer and the backend agree
+PARTS                    sqlite
+--- after rewriting ONLY the pointer, the listing follows it
+PARTS                    lmdb
+--- and resolution agrees -- it looks in lmdb, where the table is not
+cannot open PARTS
+--- a pre-stage-2 pointer is ignored, so the backend still answers
+LEGACY                   sqlite
+--- and that file still opens
+0 record(s) counted
