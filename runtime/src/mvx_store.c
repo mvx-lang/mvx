@@ -4143,6 +4143,37 @@ static int fl_listed(const char *buf, size_t len, const char *name, size_t n) {
     return 0;
 }
 
+/* THE TYPE IS WHAT RESOLUTION WILL USE, WHICH IS THE POINTER (#318).
+ *
+ * The enumeration below asks each backend what it holds, so the type was
+ * whichever backend ANSWERED.  Since stage 3 the VOC pointer decides where a
+ * file lives, and the two can disagree -- measured: a pointer rewritten to
+ * `lmdb:PARTS` left LISTF reporting `PARTS sqlite` while `COUNT PARTS` said
+ * "cannot open PARTS", because resolution followed the pointer to lmdb and
+ * the table was in sqlite.  A listing naming a backend the account does not
+ * use, for a file it cannot open, is worse than no column at all.
+ *
+ * SHADOWING, NOT REPLACING -- the same rule resolve() follows.  A usable
+ * pointer wins; everything else keeps the answer the enumeration gave, so a
+ * file with no pointer, or a pre-stage-2 one, lists exactly as before.  That
+ * is also why the enumeration is left alone: listing FROM pointers would
+ * drop any file whose pointer was never written.
+ *
+ * pointer_location() is safe to call here -- it is cached per account and
+ * returns 0 under g_derive_only, so a caller already deriving gets today's
+ * answer rather than a recursion. */
+static const char *fl_type(const char *name, size_t n, int want_dict,
+                           const char *fallback) {
+    static char pdrv[64];
+    char nb[256], spec[1200];
+    if (n == 0 || n >= sizeof nb) return fallback;
+    memcpy(nb, name, n);
+    nb[n] = '\0';
+    if (pointer_location(nb, want_dict, pdrv, sizeof pdrv, spec, sizeof spec))
+        return pdrv;
+    return fallback;
+}
+
 /* FILELIST(): every MV file in the account — subdirectories (directory
    driver) plus LMDB named DBs, as "name @VM type" attributes.  DICT
    stores and infrastructure directories are filtered out. */
@@ -4218,7 +4249,10 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                 struct stat bb;
                 if (stat(bp, &bb) == 0 && S_ISDIR(bb.st_mode)) isdir = 0;
             }
-            if (isdir) FL_PUTS(nm, nml, "dir");
+            if (isdir) {
+                const char *ty = fl_type(nm, nml, 0, "dir");
+                FL_PUTS(nm, nml, ty);
+            }
         }
         free(ents[i]);
     }
@@ -4245,7 +4279,10 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
             while (p < end) {
                 const char *am = memchr(p, '\xFE', (size_t)(end - p));
                 size_t n = (am ? am : end) - p;
-                if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, local_drv[li]);
+                if (n > 0 && !fl_internal(p, n)) {
+                    const char *ty = fl_type(p, n, 0, local_drv[li]);
+                    FL_PUTS(p, n, ty);
+                }
                 p = am ? am + 1 : end;
             }
             /* A DICTIONARY WITH NO DATA IS STILL A FILE (#318 stage 5).
@@ -4274,8 +4311,13 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                     if (n > 5 && memcmp(q, "DICT.", 5) == 0) {
                         const char *base = q + 5;
                         size_t bn = n - 5;
-                        if (!fl_listed(buf, len, base, bn))
-                            FL_PUTS(base, bn, local_drv[li]);
+                        if (!fl_listed(buf, len, base, bn)) {
+                            /* want_dict: this file has only a dictionary, so
+                               attribute 3 is the half that says where it is. */
+                            const char *ty = fl_type(base, bn, 1,
+                                                     local_drv[li]);
+                            FL_PUTS(base, bn, ty);
+                        }
                     }
                     q = am ? am + 1 : qe;
                 }
@@ -4362,7 +4404,10 @@ void mvx_filelist(mvx_ctx *ctx, mv_value *dst) {
                     while (p < end) {
                         const char *am = memchr(p, '\xFE', (size_t)(end - p));
                         size_t n = (am ? am : end) - p;
-                        if (n > 0 && !fl_internal(p, n)) FL_PUTS(p, n, bdrv);
+                        if (n > 0 && !fl_internal(p, n)) {
+                            const char *ty = fl_type(p, n, 0, bdrv);
+                            FL_PUTS(p, n, ty);
+                        }
                         p = am ? am + 1 : end;
                     }
                 }
