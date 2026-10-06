@@ -84,6 +84,7 @@ const std::set<std::string> kIntIntrinsics = {
     "MULTISELECT", "TRANSORDERSELECT",
     "OSWRITE", "OSDELETE", "OSEXEC", "MKDIR", "RMTREE", "UNTAR",
     "EDITFILE", "SETCRED", "SETCONN",
+    "POINTERFIX",
 };
 
 // String-valued intrinsics (boxed results).
@@ -786,6 +787,9 @@ private:
             }
             if (f == "DELETEFILE" && e.args.size() == 1)
                 return callRt("mvx_deletefile", i64Ty_, {ptrTy_, ptrTy_},
+                              {ctxArg_, evalPtr(*e.args[0])});
+            if (f == "POINTERFIX" && e.args.size() == 1)
+                return callRt("mvx_pointer_fix", i64Ty_, {ptrTy_, ptrTy_},
                               {ctxArg_, evalPtr(*e.args[0])});
             if (f == "INDEXBUILD" && e.args.size() == 2)
                 return callRt("mvx_index_build", i64Ty_,

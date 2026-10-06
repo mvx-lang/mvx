@@ -1185,6 +1185,55 @@ EOF
 "$MVX" "$ptrread" -o "$TESTROOT/ptrreadbin" 2>/dev/null
 check tcl-voc-pointer "$( (cd "$PTR" && MVXACCOUNT=. "$TESTROOT/ptrreadbin" 2>&1) )"
 
+# AN OLD ACCOUNT'S POINTERS CAN BE BROUGHT UP TO DATE (#318, the sweep).
+#
+# Stage 2 writes a pointer when a file is CREATED, so an account nobody has
+# created a file in since then carries the pre-stage-2 form for every file.
+# It is ignored rather than trusted, so nothing is broken -- FIX-POINTERS is
+# cleanup, and this asserts it is cleanup that cannot cost anybody a pointer.
+#
+# THE PROPERTY THAT MATTERS IS THE ONE THAT DOES NOTHING: a pointer somebody
+# WROTE must come through untouched, attributes past the third included.
+# POINTERFIX reuses CREATE-FILE's rule -- overwrite the legacy form byte for
+# byte, leave anything else -- so the test is of that reuse holding, and it
+# is asserted on a pointer carrying a fifth attribute, which is the thing an
+# account would actually lose.
+#
+# LISTONLY is asserted by what did NOT happen: the legacy pointer is still
+# legacy afterwards.  And the sweep is run TWICE, because a cleanup that is
+# not idempotent is a cleanup nobody can safely repeat.
+FXP="$TESTROOT/fixptr"
+"$ROOT/scripts/mkaccount.sh" "$FXP" >/dev/null 2>&1
+for f in FPA FPB FPKEEP; do
+  "$TCL" -a "$FXP" -c "CREATE-FILE $f" >/dev/null 2>&1
+done
+cat > "$TESTROOT/fxpseed.b" <<'FXEOF'
+OPEN "VOC" TO V ELSE STOP "no VOC"
+* two carrying the pre-stage-2 form ...
+WRITE "F":@AM:"FPA":@AM:"FPA.DICT" ON V, "FPA"
+WRITE "F":@AM:"FPB":@AM:"FPB.DICT" ON V, "FPB"
+* ... and one somebody wrote, with an attribute of their own past the third
+WRITE "F":@AM:"lmdb:FPKEEP":@AM:"lmdb:DICT.FPKEEP":@AM:"":@AM:"mine" ON V, "FPKEEP"
+FXEOF
+"$MVX" "$TESTROOT/fxpseed.b" -o "$TESTROOT/fxpseedbin" 2>/dev/null
+(cd "$FXP" && MVXACCOUNT=. "$TESTROOT/fxpseedbin")
+check tcl-fix-pointers "$( \
+  echo '--- LISTONLY names them and changes nothing'; \
+  "$TCL" -a "$FXP" -c 'FIX-POINTERS LISTONLY' 2>&1 | head -4; \
+  echo '--- so FPA is still the old form'; \
+  "$TCL" -a "$FXP" -c 'CT VOC FPA' 2>&1 | sed -n 3p; \
+  echo '--- the sweep rewrites them'; \
+  "$TCL" -a "$FXP" -c 'FIX-POINTERS' 2>&1 | head -1; \
+  echo '--- and FPA now names its backend'; \
+  "$TCL" -a "$FXP" -c 'CT VOC FPA' 2>&1 | sed -n 3p; \
+  echo '--- running it again changes nothing'; \
+  "$TCL" -a "$FXP" -c 'FIX-POINTERS' 2>&1 | head -1; \
+  echo '--- a pointer somebody WROTE is untouched, fifth attribute and all'; \
+  "$TCL" -a "$FXP" -c 'CT VOC FPKEEP' 2>&1 | sed -n -e 3p -e 6p; \
+  echo '--- and every file still opens'; \
+  "$TCL" -a "$FXP" -c 'COUNT FPA' 2>&1; \
+  "$TCL" -a "$FXP" -c 'COUNT FPKEEP' 2>&1)"
+
 # LISTF REPORTS WHAT RESOLUTION WILL USE (#318, the FILELIST limit).
 #
 # FILELIST asks each backend what it holds, so the type column was whichever

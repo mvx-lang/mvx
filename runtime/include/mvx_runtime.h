@@ -364,6 +364,11 @@ void    mvx_release(mvx_ctx *ctx, const mv_value *fvar, const mv_value *id);
 void    mvx_select(mvx_ctx *ctx, const mv_value *fvar);
 void    mvx_formlist(mvx_ctx *ctx, const mv_value *ids); /* AM-separated */
 int64_t mvx_readnext(mvx_ctx *ctx, mv_value *id);
+/* POINTERFIX(name): rewrite one file's VOC pointer when it carries the
+   pre-stage-2 form, so an old account stops being resolved by derivation
+   (mvx#318).  1 = rewritten, 0 = nothing to do. */
+int64_t mvx_pointer_fix(mvx_ctx *ctx, const mv_value *spec);
+
 int64_t mvx_index_build(mvx_ctx *ctx, const mv_value *fvar,
                         const mv_value *item);      /* -1 fail, else count */
 int64_t mvx_index_drop(mvx_ctx *ctx, const mv_value *fvar,
