@@ -1,0 +1,19 @@
+--- LISTONLY names them and changes nothing
+FIX-POINTERS: 2 pointer(s) would be rewritten
+  FPA
+  FPB
+  2 left alone (already current, or not ours to change)
+--- so FPA is still the old form
+002 FPA
+--- the sweep rewrites them
+FIX-POINTERS: 2 pointer(s) rewritten
+--- and FPA now names its backend
+002 sqlite:FPA
+--- running it again changes nothing
+FIX-POINTERS: every pointer is already current (4 file(s))
+--- a pointer somebody WROTE is untouched, fifth attribute and all
+002 lmdb:FPKEEP
+005 mine
+--- and every file still opens
+0 record(s) counted
+cannot open FPKEEP

@@ -937,6 +937,21 @@ static void pointer_cache_drop(void) {
     g_pl_n = 0; g_pl_next = 0; g_pl_acct[0] = '\0';
 }
 
+/* THE FORM EVERY PRE-STAGE-2 ACCOUNT CARRIES, in one place.  It was built
+   independently in pointer_location (which ignores it) and voc_register
+   (which is allowed to overwrite it); a third reader was one definition too
+   many, and two copies of a byte-for-byte comparison drift in silence.
+   "F / name / name.DICT" was inaccurate for a hash file the day it was
+   written -- their dictionary is DICT.<name> inside the backend -- which is
+   why it is recognised exactly and never trusted. */
+static int legacy_pointer(const char *rec, int64_t len, const char *name) {
+    char legacy[1300];
+    int ln = snprintf(legacy, sizeof legacy, "F%c%s%c%s.DICT",
+                      (char)0xFE, name, (char)0xFE, name);
+    return ln > 0 && (int64_t)ln == len &&
+           memcmp(rec, legacy, (size_t)ln) == 0;
+}
+
 /* Derive, do not read the pointer.  Two callers need it: resolving VOC itself,
    which would recurse; and voc_register, which asks resolve() where a file
    lives in order to WRITE that answer down -- reading the pointer there would
@@ -984,11 +999,7 @@ static int pointer_location(const char *cspec, int want_dict,
             const char *rp;
             int64_t rlen = mv_val_chars(&rec, nb, sizeof nb, &rp);
 
-            /* the form every pre-stage-2 account carries, and it is wrong */
-            char legacy[1300];
-            int ln = snprintf(legacy, sizeof legacy, "F%c%s%c%s.DICT",
-                              (char)0xFE, cspec, (char)0xFE, cspec);
-            int stale = (rlen == ln && memcmp(rp, legacy, (size_t)ln) == 0);
+            int stale = legacy_pointer(rp, rlen, cspec);
 
             const char *t; int64_t tl;
             attr_n(rp, rlen, 1, &t, &tl);
@@ -4700,14 +4711,11 @@ static void voc_register(const char *name, int halves) {
     mv_value existing;
     mv_init(&existing);
     if (drv->read(v, name, (int64_t)nl, &existing)) {
-        char legacy[1300];
-        int ln = snprintf(legacy, sizeof legacy, "F%c%s%c%s.DICT",
-                          (char)0xFE, name, (char)0xFE, name);
         char nb[40];
         const char *ep;
         int64_t elen = mv_val_chars(&existing, nb, sizeof nb, &ep);
-        int ours = (halves == MV_HALF_BOTH && elen == ln &&
-                    memcmp(ep, legacy, (size_t)ln) == 0);
+        int ours = (halves == MV_HALF_BOTH &&
+                    legacy_pointer(ep, elen, name));
         mv_clear(&existing);
         if (!ours) { drv->close(v); return; }
     } else {
@@ -5119,6 +5127,87 @@ int mvx_bind_driver(const char *file, const char *want) {
 int mvx_bind_driver_quiet(const char *file, const char *want,
                           char *instead, size_t icap) {
     return bind_driver(file, want, instead, icap, 0);
+}
+
+/* POINTERFIX(name): bring one file's VOC pointer up to date (#318).
+ *
+ * Stage 2 writes a pointer when a file is CREATED, so an account nobody has
+ * created a file in since then still carries the pre-stage-2 form for every
+ * file in it.  That form is ignored rather than trusted, so nothing is
+ * broken -- this is cleanup, and it is what would one day let the tolerance
+ * in pointer_location() go.  It CANNOT go as a consequence of this existing:
+ * an account that has not been swept would then have its legacy pointer
+ * believed, and a hash file's dictionary looked for at <name>.DICT instead
+ * of DICT.<name>.
+ *
+ * SAFE BY REUSE, not by a second rule.  voc_register() already overwrites
+ * only the byte-for-byte legacy form and leaves anybody's own edit alone, so
+ * this adds no new way to lose a pointer somebody wrote.
+ *
+ * WHICH HALVES THE FILE HAS IS PROBED, not assumed.  Passing BOTH would be
+ * right for every account that predates halves -- the legacy form is older
+ * than the idea of half a file -- but a hand-written legacy pointer on a
+ * dictionary-only file would then gain a data half it does not have, and
+ * writing a claim about a half that is not there is the fault stage 5b was
+ * about.  Opening each half answers it for any backend, where asking a
+ * driver for its file list only answers for the account's own store.
+ *
+ * Returns 1 if the pointer was rewritten, 0 if there was nothing to do.
+ */
+static int pointer_half_exists(const char *cspec, int want_dict) {
+    char spec[1152];
+    int was = g_derive_only;
+    g_derive_only = 1;              /* the pointer is what we are replacing */
+    const mvx_driver *d = resolve(cspec, want_dict, spec, sizeof spec);
+    g_derive_only = was;
+    if (!d) return 0;
+    char err[256] = "";
+    mvx_file *f = d->open(spec, err, sizeof err);
+    if (!f) return 0;
+    d->close(f);
+    return 1;
+}
+
+int64_t mvx_pointer_fix(mvx_ctx *ctx, const mv_value *spec) {
+    (void)ctx;
+    char cspec[1024];
+    if (!spec_cstr(spec, cspec, sizeof cspec)) return 0;
+    size_t nl = strlen(cspec);
+    if (strcmp(cspec, "VOC") == 0 || strcmp(cspec, "MD") == 0) return 0;
+    if (nl > 5 && strcmp(cspec + nl - 5, ".DICT") == 0) return 0;
+
+    /* Is there anything to do?  Asked here as well as inside voc_register,
+       because the caller is told which files changed and a sweep that
+       reported every file as fixed would say nothing. */
+    char vspec[1152];
+    int was = g_derive_only;
+    g_derive_only = 1;
+    const mvx_driver *vd = resolve("VOC", 0, vspec, sizeof vspec);
+    g_derive_only = was;
+    if (!vd) return 0;
+    char err[256] = "";
+    mvx_file *v = vd->open(vspec, err, sizeof err);
+    if (!v) return 0;
+    int was_legacy = 0;
+    mv_value rec;
+    mv_init(&rec);
+    if (vd->read(v, cspec, (int64_t)nl, &rec)) {
+        char nb[40];
+        const char *rp;
+        int64_t rlen = mv_val_chars(&rec, nb, sizeof nb, &rp);
+        was_legacy = legacy_pointer(rp, rlen, cspec);
+    }
+    mv_clear(&rec);
+    vd->close(v);
+    if (!was_legacy) return 0;
+
+    int halves = 0;
+    if (pointer_half_exists(cspec, 0)) halves |= MV_HALF_DATA;
+    if (pointer_half_exists(cspec, 1)) halves |= MV_HALF_DICT;
+    if (!halves) return 0;          /* nothing of it is there to describe */
+
+    voc_register(cspec, halves);
+    return 1;
 }
 
 int64_t mvx_createfile(mvx_ctx *ctx, const mv_value *spec,

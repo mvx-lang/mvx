@@ -171,6 +171,46 @@ static void load_dir(const char *dir) {
             const char *why = dlerror();
             fprintf(stderr, "mvx: cannot load %s: %s\n", path,
                     why ? why : "unknown error");
+            /* AND SAY WHAT TO DO (#356).  A MISSING DEPENDENCY is not the
+               same fault as a broken library, and the remedy is not obvious
+               from the loader's wording.  A released tarball can carry an
+               extension whose shared library this host does not have --
+               install-time checking cannot prevent it, because the host is
+               not present when a relocatable artifact is built -- so the
+               first time anyone learns of it is here.  Two actions, because
+               either is legitimate: supply the library, or drop the
+               extension that wants it.
+               Matched on the loader's text, and BOTH WORDINGS, because they
+               differ and testing only one leaves the other silent: glibc says
+               "cannot open shared object file", dyld says "Library not
+               loaded" and then "no such file".  It only ADDS a line rather
+               than replacing the one above, so a third wording loses the
+               hint and nothing else. */
+            if (why && (strstr(why, "cannot open shared object file") ||
+                        strstr(why, "Library not loaded"))) {
+                const char *base = strrchr(path, '/');
+                base = base ? base + 1 : path;
+                char pkg[128] = "";
+                /* libmvxext_<name>.so is the convention every extension
+                   package follows, so the name in the file is the name
+                   MVPKG knows it by. */
+                if (strncmp(base, "libmvxext_", 10) == 0) {
+                    const char *e = strchr(base + 10, '.');
+                    size_t n = e ? (size_t)(e - (base + 10)) : strlen(base + 10);
+                    if (n && n < sizeof pkg) {
+                        memcpy(pkg, base + 10, n);
+                        pkg[n] = '\0';
+                    }
+                }
+                fprintf(stderr,
+                        "     a library it needs is not on this host.  "
+                        "Install it, or remove the\n"
+                        "     extension that wants it");
+                if (pkg[0])
+                    fprintf(stderr, " with `MVPKG remove %s'", pkg);
+                fprintf(stderr,
+                        ".  Nothing else in mvx is affected.\n");
+            }
             continue;
         }
         /* What was this compiled against?  mvx-basic stamps every artifact
