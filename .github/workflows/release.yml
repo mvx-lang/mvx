@@ -140,12 +140,36 @@ jobs:
             echo "no develop branch here; nothing to check" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           }
+          # WHAT develop WILL REPORT, for the summary only.  The check below
+          # does NOT read this string -- see why.
           desc="$(git describe --tags --match 'v*' origin/develop 2>/dev/null || echo '(none)')"
           echo "develop describes as \`$desc\`" >> "$GITHUB_STEP_SUMMARY"
-          case "$desc" in
-            "$TAG"|"$TAG"-*)
-              echo "develop can see $TAG." >> "$GITHUB_STEP_SUMMARY" ;;
-            *)
+          # THE TEST IS REACHABILITY, NOT A STRING COMPARISON, because the
+          # question is literally whether develop can see this commit.
+          #
+          # This used to match describe's output against `"$TAG"|"$TAG"-*`.  The
+          # second arm is there for the legitimate case -- develop moving on
+          # after the release merge, so `v0.7.2-2-gabc` is develop seeing
+          # v0.7.2 perfectly well -- but it ALSO matches a pre-release of the
+          # same version, and that is a false pass on the exact failure this
+          # job exists to catch (mvx#360):
+          #
+          #     TAG=v0.9.0, desc=v0.9.0-rc1          -> passed
+          #     TAG=v0.9.0, desc=v0.9.0-rc1-3-gabc   -> passed
+          #
+          # A `-rc1` suffix is indistinguishable, as a glob, from a commit-count
+          # suffix.  mvx has never cut a pre-release tag so this never fired
+          # here, but mapfield had the same failure with real tags -- develop
+          # describing as `1.1.0-beta1-3-ge4c7348` while the tag was `1.1.0` --
+          # and this pattern would have called it fine (mapfield#19, #22).
+          #
+          # An exact match is not the answer either: it fails the legitimate
+          # case above, which is what mapfield#19 shipped and had to correct
+          # two commits later.  --is-ancestor is right in both directions and
+          # needs no parsing.  json#44 and mapfield#22 run the same test.
+          if git merge-base --is-ancestor "$TAG" origin/develop 2>/dev/null; then
+              echo "develop can see $TAG." >> "$GITHUB_STEP_SUMMARY"
+          else
               echo "::warning title=develop cannot see $TAG::develop describes as '$desc', so builds from it will report that and not $TAG. If this was meant to be a develop release, the tag belongs on the merge's second parent -- see the header of this workflow. If it is a main-only hotfix, this is expected."
               {
                 echo
@@ -153,8 +177,8 @@ jobs:
                 echo "report \`$desc\`. For a develop release the tag belongs on"
                 echo "the merge's second parent (\`git rev-parse main^2\`); for a"
                 echo "main-only hotfix this is expected."
-              } >> "$GITHUB_STEP_SUMMARY" ;;
-          esac
+              } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   binaries:
     needs: ci-gate
