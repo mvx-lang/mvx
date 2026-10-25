@@ -56,11 +56,30 @@ jobs:
           echo "develop is at $SHA"
 
           # --- is there anything new? ---------------------------------------
-          LAST="$(git rev-parse -q --verify 'refs/tags/dev^{commit}' || true)"
+          # WHICH RELEASE LINE IS develop ON? (mvx#364)  The dev tag names it,
+          # Composer-style: `<maj>.<min>.x-dev' is the TOP of that line -- above
+          # every release on it, below the next one up -- which is what a build
+          # from develop actually is.  A bare `dev' tag parsed as a STABLE 0.0.0
+          # in BOTH version readers, so a nightly presented itself as a release
+          # of version zero (mv-package-registry#77, mv_package#172).
+          #
+          # THE HIGHEST STABLE TAG DECIDES THE SERIES, so a beta or a previous
+          # dev tag cannot move it: the sed keeps only digits-and-dots tags with
+          # this repo's optional `v' prefix, and `sort -V' orders them as
+          # versions rather than strings -- 1.24.2 above 1.4.1, which a lexical
+          # sort gets backwards.
+          LASTREL="$(git tag --list \
+                     | sed -n 's/^v\{0,1\}[0-9][0-9.]*$/&/p' | sort -V | tail -1)"
+          [ -n "$LASTREL" ] || LASTREL=0.0.0
+          PFX=""; case "$LASTREL" in v*) PFX=v ;; esac
+          TAG="$PFX$(printf '%s' "${LASTREL#v}" | awk -F. '{printf "%d.%d.x-dev", $1, $2}')"
+          echo "last stable release $LASTREL -- dev tag is $TAG"
+
+          LAST="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)"
           if [ -n "$LAST" ]; then
             echo "last dev build was $LAST"
           else
-            echo "no dev tag yet — this is the first dev build"
+            echo "no $TAG tag yet — this is the first dev build"
           fi
           if [ "$LAST" = "$SHA" ]; then
             echo "nothing new since the last dev build — stopping."
@@ -97,11 +116,10 @@ jobs:
           echo "ci is green: $url"
 
           # --- move the tag, and start the build ----------------------------
-          # -f and --force, because the whole point is that `dev` MOVES.  An
-          # annotated tag carries the date and the commit it was made from, so
-          # what a given dev build was is still answerable after the tag has
+          # -f and --force, because the whole point is that the dev tag MOVES.
+          # An annotated tag carries the date and the commit it was made from,
+          # so what a given dev build was is still answerable after the tag has
           # moved on -- by the release, which keeps its own record.
-          TAG=dev
           git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               tag -f -a "$TAG" -m "nightly dev build of develop at $SHA" "$SHA"
