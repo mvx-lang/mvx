@@ -14,8 +14,25 @@ env:
   LLVM_VERSION: "21"
 
 jobs:
+  # PINNED, BECAUSE THIS JOB INSTALLS PUBLISHED PACKAGES (mvx#367).  The install
+  # phase fetches the git package and then ASSERTS it arrived -- and mvx refuses
+  # to copy a package whose native libraries cannot load here, so the assertion
+  # is really about this runner's libraries.  mv_git builds its mvx arm on
+  # `ubuntu-24.04' and links libgit2, whose soname pins the MINOR; `ubuntu-latest'
+  # rolled on to libgit2 1.9, the published binaries need 1.7, the package was
+  # correctly skipped and the assertion correctly failed.
+  #
+  # The claim the test makes is "the published package installs here", so HERE
+  # must be the platform the package is built for.  Pinned to the image that
+  # builds it, the two move together or not at all.
+  #
+  # WHAT THIS DOES NOT FIX, and the pin now hides: no published git artifact
+  # installs on an Ubuntu carrying libgit2 1.9, which is what a current Ubuntu
+  # is.  That is a real user-facing gap and it is mv_git#287 -- a build for the
+  # newer series, which is a release decision.  Do not read a green build-test
+  # as that being solved.
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
