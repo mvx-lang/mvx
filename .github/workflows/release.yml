@@ -34,7 +34,11 @@ on:
     # something new and CI is green.  It builds through THIS workflow rather
     # than a second copy of it, so a dev build is the same artifacts by the same
     # steps as a release -- the only way a dev build is worth having.
-    tags: ["v*", "dev"]
+    # `v<maj>.<min>.x-dev' matches "v*", so the dev tag needs no entry of its
+    # own any more.  It used to be a bare `dev', which both version readers
+    # took for a stable 0.0.0 (#364); the entry is gone rather than kept
+    # harmlessly, because a trigger for a retired shape is how it comes back.
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
