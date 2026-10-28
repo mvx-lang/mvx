@@ -7194,6 +7194,120 @@ else
         echo "FAIL install deps: the unloadable package was not skipped"
         sed -n 's/^/    | /p' "$PDW/install2.log" | tail -8
       fi
+
+      # ... UNLESS IT CAN BE BUILT HERE (mvx#370).  Skipping is right for a
+      # prebuilt that cannot load, but it leaves the host without the package,
+      # and for libgit2 there is no library the user can install to fix it --
+      # Ubuntu 25.10 and 26.04 ship 1.9 and no 1.7 at all.  So when the release
+      # also published its SOURCE, build that against what this machine has.
+      #
+      # The fixture is the same shape as the real case: the BINARY asset's
+      # library needs a libfake.so.1 that is not here, and the SOURCE asset
+      # carries what it needs to produce one that is.  mvpkg is the package
+      # under test because the fallback runs for BUNDLED packages, which are
+      # mvpkg and git by name.
+      #
+      # TESTED AS A PAIR.  The same unloadable binary is installed twice, once
+      # with the source asset listed and once without: without the pair, "it
+      # installed" could as easily mean the native check had stopped working.
+      pd_pack_src() {   # pd_pack_src <dir> <repo> <stem> <version>
+        out="$PDR/$2/releases/download/$4"
+        mkdir -p "$out"
+        tar czf "$out/$3-$4-source.tar.gz" -C "$1" .
+        ( cd "$out" && { shasum -a 256 "$3-$4-source.tar.gz" 2>/dev/null \
+                         || sha256sum "$3-$4-source.tar.gz"; } \
+                       > "$3-$4-source.tar.gz.sha256" )
+      }
+
+      SP="$PDW/p/srcmvpkg"
+      mkdir -p "$SP/src" "$SP/deps" "$SP/VOC" "$SP/CATALOG" "$SP/LIB"
+      cp "$PDW/fake.c" "$SP/src/fake.c"
+      echo 'int fake(void); int srcext(void){return fake();}' > "$SP/src/stub.c"
+      cp "$ND/LIB/libstub.so" "$SP/LIB/libmvxext_mvpkg.so"   # the stale prebuilt
+      printf 'SRCFN 1 1\n' > "$SP/EXPORTS"
+      echo x > "$SP/CATALOG/MVPKG"
+      echo V > "$SP/VOC/MVPKG"
+      printf '{"name":"mvx-lang/mvpkg","artifact":"mvpkg","version":"9.9.9","dependencies":[]}\n' \
+        > "$SP/mvpkg.json"
+      # mkpkg needs a BP directory or a NATIVE manifest to consider this a
+      # package at all; the comment is enough for the latter, and leaves the
+      # whole build to build-native.sh, which is where a package that links an
+      # OS library does its work.
+      printf '# built by build-native.sh\n' > "$SP/NATIVE"
+      # libfake is carried OUTSIDE LIB/ because mkpkg clears LIB/ before it
+      # builds -- and put into LIB/ by the build, which is also what makes the
+      # result loadable: the native check searches <package>/LIB.
+      cc -shared -fPIC -Wl,-soname,libfake.so.1 -o "$SP/deps/libfake.so.1" "$PDW/fake.c"
+      cat > "$SP/build-native.sh" <<'BNEOF'
+#!/bin/sh
+set -e
+PKG="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$PKG/LIB"
+cp "$PKG/deps/libfake.so.1" "$PKG/LIB/libfake.so.1"
+cc -shared -fPIC -o "$PKG/LIB/libmvxext_mvpkg.so" "$PKG/src/stub.c" \
+   -L"$PKG/LIB" -l:libfake.so.1
+echo "  built LIB/libmvxext_mvpkg.so (fixture)"
+BNEOF
+      chmod +x "$SP/build-native.sh"
+
+      # The binary asset: the prebuilt library, and nothing to resolve it with.
+      SB="$PDW/p/binmvpkg"
+      rm -rf "$SB"; mkdir -p "$SB/LIB" "$SB/VOC" "$SB/CATALOG"
+      cp "$SP/LIB/libmvxext_mvpkg.so" "$SB/LIB/"
+      cp "$SP/EXPORTS" "$SB/EXPORTS"
+      cp "$SP/mvpkg.json" "$SB/mvpkg.json"
+      echo x > "$SB/CATALOG/MVPKG"
+      echo V > "$SB/VOC/MVPKG"
+      pd_pack "$SB" mv_package mvpkg 9.9.9
+      pd_pack_src "$SP" mv_package mvpkg 9.9.9
+
+      # The listing is where the source URL comes from, so it has to name the
+      # asset the way a real release does -- with its download URL.
+      SREL="$PDR/mv_package/releases/download/9.9.9"
+      printf '[{"tag_name":"9.9.9","prerelease":false,"draft":false,"assets":[{"name":"mvpkg-9.9.9-mvx-%s.tar.gz","browser_download_url":"file://%s/mvpkg-9.9.9-mvx-%s.tar.gz"},{"name":"mvpkg-9.9.9-source.tar.gz","browser_download_url":"file://%s/mvpkg-9.9.9-source.tar.gz"}]}]\n' \
+        "$PDT" "$SREL" "$PDT" "$SREL" > "$PDW/rel/mv_package.json"
+
+      PDPFX3="$PDW/prefix3"
+      MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$PDR" \
+        MVX_INSTALL_PKGINFO="$PDW/info" MVX_INSTALL_RELEASES="$PDW/rel" \
+        cmake --install "$ROOT/build" --prefix "$PDPFX3" </dev/null >"$PDW/install3.log" 2>&1 || true
+      PD3="$PDPFX3/share/mvx/system"
+      if [ -f "$PD3/LIB/libmvxext_mvpkg.so" ] && [ -f "$PD3/LIB/libfake.so.1" ] &&
+         grep -q "^SRCFN" "$PD3/EXPORTS" 2>/dev/null &&
+         grep -q "from source" "$PDW/install3.log"; then
+        PASS=$((PASS + 1))
+        echo "  a package whose prebuilt cannot load is built from source instead"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL source fallback: the package was not built and installed"
+        # WHICH of the four is false, and the WHOLE log.  A bare "it did not
+        # work" plus a 12-line tail says nothing about where the path stopped,
+        # and the tail is reliably the LAST package's output, not this one's.
+        [ -f "$PD3/LIB/libmvxext_mvpkg.so" ] || echo "    | no LIB/libmvxext_mvpkg.so"
+        [ -f "$PD3/LIB/libfake.so.1" ] || echo "    | no LIB/libfake.so.1"
+        grep -q "^SRCFN" "$PD3/EXPORTS" 2>/dev/null || echo "    | SRCFN is not in EXPORTS"
+        grep -q "from source" "$PDW/install3.log" || echo "    | no source build was attempted"
+        sed -n 's/^/    | /p' "$PDW/install3.log"
+      fi
+
+      # THE OTHER HALF OF THE PAIR: same unloadable binary, no source asset in
+      # the listing.  This must still skip -- if it installs, the check above
+      # measured nothing.
+      printf '[{"tag_name":"9.9.9","prerelease":false,"draft":false,"assets":[{"name":"mvpkg-9.9.9-mvx-%s.tar.gz","browser_download_url":"file://%s/mvpkg-9.9.9-mvx-%s.tar.gz"}]}]\n' \
+        "$PDT" "$SREL" "$PDT" > "$PDW/rel/mv_package.json"
+      PDPFX4="$PDW/prefix4"
+      MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$PDR" \
+        MVX_INSTALL_PKGINFO="$PDW/info" MVX_INSTALL_RELEASES="$PDW/rel" \
+        cmake --install "$ROOT/build" --prefix "$PDPFX4" </dev/null >"$PDW/install4.log" 2>&1 || true
+      if [ ! -e "$PDPFX4/share/mvx/system/LIB/libmvxext_mvpkg.so" ] &&
+         grep -q "libfake.so.1" "$PDW/install4.log"; then
+        PASS=$((PASS + 1))
+        echo "  and with no source published it is still skipped whole"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL source fallback: no source asset, yet the package installed"
+        sed -n 's/^/    | /p' "$PDW/install4.log" | tail -10
+      fi
     else
       echo "  (skipped the native-library check -- no working cc -shared)"
     fi

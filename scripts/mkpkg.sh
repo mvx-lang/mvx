@@ -56,7 +56,12 @@ json_arr() {  # json_arr <file> <key> -> one array entry per line
 }
 basename_of() { printf '%s' "${1##*/}"; }
 
-PKGNAME="$(head -1 "$PKG/PKG" 2>/dev/null)"
+# `|| true' BECAUSE OF `set -e'.  A package whose manifest is mvpkg.json has no
+# PKG file, head exits 1, and the assignment carries that status -- so the shell
+# left here, before building anything, with the reason sent to /dev/null.  The
+# mvpkg.json branch right below was unreachable the whole time: every package
+# built so far happens to carry a PKG, which is why nothing caught it.
+PKGNAME="$(head -1 "$PKG/PKG" 2>/dev/null || true)"
 if [ -z "$PKGNAME" ] && [ -f "$PKG/mvpkg.json" ]; then
   PKGNAME="$(basename_of "$(json_str "$PKG/mvpkg.json" name)")"
 fi
