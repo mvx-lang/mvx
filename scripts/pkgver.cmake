@@ -323,4 +323,54 @@ function(mvx_choose_version name repo stem triple override workdir outvar)
   message(WARNING "mvx: no valid choice for ${name}; not installing it.")
 endfunction()
 
+# mvx_source_asset(<releases-json> <tag> <outvar>)
+#
+# The download URL of a release's SOURCE asset, for building a package here when
+# its prebuilt binary cannot load (mvx#370).
+#
+# READ, NOT CONSTRUCTED.  The two bundled packages do not agree on how a source
+# asset is named -- mv_git publishes `mvx-lang_git-2.2.0-source.tar.gz' (the
+# package name) and mv_package `mvpkg-1.24.2-source.tar.gz' (the artifact stem)
+# -- so a name built from a stem here would find one of them and miss the other,
+# and miss it the quiet way: a 404 that reads as "no source published".  The
+# listing that `mvx_choose_version' already downloaded holds both the names and
+# the URLs, so ask it.
+#
+# Returns "" when there is no such asset, which is a normal answer: a
+# binary-only (commercial) package publishes none.
+function(mvx_source_asset json tag outvar)
+  set(${outvar} "" PARENT_SCOPE)
+  if(NOT EXISTS "${json}")
+    return()
+  endif()
+  file(READ "${json}" doc)
+  string(JSON n ERROR_VARIABLE jerr LENGTH "${doc}")
+  if(jerr OR n EQUAL 0)
+    return()
+  endif()
+  math(EXPR last "${n} - 1")
+  foreach(i RANGE 0 ${last})
+    string(JSON t ERROR_VARIABLE e1 GET "${doc}" ${i} tag_name)
+    if(e1 OR NOT "${t}" STREQUAL "${tag}")
+      continue()
+    endif()
+    string(JSON na ERROR_VARIABLE e2 LENGTH "${doc}" ${i} assets)
+    if(e2 OR na EQUAL 0)
+      return()                      # the release exists and has nothing to offer
+    endif()
+    math(EXPR alast "${na} - 1")
+    foreach(j RANGE 0 ${alast})
+      string(JSON an ERROR_VARIABLE e3 GET "${doc}" ${i} assets ${j} name)
+      if(NOT e3 AND an MATCHES "-source\\.tar\\.gz$")
+        string(JSON au ERROR_VARIABLE e4 GET "${doc}" ${i} assets ${j} browser_download_url)
+        if(NOT e4)
+          set(${outvar} "${au}" PARENT_SCOPE)
+        endif()
+        return()
+      endif()
+    endforeach()
+    return()                        # right release, no source asset in it
+  endforeach()
+endfunction()
+
 cmake_policy(POP)

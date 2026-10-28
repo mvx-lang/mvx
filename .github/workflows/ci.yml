@@ -213,6 +213,114 @@ jobs:
                exit 1 ;;
           esac
 
+  # ---- THE OTHER LIBGIT2, ON PURPOSE (mvx#370) -----------------------------
+  # build-test is pinned to ubuntu-24.04 so the published git package -- built
+  # against libgit2 1.7 -- fits the runner it is tested on (mvx#367).  That pin
+  # also hides the case that broke: a host whose libgit2 is 1.9, where the
+  # prebuilt cannot load and no library the user can install will change that
+  # (Ubuntu 25.10 and 26.04 ship 1.9 and no 1.7 at all).
+  #
+  # So this job IS that host, and it asserts the install builds the package here
+  # rather than leaving the toolchain without git.  `ubuntu-latest' is deliberate
+  # and the one place in this file where it is load-bearing: the point is to run
+  # on whatever is current.
+  #
+  # No services and no suite -- the question is only what the install does, so a
+  # build and one install answers it.
+  source-fallback:
+    name: git builds from source on a newer libgit2
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      # The same set build-test installs.  Trimming it to "what this job needs"
+      # would make a build failure here mean something different from a build
+      # failure there, for no saving worth having.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc g++ liblmdb-dev libedit-dev \
+            libgit2-dev libpq-dev postgresql-client libmongoc-dev pkg-config \
+            libmariadb-dev \
+            zlib1g-dev libzstd-dev libncurses-dev \
+            wget lsb-release software-properties-common gnupg ca-certificates
+          llvm_ok=
+          for attempt in 1 2 3 4 5; do
+            if wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+               && chmod +x /tmp/llvm.sh \
+               && sudo /tmp/llvm.sh "${LLVM_VERSION}" \
+               && sudo apt-get install -y --no-install-recommends \
+                    "llvm-${LLVM_VERSION}-dev"; then
+              llvm_ok=1; break
+            fi
+            echo "apt.llvm.org attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          if [ -z "$llvm_ok" ]; then
+            echo "::error::apt.llvm.org unreachable after 5 attempts over ~4 minutes."
+            exit 1
+          fi
+
+      - name: Say what libgit2 this runner has
+        run: |
+          pkg-config --modversion libgit2
+          ldconfig -p | grep -F libgit2.so || true
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="/usr/lib/llvm-${LLVM_VERSION}"
+          cmake --build build
+
+      - name: Install, and assert git was BUILT here
+        env:
+          MVX_INSTALL_PROMPT: never
+          # The install asks GitHub which package versions exist; a token keeps
+          # that listing clear of the per-IP rate limit on shared runners.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix "$PWD/stage" </dev/null 2>&1 | tee install.log
+
+          # IS THIS JOB STILL TESTING ANYTHING?  If the published package ever
+          # fits this runner -- a release built against 1.9, or ubuntu-latest
+          # moving back -- then the fallback never runs and a green result here
+          # would mean nothing at all.  Say so instead of passing quietly.
+          if ! grep -q "prebuilt libraries need" install.log; then
+            echo "::error::the prebuilt git package loads on this runner, so the"
+            echo "::error::source fallback never ran and this job proved nothing."
+            echo "::error::Point it at a libgit2 the published package was not built"
+            echo "::error::against, or retire it (mvx#370)."
+            exit 1
+          fi
+          grep -q "from source" install.log || {
+            echo "::error::no source build was attempted"; exit 1; }
+
+          # The package is THERE -- the same positive fact build-test asserts.
+          test -e stage/share/mvx/system/CATALOG/GIT || {
+            echo "::error::git was not installed"; exit 1; }
+
+          # AND IT IS THIS HOST'S libgit2 it was built against, which is the
+          # whole point.  A library that merely exists could have been copied
+          # out of the prebuilt tarball.
+          need="$(objdump -p stage/share/mvx/system/LIB/libmvxgit.so \
+                  | sed -n 's/^ *NEEDED *\(libgit2\.so[0-9.]*\).*/\1/p' | sort -u)"
+          have="$(pkg-config --modversion libgit2)"
+          # major.minor, because that is what the soname carries -- and taken
+          # with cut rather than ${have%.*}, which would answer "1" for a
+          # two-component version.
+          hm="$(printf '%s' "$have" | cut -d. -f1,2)"
+          echo "built against $need, runner has libgit2 $have"
+          case "$need" in
+            "libgit2.so.$hm") ;;
+            *) echo "::error::built against $need but this host has libgit2 $have"
+               exit 1 ;;
+          esac
+
   # ---- the workflow files themselves ---------------------------------------
   # NOTHING ELSE CHECKS THEM (mvx#314).  release.yml runs only on a tag, so a
   # mistake in it is found by cutting a release -- which is how mvx#312 was
