@@ -382,8 +382,17 @@ function(mvx_source_build name version srcurl workdir outvar)
     # The build output is the only thing that says WHICH header or library is
     # absent, and a truncated tail is what made the binary path's failure
     # unreadable, so keep it.
+    #
+    # AND THE STATUS, because a build can fail saying NOTHING: `set -e' in
+    # mkpkg left on a probe whose stderr went to /dev/null, and the warning
+    # then read "did not build here:" followed by blank lines, which is a
+    # worse report than no report.
+    string(STRIP "${bout}" bshown)
+    if(bshown STREQUAL "")
+      set(bshown "     (it printed nothing; exit status ${brc})")
+    endif()
     message(WARNING
-      "mvx: ${name} ${version} did not build here:\n${bout}\n"
+      "mvx: ${name} ${version} did not build here:\n${bshown}\n"
       "     The toolchain is installed; ${name} is not.  Install this\n"
       "     package's build dependencies (on Debian/Ubuntu that is\n"
       "     build-essential, pkg-config and the -dev package for each library\n"
