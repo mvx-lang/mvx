@@ -7280,7 +7280,14 @@ BNEOF
       else
         FAIL=$((FAIL + 1))
         echo "FAIL source fallback: the package was not built and installed"
-        sed -n 's/^/    | /p' "$PDW/install3.log" | tail -12
+        # WHICH of the four is false, and the WHOLE log.  A bare "it did not
+        # work" plus a 12-line tail says nothing about where the path stopped,
+        # and the tail is reliably the LAST package's output, not this one's.
+        [ -f "$PD3/LIB/libmvxext_mvpkg.so" ] || echo "    | no LIB/libmvxext_mvpkg.so"
+        [ -f "$PD3/LIB/libfake.so.1" ] || echo "    | no LIB/libfake.so.1"
+        grep -q "^SRCFN" "$PD3/EXPORTS" 2>/dev/null || echo "    | SRCFN is not in EXPORTS"
+        grep -q "from source" "$PDW/install3.log" || echo "    | no source build was attempted"
+        sed -n 's/^/    | /p' "$PDW/install3.log"
       fi
 
       # THE OTHER HALF OF THE PAIR: same unloadable binary, no source asset in
