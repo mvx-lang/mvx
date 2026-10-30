@@ -7315,5 +7315,95 @@ BNEOF
 fi
 rm -rf "$PDW"
 
+echo "== the toolchain ships a builder for a package with a C extension"
+# mvx#369: every published toolchain shipped without the git package, because
+# the release image has no libgit2 and a package whose library cannot load is
+# not copied.  The way out is to build it on the host it will run on -- and
+# MVPKGOS("BUILD") already shells out to `mkpkg' by name to do exactly that
+# for a C-extension package.  It was never shipped, so the remedy the installer
+# printed (`MVPKG install git') could not work.  Static linking is not open to
+# us (it would mean packaging libgit2 and owning its security updates).
+MKW="$(mktemp -d)"
+MKPFX="$MKW/prefix"
+# Nothing to fetch: a base URL that resolves to nothing keeps this offline, and
+# the package steps then warn and skip, which is not what is under test here.
+MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$MKW/none" \
+  cmake --install "$ROOT/build" --prefix "$MKPFX" </dev/null >"$MKW/install.log" 2>&1 || true
+if [ -x "$MKPFX/bin/mkpkg" ]; then
+  PASS=$((PASS + 1)); echo "  mkpkg is installed beside the toolchain"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL builder: no executable bin/mkpkg in the install prefix"
+  echo "    | bin: $(ls "$MKPFX/bin" 2>&1 | tr '\n' ' ')"
+fi
+
+if [ -x "$MKPFX/bin/mkpkg" ] && command -v cc >/dev/null 2>&1; then
+  # A REAL EXTENSION, not a stub that merely compiles: it includes mvx_ext.h
+  # and returns a function table on the published ABI, so the test fails if the
+  # installed headers are missing, stale or not what a package compiles against.
+  MKP="$MKW/p/instpkg"
+  mkdir -p "$MKP/src"
+  cat > "$MKP/src/ext.c" <<'EXTEOF'
+#include "mvx_ext.h"
+static void ext_ping(mvx_ctx *ctx, mv_value *ret, int32_t argc, mv_value **argv)
+{ (void)ctx; (void)ret; (void)argc; (void)argv; }
+static const mvx_extfn fns[] = {{"PKGPING", 0, 0, ext_ping}};
+static const mvx_ext ext = {"instpkg", 1, fns};
+const mvx_ext *mvx_ext_entry(int abi) { return abi == MVX_EXT_ABI ? &ext : NULL; }
+EXTEOF
+  # `#include "mvx_ext.h"' with no copy beside the source: it can ONLY come
+  # from the -I the script derives from its own location, which is the whole
+  # claim -- the builder works from an install prefix, with no mvx source tree.
+  printf 'src/ext.c\n' > "$MKP/NATIVE"
+  printf 'PKGPING 0 0\n' > "$MKP/EXPORTS"
+  # IT DECLARES A DEPENDENCY, and the sibling it names is really there, so the
+  # manifest is read for more than its name.  Building the library proves far
+  # less than it looks: a package's dependencies supply the EXPORTS its BASIC
+  # compiles against, and mkpkg went on to build a perfectly good .so while
+  # resolving NONE of them -- so the fact asserted below is the resolution,
+  # not the artifact.
+  mkdir -p "$MKW/p/sibdep/VOC"
+  printf 'SIBFN 1 1\n' > "$MKW/p/sibdep/EXPORTS"
+  printf '{"name":"mvx-lang/instpkg","artifact":"instpkg","version":"1.0.0","dependencies":["mvx-lang/sibdep"]}\n' \
+    > "$MKP/mvpkg.json"
+  if "$MKPFX/bin/mkpkg" "$MKP" >"$MKW/build.log" 2>&1 &&
+     ls "$MKP/LIB"/libmvxext_instpkg.* >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo "  it builds a C-extension package against the installed prefix"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL builder: mkpkg did not build the extension from the prefix"
+    sed -n 's/^/    | /p' "$MKW/build.log"
+  fi
+  if grep -q "dep sibdep -> " "$MKW/build.log" &&
+     ! grep -qi "syntax error" "$MKW/build.log" &&
+     ! grep -q "dep esac" "$MKW/build.log"; then
+    PASS=$((PASS + 1))
+    echo "  and it reads the dependencies out of mvpkg.json"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL builder: the mvpkg.json dependency was not resolved"
+    sed -n 's/^/    | /p' "$MKW/build.log" | head -20
+  fi
+
+  # THE FALSIFYING HALF.  Take the installed headers away and the same build
+  # must fail: without this, a cc that found mvx_ext.h somewhere else entirely
+  # -- this source tree, a previously installed toolchain -- would read as
+  # proof of something the prefix never supplied.
+  mv "$MKPFX/include" "$MKW/include.away"
+  if "$MKPFX/bin/mkpkg" "$MKP" >"$MKW/build2.log" 2>&1; then
+    FAIL=$((FAIL + 1))
+    echo "FAIL builder: it built with the prefix's headers removed, so the"
+    echo "              passing build above did not prove they were used"
+  else
+    PASS=$((PASS + 1))
+    echo "  and it is the prefix's headers it compiles against"
+  fi
+  mv "$MKW/include.away" "$MKPFX/include"
+else
+  echo "  (skipped the extension build -- no bin/mkpkg or no cc)"
+fi
+rm -rf "$MKW"
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

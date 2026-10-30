@@ -297,6 +297,63 @@ jobs:
           cmake --build build
           cmake --install build --prefix "$PWD/stage/mvx-lang"
 
+      # A RELEASE THAT CANNOT GET GIT IS NOT A RELEASE (mvx#369).  Every
+      # published toolchain up to 0.8.0 shipped without the git package: this
+      # image has no libgit2, a package whose library cannot load is not
+      # copied, and the warning went into the release log where nobody read it.
+      # A warning is not a gate, which is why it stayed true for a whole
+      # release.
+      #
+      # The toolchain is not required to CARRY git -- it cannot, here -- but it
+      # must carry what builds it on the host, since that is the only route on
+      # a machine whose libgit2 minor differs from the prebuilt's.  So this
+      # asserts the builder is shipped AND that it works in this image, by
+      # building a real extension against the installed headers.  Asserting the
+      # files exist would pass on a toolchain whose mkpkg cannot compile.
+      - name: The shipped toolchain can build a C-extension package
+        run: |
+          set -eu
+          . /opt/rh/gcc-toolset-14/enable
+          PFX="$PWD/stage/mvx-lang"
+          test -x "$PFX/bin/mkpkg" || {
+            echo "::error::bin/mkpkg is not in the staged toolchain, so a package"
+            echo "::error::with a C extension cannot be built on the host and the"
+            echo "::error::remedy the installer prints cannot be followed."
+            exit 1
+          }
+          W="$(mktemp -d)"
+          mkdir -p "$W/relpkg/src"
+          cat > "$W/relpkg/src/ext.c" <<'EXTEOF'
+          #include "mvx_ext.h"
+          static void ext_ping(mvx_ctx *ctx, mv_value *ret, int32_t argc, mv_value **argv)
+          { (void)ctx; (void)ret; (void)argc; (void)argv; }
+          static const mvx_extfn fns[] = {{"PKGPING", 0, 0, ext_ping}};
+          static const mvx_ext ext = {"relpkg", 1, fns};
+          const mvx_ext *mvx_ext_entry(int abi) { return abi == MVX_EXT_ABI ? &ext : NULL; }
+          EXTEOF
+          printf 'src/ext.c\n' > "$W/relpkg/NATIVE"
+          printf 'PKGPING 0 0\n' > "$W/relpkg/EXPORTS"
+          printf '{"name":"mvx-lang/relpkg","artifact":"relpkg","version":"1.0.0","dependencies":[]}\n' \
+            > "$W/relpkg/mvpkg.json"
+          if ! "$PFX/bin/mkpkg" "$W/relpkg" > "$W/build.log" 2>&1; then
+            echo "::error::the shipped mkpkg cannot build a C-extension package in this image"
+            sed -n 's/^/  | /p' "$W/build.log"
+            exit 1
+          fi
+          ls "$W/relpkg/LIB"/libmvxext_relpkg.so >/dev/null 2>&1 || {
+            echo "::error::mkpkg reported success but produced no extension library"
+            sed -n 's/^/  | /p' "$W/build.log"
+            exit 1
+          }
+          echo "the shipped builder works: $(basename "$W/relpkg/LIB"/libmvxext_relpkg.so)"
+          if [ -e "$PFX/share/mvx/system/CATALOG/GIT" ]; then
+            echo "and this toolchain also carries GIT prebuilt"
+          else
+            echo "::notice::no prebuilt GIT in this toolchain (this image has no"
+            echo "::notice::libgit2); it ships mkpkg so GIT can be built on the host."
+          fi
+          rm -rf "$W"
+
       # SHIP WHAT THE BUILD IMAGE HAPPENS TO CARRY (mvx#297).  v0.3.0 was built
       # on the Ubuntu runner and linked libedit.so.2; since mvx#203 the build
       # happens in manylinux_2_28 (AlmaLinux 8), whose libedit is soname 0.

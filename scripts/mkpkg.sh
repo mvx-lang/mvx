@@ -16,10 +16,25 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG="${1:?usage: mkpkg.sh <package-directory>}"
 
-# The compiler: a built tree's build/bin/mvx-basic by default, but overridable
-# with $MVXBASIC (or an installed mvx-basic on PATH) so a package can be built
+# A SOURCE TREE OR AN INSTALL PREFIX (mvx#369).  This script is installed as
+# <prefix>/bin/mkpkg so a toolchain can build a package with a C extension on
+# the host it is running on -- which is the only way to get the git package
+# onto a machine whose libgit2 is not the one the prebuilt was linked against.
+# From bin/ the ROOT above IS the prefix, and a prefix has include/ and bin/
+# where a source tree has runtime/include and build/bin.  Both layouts are
+# named here rather than probed per use, so a new use cannot pick the wrong one.
+if [ -d "$ROOT/runtime/include" ]; then
+  MVXINC="$ROOT/runtime/include"           # source tree
+  MVXBIN="$ROOT/build/bin"
+else
+  MVXINC="$ROOT/include"                   # install prefix
+  MVXBIN="$ROOT/bin"
+fi
+
+# The compiler: the tree's own mvx-basic by default, but overridable with
+# $MVXBASIC (or an installed mvx-basic on PATH) so a package can be built
 # against a setup-mvx toolchain in CI, with no mvx source checkout.
-MVXBASIC="${MVXBASIC:-$ROOT/build/bin/mvx-basic}"
+MVXBASIC="${MVXBASIC:-$MVXBIN/mvx-basic}"
 [ -x "$MVXBASIC" ] || command -v "$MVXBASIC" >/dev/null 2>&1 || MVXBASIC="$(command -v mvx-basic || true)"
 [ -n "$MVXBASIC" ] || { echo "mkpkg: no mvx-basic (set \$MVXBASIC or put it on PATH)" >&2; exit 1; }
 
@@ -55,6 +70,26 @@ json_arr() {  # json_arr <file> <key> -> one array entry per line
     | tr ',' '\n' | sed -n 's/.*"\([^"]*\)".*/\1/p'
 }
 basename_of() { printf '%s' "${1##*/}"; }
+# dep_name <entry> -> "<prefix><last path segment>", the prefix being the
+# ?/!/+ marker that sits outside the name.
+#
+# A FUNCTION, not inline in the loop below, because of what `sh' is on macOS:
+# bash 3.2 finds the end of a `$( )' by counting parentheses, so the first `)'
+# of a `case' pattern inside one ends the substitution early.  The dependency
+# list then came back as fragments of this script -- `pfx=;', `esac', `done)'
+# -- each reported as an unresolved dependency, while the real ones were never
+# resolved at all.  Called from a substitution it is fine; parsed inside one it
+# is not.  Nothing caught it because the only caller is the mvpkg.json branch,
+# which could not run until mvx#370 fixed the `set -e' exit above it.
+dep_name() {
+  dn="$1"; dp=""
+  case "$dn" in
+    \?*) dp="?"; dn="${dn#?}" ;;
+    \!*) dp="!"; dn="${dn#?}" ;;
+    +*)  dp="+"; dn="${dn#?}" ;;
+  esac
+  printf '%s%s\n' "$dp" "$(basename_of "$dn")"
+}
 
 # `|| true' BECAUSE OF `set -e'.  A package whose manifest is mvpkg.json has no
 # PKG file, head exits 1, and the assignment carries that status -- so the shell
@@ -91,13 +126,17 @@ if [ -f "$PKG/PKG" ] || [ -f "$PKG/mvpkg.json" ]; then
   else
     # dependencies keep their ?/!/+ prefix, which sits outside the name;
     # devDependencies are build-only, which is what '+' means in PKG.
-    DEPS="$(json_arr "$PKG/mvpkg.json" dependencies | while IFS= read -r d; do
+    # `|| [ -n "$d" ]' -- the same guard the NATIVE and VERBS loops below use,
+    # and needed for the same reason twice over: json_arr strips every newline
+    # with `tr -d', and BSD sed does not put one back on the last line the way
+    # GNU sed does.  So on macOS the entire dependency list was ONE unterminated
+    # line, `read' reported end-of-input, and the loop body never ran -- an
+    # empty list, no warning, on the platform mvx is developed on.
+    DEPS="$(json_arr "$PKG/mvpkg.json" dependencies | while IFS= read -r d || [ -n "$d" ]; do
               [ -n "$d" ] || continue
-              pfx=""
-              case "$d" in [\?!+]*) pfx="${d%"${d#?}"}"; d="${d#?}" ;; esac
-              printf '%s%s\n' "$pfx" "$(basename_of "$d")"
+              dep_name "$d"
             done
-            json_arr "$PKG/mvpkg.json" devDependencies | while IFS= read -r d; do
+            json_arr "$PKG/mvpkg.json" devDependencies | while IFS= read -r d || [ -n "$d" ]; do
               [ -n "$d" ] && printf '+%s\n' "$(basename_of "$d")"
             done)"
   fi
@@ -189,7 +228,7 @@ if [ -f "$PKG/NATIVE" ]; then
     if [ -z "$NLDFLAGS" ] && [ -n "$NLIBS" ]; then NLDFLAGS="$NLIBS"; fi
     mkdir -p "$PKG/LIB"
     # shellcheck disable=SC2086
-    cc -O2 -fPIC -shared $UNDEF -I"$ROOT/runtime/include" $NCFLAGS $NSRCS $NLDFLAGS \
+    cc -O2 -fPIC -shared $UNDEF -I"$MVXINC" $NCFLAGS $NSRCS $NLDFLAGS \
        -o "$PKG/LIB/libmvxext_$PKGNAME.$EXT"
     echo "  built LIB/libmvxext_$PKGNAME.$EXT (native extension)"
   fi
@@ -329,14 +368,25 @@ fi
 # bin/: standalone OS commands a package ships (built by build-native.sh
 # or checked in).  Symlink them beside mvx so they land on the dev PATH;
 # an install would copy them into a real bin directory instead.
+# ONLY INTO A BUILD TREE.  In a source tree build/bin is ours to populate; an
+# install prefix's bin/ is the toolchain's own, may need root, and is not where
+# a package built by MVPKG gets deployed from -- so say where the command is
+# and let the caller place it.
 if [ -d "$PKG/bin" ]; then
-  mkdir -p "$ROOT/build/bin"
-  for b in "$PKG"/bin/*; do
-    [ -f "$b" ] && [ -x "$b" ] || continue
-    babs="$(cd "$(dirname "$b")" && pwd)/$(basename "$b")"
-    ln -sf "$babs" "$ROOT/build/bin/$(basename "$b")"
-    echo "  installed bin/$(basename "$b") -> build/bin/$(basename "$b")"
-  done
+  if [ -d "$ROOT/runtime/include" ]; then
+    mkdir -p "$MVXBIN"
+    for b in "$PKG"/bin/*; do
+      [ -f "$b" ] && [ -x "$b" ] || continue
+      babs="$(cd "$(dirname "$b")" && pwd)/$(basename "$b")"
+      ln -sf "$babs" "$MVXBIN/$(basename "$b")"
+      echo "  installed bin/$(basename "$b") -> build/bin/$(basename "$b")"
+    done
+  else
+    for b in "$PKG"/bin/*; do
+      [ -f "$b" ] && [ -x "$b" ] || continue
+      echo "  built bin/$(basename "$b") (in $PKG/bin)"
+    done
+  fi
 fi
 
 echo "package built: $PKG"

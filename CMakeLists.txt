@@ -602,6 +602,16 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/runtime/include/
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/client/include/
         DESTINATION include FILES_MATCHING PATTERN "*.h")
 
+# THE PACKAGE BUILDER (mvx#369).  Without it a published toolchain cannot build
+# a package that has a C extension, and the git package is one: its prebuilt is
+# linked against a single libgit2 soname, so on a host carrying a different
+# minor the only way to get GIT is to compile it here.  MVPKGOS("BUILD")
+# already shells out to `mkpkg' by name for such a package -- it was simply
+# never shipped, so every toolchain told the user to run a command that could
+# not work.  Installed under its command name, without the .sh.
+install(PROGRAMS ${CMAKE_SOURCE_DIR}/scripts/mkpkg.sh
+        DESTINATION bin RENAME mkpkg)
+
 # --- configuration summary ---------------------------------------------
 message(STATUS "")
 message(STATUS "MVX components:")
