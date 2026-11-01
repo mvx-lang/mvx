@@ -96,6 +96,14 @@ int main(void) {
         return 70;
     }
 
+    /* AND THE PROGRAM IS `path', NOT THIS BINARY (mvx#373).  A prog: permit
+       grant is bound to the sha256 of the file a program's code is in, and
+       every copy of this launcher is byte-for-byte the same file: without
+       this, blessing one cataloged program would bless every one of them on
+       the machine, since the permit layer would fall back to the process
+       image and find this. */
+    mvx_perm_prog_enter(path);
+
     /* The same three lines the compiled executable used to carry, from
        mvx_crt.c: a context, the program, and the teardown.  STOP and a fatal
        error still leave through exit(), so neither reaches the end here. */

@@ -315,8 +315,12 @@ else
 fi
 
 # program-identity binding (#80, 8.4 constraint 3): a prog:NAME grant applies
-# only when the running binary matches the system-blessed sha256 for NAME — a
+# only when the running program matches the system-blessed sha256 for NAME — a
 # stale hash (re-cataloged / substituted binary) no longer inherits the grant.
+#
+# THIS ONE RUNS THE PROGRAM AS A STANDALONE EXECUTABLE, which is its own
+# process image.  That is the easy half and it is not the half real verbs use;
+# the dispatcher cases are below, and they are what #373 was about.
 PPROG="$TESTROOT/pacct-prog"
 mkdir -p "$PPROG/.mvx-private"
 echo "permit prog:TESTPROG = echo" > "$PPROG/.mvx-private/permissions"
@@ -335,6 +339,81 @@ if "$MVX" "$ROOT/tests/osexec_prog.b" -o "$out" 2>"$TESTROOT/cerr"; then
 else
   check osexec_prog "COMPILE FAILED: $(cat "$TESTROOT/cerr")"
 fi
+
+# --- the same grant, through the DISPATCHER (#373) -------------------------
+# The check above was the only coverage program identity had, and it runs the
+# program as a standalone executable -- where /proc/self/exe IS the program.
+# No cataloged verb has had that shape since #248, which dlopens a verb and
+# runs it at a level in the shell's own process.  So that check went on
+# passing while every prog: grant was inert, and the one blessing that DID
+# bind was mvx's own -- which handed the command to every verb in the account
+# and to `!' typed at the prompt.  Six cases, because the fix has to get the
+# refusals right as well as the grant.
+PVA="$TESTROOT/pacct-verb"
+PVS="$TESTROOT/sysacct-verb"
+"$ROOT/scripts/mkaccount.sh" "$PVA" >/dev/null
+mkdir -p "$PVA/.mvx-private" "$PVA/BP" "$PVS/.mvx-private"
+echo "permit prog:TESTPROG = echo" > "$PVA/.mvx-private/permissions"
+cp "$ROOT/tests/osexec_prog.b" "$PVA/BP/TESTPROG"
+cp "$ROOT/tests/osexec_prog.b" "$PVA/BP/OTHERPROG"
+# OUTER reaches OSEXEC on both sides of an in-process EXECUTE, so one run says
+# whether the inner level inherited the grant AND whether the outer got its
+# own identity back afterwards.
+cat > "$PVA/BP/OUTER" <<'PROGEOF'
+   O = "" ; S1 = OSEXEC("echo":@FM:"x", O)
+   PRINT "outer-before: ":S1
+   EXECUTE "TESTPROG"
+   O = "" ; S2 = OSEXEC("echo":@FM:"x", O)
+   PRINT "outer-after: ":S2
+PROGEOF
+cat > "$PVA/BP/ABORTER" <<'PROGEOF'
+   ABORT
+PROGEOF
+cat > "$PVA/BP/OUTABRT" <<'PROGEOF'
+   EXECUTE "ABORTER"
+PROGEOF
+for v in TESTPROG OTHERPROG OUTER ABORTER OUTABRT; do
+  MVXPRIV=developer "$TCL" -a "$PVA" -c "CATALOG BP $v" >/dev/null 2>&1
+done
+# WHAT TO BLESS: `mvx --program-hash', which is the runtime answering for
+# itself.  The file to bless is CATALOG/<name>.so on Linux -- where
+# CATALOG/<name> is a copy of mvx-launch, identical for every program -- and
+# CATALOG/<name> on macOS, where the executable is dlopen-able and is the whole
+# program.  ASKED RATHER THAN REIMPLEMENTED, because a test carrying its own
+# copy of that rule would keep passing against its own copy after the loader's
+# changed: here a divergence shows up as the first case below going red.
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+        else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+bless_as() { echo "program TESTPROG = $1" > "$PVS/.mvx-private/programs"; }
+pvrun() { MVXSYSTEM="$PVS" "$TCL" -a "$PVA" -c "$1" 2>&1 | grep '^echo:' | head -1; }
+# REPORTED AS WORDS, NOT AS A MATCH COUNT.  A golden file reading `0' says
+# nothing about which way round the test had it, and the two cases it covers
+# are the ones whose right answer is a REFUSAL -- the half that is easy to
+# record backwards and never notice.
+pvmark() { # pvmark MARKER tcl-line...
+  m="$1"; shift
+  if printf '%s\n' "$@" | MVXSYSTEM="$PVS" "$TCL" -a "$PVA" 2>&1 |
+       grep -qE "^$m\$"
+  then printf 'the command RAN'; else printf 'refused'; fi
+}
+
+bless_as "$("$TCL" --program-hash "$PVA/CATALOG/TESTPROG")"
+v1="$(pvrun TESTPROG)"
+v2="$(pvrun OTHERPROG)"
+# nested: OUTER is not blessed, TESTPROG is -- so the inner level must GAIN the
+# grant the outer does not have, and lose it again on the way out.
+v3="$(MVXSYSTEM="$PVS" "$TCL" -a "$PVA" -c OUTER 2>&1 |
+        grep -E '^(outer-|echo:)' | tr '\n' ' ' | sed 's/ *$//')"
+bless_as "$(sha "$TCL")"
+v4="$(pvrun TESTPROG)"
+v5="$(pvmark at-the-prompt '!echo at-the-prompt' OFF)"
+# an ABORT unwinds past the levels in between without their own leave running,
+# so the prompt must still get its identity back -- OUTABRT is blessed here, so
+# a leaked entry would GRANT the prompt rather than merely confuse it.
+bless_as "$("$TCL" --program-hash "$PVA/CATALOG/OUTABRT")"
+v6="$(pvmark after-the-abort OUTABRT '!echo after-the-abort' OFF)"
+check osexec_prog_verb "$(printf 'the blessed verb:     %s\nan unrelated verb:    %s\nacross an EXECUTE:    %s\nmvx blessed, a verb:  %s\nmvx blessed, a bang:  %s\naborted, then a bang: %s' \
+  "$v1" "$v2" "$v3" "$v4" "$v5" "$v6")"
 
 # ---------------------------------------------------------------- phase 2
 echo "== system tests"
@@ -1623,6 +1702,32 @@ reqtest() { # reqtest <manifest-requirement> -> the LINK-PKG line
   "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1 | tail -1 | normalise \
     | sed -E -e 's/(but this is ).*/\1@RUNTIME@/'
 }
+reqfull() { # reqfull <manifest-requirement> <dir> -> every line, not just the
+  # decision.  reqtest keeps the last line only, which is right for asserting
+  # what was decided; a warning prints BEFORE the decision, so the cases that
+  # assert a build said what it could not work out need both (#376).
+  printf 'reqpkg\n1.0.0\ndesc\nmvx\n%s\n' "$1" > "$RQP/PKG"
+  d="$TESTROOT/rq$2"; mkdir -p "$d"
+  "$ROOT/scripts/mkaccount.sh" "$d" >/dev/null 2>&1
+  "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1
+}
+
+verwith() { # verwith <fill> -> this build's dotted version, with any component
+  # that is not a number replaced by <fill>.  Since #364 the dev tag names the
+  # release line, so VERSION SHORT is 0.8.x-dev-... and the patch is the letter
+  # x: `verwith 0' is a version this build certainly has, and the version is
+  # left alone on a build whose components are all numbers.
+  printf '%s' "$VER" | sed -E 's/-.*//' |
+    awk -F. -v fill="$1" '{
+      for (i = 1; i <= 3; i++) {
+        v = (i <= NF ? $i : 0)
+        if (v !~ /^[0-9]+$/) v = fill
+        printf "%s%s", (i > 1 ? "." : ""), v
+      }
+      print ""
+    }'
+}
+
 # The ABI cases are the same everywhere -- it is a compile-time constant -- so
 # they go in a fixture.
 check tcl-requires "$( \
@@ -1640,6 +1745,13 @@ case "$VER" in
   0.0.0*) vknown=0 ;;
   *)      vknown=1 ;;
 esac
+# A THIRD STATE, not a second (#376).  Before #364 a build either knew its
+# version or reported 0.0.0; now a dev build reports the release line with the
+# patch left as `x', which knows more than 0.0.0 and less than a tag.
+case "$(printf '%s' "$VER" | sed -E 's/-.*//')" in
+  *[!0-9.]*) vunk=1 ;;
+  *)         vunk=0 ;;
+esac
 r="$(reqtest '!mvx>=9.9.9' f)"
 if [ "$vknown" = 1 ]; then
   case "$r" in
@@ -1654,11 +1766,68 @@ else
     *) FAIL=$((FAIL+1)); echo "FAIL untagged build should warn, not refuse: $r" ;;
   esac
 fi
-r="$(reqtest "!mvx>=$(printf '%s' "$VER" | sed -E 's/-.*//')" g)"
+# A version this build HAS is accepted, and -- where the build knows what it is
+# -- accepted in silence.  The derivation matters: `sed s/-.*//' alone yields
+# 0.8.x on a dev build, and a requirement of ">=0.8.x" is not a version at all,
+# so it takes the malformed-manifest path and this would pass while comparing
+# nothing (#376).  verwith 0 asks the question that was meant.
+own="$(verwith 0)"
+r="$(reqfull "!mvx>=$own" g)"
 case "$r" in
-  *linked*) PASS=$((PASS+1)); echo "  a version this build does have is accepted" ;;
-  *) FAIL=$((FAIL+1)); echo "FAIL should accept its own version: $r" ;;
+  *linked*)
+    case "$r" in
+      *warning*)
+        if [ "$vknown" = 0 ]; then
+          PASS=$((PASS+1))
+          echo "  an untagged build warns about its own version too, and links"
+        else
+          FAIL=$((FAIL+1)); echo "FAIL warned about a version it has: $r"
+        fi ;;
+      *) PASS=$((PASS+1))
+         echo "  a version this build does have is accepted, and says nothing" ;;
+    esac ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL should accept its own version ($own): $r" ;;
 esac
+
+# A REQUIREMENT THAT IS NOT A VERSION MUST NOT BE FATAL.  This one needs no
+# branch, unlike the cases below, because the answer does not depend on what
+# the build is: a manifest is malformed whoever reads it, and LINK-PKG settles
+# that before it looks at its own version.  Which is load-bearing rather than
+# tidy -- the unknown-version path returns, so asking in the other order would
+# make this assertion pass on a tagged build and fail on every CI run.
+r="$(reqfull '!mvx>=zz' h)"
+case "$r" in
+  *"not a version this can compare against"*) PASS=$((PASS+1))
+    echo "  a requirement that is not a version warns, and does not abort" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL a non-version requirement should warn: $r" ;;
+esac
+
+# .999 is above any real patch on this line, which splits the three builds
+# apart: one that knows its patch refuses it, one whose patch is the dev tag's
+# placeholder cannot tell, and an untagged one never gets as far as comparing.
+# Keeping those three answers distinct is the whole of #376, so each is asserted
+# rather than tolerated.
+line="$(printf '%s' "$VER" | sed -E 's/-.*//' | awk -F. '{print $1"."$2".999"}')"
+r="$(reqfull "!mvx>=$line" i)"
+if [ "$vknown" = 0 ]; then
+  case "$r" in
+    *"does not know its version"*) PASS=$((PASS+1))
+      echo "  an untagged build does not pretend to a patch level either" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL untagged build should warn on $line: $r" ;;
+  esac
+elif [ "$vunk" = 1 ]; then
+  case "$r" in
+    *"does not know its own patch level"*) PASS=$((PASS+1))
+      echo "  a dev build says it cannot tell, rather than aborting on the x" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL dev build should warn on $line: $r" ;;
+  esac
+else
+  case "$r" in
+    *"needs mvx >=$line"*) PASS=$((PASS+1))
+      echo "  a build that knows its patch level refuses one above it" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL tagged build should refuse $line: $r" ;;
+  esac
+fi
 
 # A package can export a FUNCTION, and a DEFFUN'd caller resolves it across the
 # package boundary (#101).  BUILD-PKG and CATALOG classified only SUBROUTINE as
@@ -7194,12 +7363,216 @@ else
         echo "FAIL install deps: the unloadable package was not skipped"
         sed -n 's/^/    | /p' "$PDW/install2.log" | tail -8
       fi
+
+      # ... UNLESS IT CAN BE BUILT HERE (mvx#370).  Skipping is right for a
+      # prebuilt that cannot load, but it leaves the host without the package,
+      # and for libgit2 there is no library the user can install to fix it --
+      # Ubuntu 25.10 and 26.04 ship 1.9 and no 1.7 at all.  So when the release
+      # also published its SOURCE, build that against what this machine has.
+      #
+      # The fixture is the same shape as the real case: the BINARY asset's
+      # library needs a libfake.so.1 that is not here, and the SOURCE asset
+      # carries what it needs to produce one that is.  mvpkg is the package
+      # under test because the fallback runs for BUNDLED packages, which are
+      # mvpkg and git by name.
+      #
+      # TESTED AS A PAIR.  The same unloadable binary is installed twice, once
+      # with the source asset listed and once without: without the pair, "it
+      # installed" could as easily mean the native check had stopped working.
+      pd_pack_src() {   # pd_pack_src <dir> <repo> <stem> <version>
+        out="$PDR/$2/releases/download/$4"
+        mkdir -p "$out"
+        tar czf "$out/$3-$4-source.tar.gz" -C "$1" .
+        ( cd "$out" && { shasum -a 256 "$3-$4-source.tar.gz" 2>/dev/null \
+                         || sha256sum "$3-$4-source.tar.gz"; } \
+                       > "$3-$4-source.tar.gz.sha256" )
+      }
+
+      SP="$PDW/p/srcmvpkg"
+      mkdir -p "$SP/src" "$SP/deps" "$SP/VOC" "$SP/CATALOG" "$SP/LIB"
+      cp "$PDW/fake.c" "$SP/src/fake.c"
+      echo 'int fake(void); int srcext(void){return fake();}' > "$SP/src/stub.c"
+      cp "$ND/LIB/libstub.so" "$SP/LIB/libmvxext_mvpkg.so"   # the stale prebuilt
+      printf 'SRCFN 1 1\n' > "$SP/EXPORTS"
+      echo x > "$SP/CATALOG/MVPKG"
+      echo V > "$SP/VOC/MVPKG"
+      printf '{"name":"mvx-lang/mvpkg","artifact":"mvpkg","version":"9.9.9","dependencies":[]}\n' \
+        > "$SP/mvpkg.json"
+      # mkpkg needs a BP directory or a NATIVE manifest to consider this a
+      # package at all; the comment is enough for the latter, and leaves the
+      # whole build to build-native.sh, which is where a package that links an
+      # OS library does its work.
+      printf '# built by build-native.sh\n' > "$SP/NATIVE"
+      # libfake is carried OUTSIDE LIB/ because mkpkg clears LIB/ before it
+      # builds -- and put into LIB/ by the build, which is also what makes the
+      # result loadable: the native check searches <package>/LIB.
+      cc -shared -fPIC -Wl,-soname,libfake.so.1 -o "$SP/deps/libfake.so.1" "$PDW/fake.c"
+      cat > "$SP/build-native.sh" <<'BNEOF'
+#!/bin/sh
+set -e
+PKG="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$PKG/LIB"
+cp "$PKG/deps/libfake.so.1" "$PKG/LIB/libfake.so.1"
+cc -shared -fPIC -o "$PKG/LIB/libmvxext_mvpkg.so" "$PKG/src/stub.c" \
+   -L"$PKG/LIB" -l:libfake.so.1
+echo "  built LIB/libmvxext_mvpkg.so (fixture)"
+BNEOF
+      chmod +x "$SP/build-native.sh"
+
+      # The binary asset: the prebuilt library, and nothing to resolve it with.
+      SB="$PDW/p/binmvpkg"
+      rm -rf "$SB"; mkdir -p "$SB/LIB" "$SB/VOC" "$SB/CATALOG"
+      cp "$SP/LIB/libmvxext_mvpkg.so" "$SB/LIB/"
+      cp "$SP/EXPORTS" "$SB/EXPORTS"
+      cp "$SP/mvpkg.json" "$SB/mvpkg.json"
+      echo x > "$SB/CATALOG/MVPKG"
+      echo V > "$SB/VOC/MVPKG"
+      pd_pack "$SB" mv_package mvpkg 9.9.9
+      pd_pack_src "$SP" mv_package mvpkg 9.9.9
+
+      # The listing is where the source URL comes from, so it has to name the
+      # asset the way a real release does -- with its download URL.
+      SREL="$PDR/mv_package/releases/download/9.9.9"
+      printf '[{"tag_name":"9.9.9","prerelease":false,"draft":false,"assets":[{"name":"mvpkg-9.9.9-mvx-%s.tar.gz","browser_download_url":"file://%s/mvpkg-9.9.9-mvx-%s.tar.gz"},{"name":"mvpkg-9.9.9-source.tar.gz","browser_download_url":"file://%s/mvpkg-9.9.9-source.tar.gz"}]}]\n' \
+        "$PDT" "$SREL" "$PDT" "$SREL" > "$PDW/rel/mv_package.json"
+
+      PDPFX3="$PDW/prefix3"
+      MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$PDR" \
+        MVX_INSTALL_PKGINFO="$PDW/info" MVX_INSTALL_RELEASES="$PDW/rel" \
+        cmake --install "$ROOT/build" --prefix "$PDPFX3" </dev/null >"$PDW/install3.log" 2>&1 || true
+      PD3="$PDPFX3/share/mvx/system"
+      if [ -f "$PD3/LIB/libmvxext_mvpkg.so" ] && [ -f "$PD3/LIB/libfake.so.1" ] &&
+         grep -q "^SRCFN" "$PD3/EXPORTS" 2>/dev/null &&
+         grep -q "from source" "$PDW/install3.log"; then
+        PASS=$((PASS + 1))
+        echo "  a package whose prebuilt cannot load is built from source instead"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL source fallback: the package was not built and installed"
+        # WHICH of the four is false, and the WHOLE log.  A bare "it did not
+        # work" plus a 12-line tail says nothing about where the path stopped,
+        # and the tail is reliably the LAST package's output, not this one's.
+        [ -f "$PD3/LIB/libmvxext_mvpkg.so" ] || echo "    | no LIB/libmvxext_mvpkg.so"
+        [ -f "$PD3/LIB/libfake.so.1" ] || echo "    | no LIB/libfake.so.1"
+        grep -q "^SRCFN" "$PD3/EXPORTS" 2>/dev/null || echo "    | SRCFN is not in EXPORTS"
+        grep -q "from source" "$PDW/install3.log" || echo "    | no source build was attempted"
+        sed -n 's/^/    | /p' "$PDW/install3.log"
+      fi
+
+      # THE OTHER HALF OF THE PAIR: same unloadable binary, no source asset in
+      # the listing.  This must still skip -- if it installs, the check above
+      # measured nothing.
+      printf '[{"tag_name":"9.9.9","prerelease":false,"draft":false,"assets":[{"name":"mvpkg-9.9.9-mvx-%s.tar.gz","browser_download_url":"file://%s/mvpkg-9.9.9-mvx-%s.tar.gz"}]}]\n' \
+        "$PDT" "$SREL" "$PDT" > "$PDW/rel/mv_package.json"
+      PDPFX4="$PDW/prefix4"
+      MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$PDR" \
+        MVX_INSTALL_PKGINFO="$PDW/info" MVX_INSTALL_RELEASES="$PDW/rel" \
+        cmake --install "$ROOT/build" --prefix "$PDPFX4" </dev/null >"$PDW/install4.log" 2>&1 || true
+      if [ ! -e "$PDPFX4/share/mvx/system/LIB/libmvxext_mvpkg.so" ] &&
+         grep -q "libfake.so.1" "$PDW/install4.log"; then
+        PASS=$((PASS + 1))
+        echo "  and with no source published it is still skipped whole"
+      else
+        FAIL=$((FAIL + 1))
+        echo "FAIL source fallback: no source asset, yet the package installed"
+        sed -n 's/^/    | /p' "$PDW/install4.log" | tail -10
+      fi
     else
       echo "  (skipped the native-library check -- no working cc -shared)"
     fi
   fi
 fi
 rm -rf "$PDW"
+
+echo "== the toolchain ships a builder for a package with a C extension"
+# mvx#369: every published toolchain shipped without the git package, because
+# the release image has no libgit2 and a package whose library cannot load is
+# not copied.  The way out is to build it on the host it will run on -- and
+# MVPKGOS("BUILD") already shells out to `mkpkg' by name to do exactly that
+# for a C-extension package.  It was never shipped, so the remedy the installer
+# printed (`MVPKG install git') could not work.  Static linking is not open to
+# us (it would mean packaging libgit2 and owning its security updates).
+MKW="$(mktemp -d)"
+MKPFX="$MKW/prefix"
+# Nothing to fetch: a base URL that resolves to nothing keeps this offline, and
+# the package steps then warn and skip, which is not what is under test here.
+MVX_INSTALL_PROMPT=never MVX_INSTALL_PKGBASE="file://$MKW/none" \
+  cmake --install "$ROOT/build" --prefix "$MKPFX" </dev/null >"$MKW/install.log" 2>&1 || true
+if [ -x "$MKPFX/bin/mkpkg" ]; then
+  PASS=$((PASS + 1)); echo "  mkpkg is installed beside the toolchain"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL builder: no executable bin/mkpkg in the install prefix"
+  echo "    | bin: $(ls "$MKPFX/bin" 2>&1 | tr '\n' ' ')"
+fi
+
+if [ -x "$MKPFX/bin/mkpkg" ] && command -v cc >/dev/null 2>&1; then
+  # A REAL EXTENSION, not a stub that merely compiles: it includes mvx_ext.h
+  # and returns a function table on the published ABI, so the test fails if the
+  # installed headers are missing, stale or not what a package compiles against.
+  MKP="$MKW/p/instpkg"
+  mkdir -p "$MKP/src"
+  cat > "$MKP/src/ext.c" <<'EXTEOF'
+#include "mvx_ext.h"
+static void ext_ping(mvx_ctx *ctx, mv_value *ret, int32_t argc, mv_value **argv)
+{ (void)ctx; (void)ret; (void)argc; (void)argv; }
+static const mvx_extfn fns[] = {{"PKGPING", 0, 0, ext_ping}};
+static const mvx_ext ext = {"instpkg", 1, fns};
+const mvx_ext *mvx_ext_entry(int abi) { return abi == MVX_EXT_ABI ? &ext : NULL; }
+EXTEOF
+  # `#include "mvx_ext.h"' with no copy beside the source: it can ONLY come
+  # from the -I the script derives from its own location, which is the whole
+  # claim -- the builder works from an install prefix, with no mvx source tree.
+  printf 'src/ext.c\n' > "$MKP/NATIVE"
+  printf 'PKGPING 0 0\n' > "$MKP/EXPORTS"
+  # IT DECLARES A DEPENDENCY, and the sibling it names is really there, so the
+  # manifest is read for more than its name.  Building the library proves far
+  # less than it looks: a package's dependencies supply the EXPORTS its BASIC
+  # compiles against, and mkpkg went on to build a perfectly good .so while
+  # resolving NONE of them -- so the fact asserted below is the resolution,
+  # not the artifact.
+  mkdir -p "$MKW/p/sibdep/VOC"
+  printf 'SIBFN 1 1\n' > "$MKW/p/sibdep/EXPORTS"
+  printf '{"name":"mvx-lang/instpkg","artifact":"instpkg","version":"1.0.0","dependencies":["mvx-lang/sibdep"]}\n' \
+    > "$MKP/mvpkg.json"
+  if "$MKPFX/bin/mkpkg" "$MKP" >"$MKW/build.log" 2>&1 &&
+     ls "$MKP/LIB"/libmvxext_instpkg.* >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo "  it builds a C-extension package against the installed prefix"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL builder: mkpkg did not build the extension from the prefix"
+    sed -n 's/^/    | /p' "$MKW/build.log"
+  fi
+  if grep -q "dep sibdep -> " "$MKW/build.log" &&
+     ! grep -qi "syntax error" "$MKW/build.log" &&
+     ! grep -q "dep esac" "$MKW/build.log"; then
+    PASS=$((PASS + 1))
+    echo "  and it reads the dependencies out of mvpkg.json"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL builder: the mvpkg.json dependency was not resolved"
+    sed -n 's/^/    | /p' "$MKW/build.log" | head -20
+  fi
+
+  # THE FALSIFYING HALF.  Take the installed headers away and the same build
+  # must fail: without this, a cc that found mvx_ext.h somewhere else entirely
+  # -- this source tree, a previously installed toolchain -- would read as
+  # proof of something the prefix never supplied.
+  mv "$MKPFX/include" "$MKW/include.away"
+  if "$MKPFX/bin/mkpkg" "$MKP" >"$MKW/build2.log" 2>&1; then
+    FAIL=$((FAIL + 1))
+    echo "FAIL builder: it built with the prefix's headers removed, so the"
+    echo "              passing build above did not prove they were used"
+  else
+    PASS=$((PASS + 1))
+    echo "  and it is the prefix's headers it compiles against"
+  fi
+  mv "$MKW/include.away" "$MKPFX/include"
+else
+  echo "  (skipped the extension build -- no bin/mkpkg or no cc)"
+fi
+rm -rf "$MKW"
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

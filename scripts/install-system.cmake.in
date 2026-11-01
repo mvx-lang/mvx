@@ -291,11 +291,128 @@ function(mvx_install_deps manifest depth)
   endforeach()
 endfunction()
 
-# mvx_install_url(<display> <version> <tarball-url> <depth>)
+# mvx_source_build(<display> <version> <source-url> <workdir> <outvar>)
+#
+# Build the package HERE, from its published source, and return the directory
+# holding the result (empty when it could not be done).
+#
+# WHY THIS EXISTS (mvx#370).  A prebuilt native library is linked against one
+# libgit2 soname, and libgit2 bumps its soname at every minor -- its own
+# api-stability document says symbol names, signatures and struct layout are
+# "only stable within minor releases".  So a binary built against 1.7 cannot
+# load on a host carrying 1.9, and there is no version of "install the right
+# library" that a user can act on: Ubuntu 25.10 and 26.04 publish 1.9 and no
+# 1.7 at all.  Building here links against whatever this machine actually has.
+#
+# A FALLBACK, NOT THE DEFAULT.  Where the prebuilt loads it is still what gets
+# installed, so no host acquires a compiler requirement it did not have before
+# and the common path does not slow down.
+function(mvx_source_build name version srcurl workdir outvar)
+  set(${outvar} "" PARENT_SCOPE)
+  if(srcurl STREQUAL "")
+    return()
+  endif()
+  # mkpkg IS NOT SHIPPED (mvx#369), so this path exists only where mvx was
+  # built from source -- which is exactly where it is needed and where the
+  # script is certain to be present.  An installed toolchain reaches the same
+  # package through `MVPKG install', and making THAT build from source is a
+  # different job with its own blocker.
+  set(mkpkg "${SRC}/scripts/mkpkg.sh")
+  if(NOT EXISTS "${mkpkg}")
+    return()
+  endif()
+  # Named here rather than left to the compiler to miss: build-native.sh calls
+  # `cc' and asks pkg-config for the library's flags.
+  find_program(MVX_PKG_CC NAMES cc gcc clang)
+  if(NOT MVX_PKG_CC)
+    message(WARNING
+      "mvx: ${name} ${version} would be built from source here, but there is\n"
+      "     no C compiler (cc/gcc/clang) on PATH.")
+    return()
+  endif()
+
+  set(sdir "${workdir}/src")
+  file(REMOVE_RECURSE "${sdir}")
+  file(MAKE_DIRECTORY "${sdir}")
+  get_filename_component(stgz "${srcurl}" NAME)
+  message(STATUS "  building ${name} ${version} from source (${stgz})")
+
+  # THE SAME CARE AS THE BINARY.  Both the checksum and the archive, because a
+  # source tarball that builds and installs is as much a trust decision as a
+  # binary that runs.
+  file(DOWNLOAD "${srcurl}.sha256" "${sdir}/sum" STATUS ssumst TIMEOUT 60)
+  list(GET ssumst 0 ssumrc)
+  file(DOWNLOAD "${srcurl}" "${sdir}/${stgz}" STATUS sdlst TIMEOUT 300)
+  list(GET sdlst 0 sdlrc)
+  if(NOT sdlrc EQUAL 0)
+    list(GET sdlst 1 sdlmsg)
+    message(WARNING "mvx: cannot download ${name} ${version} source -- ${sdlmsg}")
+    return()
+  endif()
+  if(ssumrc EQUAL 0)
+    file(READ "${sdir}/sum" ssumline)
+    string(REGEX MATCH "[0-9a-fA-F]+" swant "${ssumline}")
+    file(SHA256 "${sdir}/${stgz}" sgot)
+    string(TOLOWER "${swant}" swant)
+    if(NOT swant STREQUAL "" AND NOT swant STREQUAL sgot)
+      message(FATAL_ERROR
+        "mvx: ${name} ${version} source failed its checksum\n"
+        "     published ${swant}\n"
+        "     downloaded ${sgot}\n"
+        "     Refusing to build it.")
+    endif()
+  endif()
+
+  file(ARCHIVE_EXTRACT INPUT "${sdir}/${stgz}" DESTINATION "${sdir}/x")
+
+  # MVXHOME, not MVX_ROOT: build-native.sh prefers an mvx SOURCE tree's
+  # runtime/include + build/lib and falls back to an installed prefix's
+  # include + lib.  What is being installed is the prefix, and it already has
+  # both by the time packages are fetched -- so point at it and let the
+  # fallback branch run.  The extracted tree lives under the build directory,
+  # whose parent is not an mvx tree, so the first branch cannot match by
+  # accident.
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "MVXBASIC=${CMAKE_INSTALL_PREFIX}/bin/mvx-basic"
+            "MVXHOME=${CMAKE_INSTALL_PREFIX}"
+            sh "${mkpkg}" "${sdir}/x"
+    OUTPUT_VARIABLE bout ERROR_VARIABLE bout RESULT_VARIABLE brc)
+  if(NOT brc EQUAL 0)
+    # The build output is the only thing that says WHICH header or library is
+    # absent, and a truncated tail is what made the binary path's failure
+    # unreadable, so keep it.
+    #
+    # AND THE STATUS, because a build can fail saying NOTHING: `set -e' in
+    # mkpkg left on a probe whose stderr went to /dev/null, and the warning
+    # then read "did not build here:" followed by blank lines, which is a
+    # worse report than no report.
+    string(STRIP "${bout}" bshown)
+    if(bshown STREQUAL "")
+      set(bshown "     (it printed nothing; exit status ${brc})")
+    endif()
+    message(WARNING
+      "mvx: ${name} ${version} did not build here:\n${bshown}\n"
+      "     The toolchain is installed; ${name} is not.  Install this\n"
+      "     package's build dependencies (on Debian/Ubuntu that is\n"
+      "     build-essential, pkg-config and the -dev package for each library\n"
+      "     it needs), then add it with:\n"
+      "         mvx -c \"MVPKG install ${name}\"")
+    return()
+  endif()
+  set(${outvar} "${sdir}/x" PARENT_SCOPE)
+endfunction()
+
+# mvx_install_url(<display> <version> <tarball-url> <depth> [<source-url>])
 #
 # Download, verify, check that its native libraries load, install, and then
-# install what IT requires.
+# install what IT requires.  With a source URL, a package whose prebuilt
+# libraries cannot load here is BUILT here instead of skipped (mvx#370).
 function(mvx_install_url name version url depth)
+  set(srcurl "")
+  if(ARGC GREATER 4)
+    set(srcurl "${ARGV4}")
+  endif()
   set(tmp "${BIN}/pkgdl/${name}")
   file(REMOVE_RECURSE "${tmp}")
   file(MAKE_DIRECTORY "${tmp}")
@@ -344,8 +461,33 @@ function(mvx_install_url name version url depth)
   # error.  A package that cannot work here is better not installed -- nothing
   # of it is copied, and mvpkg can add it once the library is there.
   mvx_native_missing("${tmp}/x" "${CMAKE_INSTALL_PREFIX}" missing)
+  set(instdir "${tmp}/x")
   if(NOT missing STREQUAL "")
     string(REPLACE ";" "\n            " mtext "${missing}")
+    # BUILD IT HERE INSTEAD (mvx#370).  The prebuilt is linked against a
+    # library this machine does not have; the source is not, so compile it
+    # against what is here rather than leaving the host without the package.
+    message(STATUS
+      "  ${name} ${version}'s prebuilt libraries need ${mtext}, which is not here")
+    mvx_source_build("${name}" "${version}" "${srcurl}" "${tmp}" built)
+    if(NOT built STREQUAL "")
+      # AND THE BUILD HAS TO ANSWER THE SAME QUESTION.  A build can succeed and
+      # still produce something unloadable -- a library resolved at link time
+      # from a path the loader does not search is the ordinary way -- so ask
+      # again rather than assuming the compiler settled it.
+      mvx_native_missing("${built}" "${CMAKE_INSTALL_PREFIX}" bmissing)
+      if(bmissing STREQUAL "")
+        set(instdir "${built}")
+        set(missing "")
+      else()
+        string(REPLACE ";" "\n            " bmtext "${bmissing}")
+        message(WARNING
+          "mvx: ${name} ${version} was built here and still cannot load:\n"
+          "            ${bmtext}")
+      endif()
+    endif()
+  endif()
+  if(NOT missing STREQUAL "")
     message(WARNING
       "mvx: ${name} ${version} needs a library this machine does not have:\n"
       "            ${mtext}\n"
@@ -357,15 +499,15 @@ function(mvx_install_url name version url depth)
     return()
   endif()
 
-  mvx_install_tree("${name}" "${tmp}/x")
+  mvx_install_tree("${name}" "${instdir}")
   message(STATUS "  installed package ${name} ${version} (${MVX_PKG_TRIPLE})")
   _mvx_mark_installed("${name}")
 
   # WHAT IT NEEDS COMES WITH IT.  mvpkg declares `curl', and without it an
   # installed mvpkg cannot reach the HTTPS registry at all (#218).
-  if(EXISTS "${tmp}/x/mvpkg.json")
+  if(EXISTS "${instdir}/mvpkg.json")
     math(EXPR next "${depth} + 1")
-    mvx_install_deps("${tmp}/x/mvpkg.json" ${next})
+    mvx_install_deps("${instdir}/mvpkg.json" ${next})
   endif()
   file(REMOVE_RECURSE "${tmp}")
 endfunction()
@@ -379,7 +521,21 @@ endfunction()
 function(mvx_fetch_package name repo stem version)
   set(tgz "${stem}-${version}-mvx-${MVX_PKG_TRIPLE}.tar.gz")
   set(url "${MVX_PKG_BASEURL}/${repo}/releases/download/${version}/${tgz}")
-  mvx_install_url("${name}" "${version}" "${url}" 0)
+  # THE SOURCE ASSET OF THE SAME RELEASE, for building here when the prebuilt
+  # cannot load (mvx#370).  Taken from the release listing `mvx_choose_version'
+  # already fetched -- the asset names are not predictable from the stem, and
+  # the listing is where both the names and the URLs are.
+  #
+  # A version set at configure time deliberately skips that listing, so there
+  # is nothing to read and the fallback is simply unavailable: the install then
+  # behaves as it did before this existed.
+  if(DEFINED ENV{MVX_INSTALL_RELEASES})
+    set(rjson "$ENV{MVX_INSTALL_RELEASES}/${repo}.json")
+  else()
+    set(rjson "${BIN}/pkgdl/${repo}.releases.json")
+  endif()
+  mvx_source_asset("${rjson}" "${version}" srcurl)
+  mvx_install_url("${name}" "${version}" "${url}" 0 "${srcurl}")
 endfunction()
 
 # WHICH VERSION is asked, not pinned (mvx#212): pkgver.cmake lists each

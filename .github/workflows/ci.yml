@@ -14,8 +14,25 @@ env:
   LLVM_VERSION: "21"
 
 jobs:
+  # PINNED, BECAUSE THIS JOB INSTALLS PUBLISHED PACKAGES (mvx#367).  The install
+  # phase fetches the git package and then ASSERTS it arrived -- and mvx refuses
+  # to copy a package whose native libraries cannot load here, so the assertion
+  # is really about this runner's libraries.  mv_git builds its mvx arm on
+  # `ubuntu-24.04' and links libgit2, whose soname pins the MINOR; `ubuntu-latest'
+  # rolled on to libgit2 1.9, the published binaries need 1.7, the package was
+  # correctly skipped and the assertion correctly failed.
+  #
+  # The claim the test makes is "the published package installs here", so HERE
+  # must be the platform the package is built for.  Pinned to the image that
+  # builds it, the two move together or not at all.
+  #
+  # WHAT THIS DOES NOT FIX, and the pin now hides: no published git artifact
+  # installs on an Ubuntu carrying libgit2 1.9, which is what a current Ubuntu
+  # is.  That is a real user-facing gap and it is mv_git#287 -- a build for the
+  # newer series, which is a release decision.  Do not read a green build-test
+  # as that being solved.
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
@@ -193,6 +210,114 @@ jobs:
           case "${max:-GLIBC_2.0}" in
             GLIBC_2.[0-9]|GLIBC_2.1[0-9]|GLIBC_2.2[0-8]) ;;
             *) echo "::error::floor rose to $max; mvx#203 pins it at GLIBC_2.28"
+               exit 1 ;;
+          esac
+
+  # ---- THE OTHER LIBGIT2, ON PURPOSE (mvx#370) -----------------------------
+  # build-test is pinned to ubuntu-24.04 so the published git package -- built
+  # against libgit2 1.7 -- fits the runner it is tested on (mvx#367).  That pin
+  # also hides the case that broke: a host whose libgit2 is 1.9, where the
+  # prebuilt cannot load and no library the user can install will change that
+  # (Ubuntu 25.10 and 26.04 ship 1.9 and no 1.7 at all).
+  #
+  # So this job IS that host, and it asserts the install builds the package here
+  # rather than leaving the toolchain without git.  `ubuntu-latest' is deliberate
+  # and the one place in this file where it is load-bearing: the point is to run
+  # on whatever is current.
+  #
+  # No services and no suite -- the question is only what the install does, so a
+  # build and one install answers it.
+  source-fallback:
+    name: git builds from source on a newer libgit2
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      # The same set build-test installs.  Trimming it to "what this job needs"
+      # would make a build failure here mean something different from a build
+      # failure there, for no saving worth having.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc g++ liblmdb-dev libedit-dev \
+            libgit2-dev libpq-dev postgresql-client libmongoc-dev pkg-config \
+            libmariadb-dev \
+            zlib1g-dev libzstd-dev libncurses-dev \
+            wget lsb-release software-properties-common gnupg ca-certificates
+          llvm_ok=
+          for attempt in 1 2 3 4 5; do
+            if wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+               && chmod +x /tmp/llvm.sh \
+               && sudo /tmp/llvm.sh "${LLVM_VERSION}" \
+               && sudo apt-get install -y --no-install-recommends \
+                    "llvm-${LLVM_VERSION}-dev"; then
+              llvm_ok=1; break
+            fi
+            echo "apt.llvm.org attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          if [ -z "$llvm_ok" ]; then
+            echo "::error::apt.llvm.org unreachable after 5 attempts over ~4 minutes."
+            exit 1
+          fi
+
+      - name: Say what libgit2 this runner has
+        run: |
+          pkg-config --modversion libgit2
+          ldconfig -p | grep -F libgit2.so || true
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="/usr/lib/llvm-${LLVM_VERSION}"
+          cmake --build build
+
+      - name: Install, and assert git was BUILT here
+        env:
+          MVX_INSTALL_PROMPT: never
+          # The install asks GitHub which package versions exist; a token keeps
+          # that listing clear of the per-IP rate limit on shared runners.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix "$PWD/stage" </dev/null 2>&1 | tee install.log
+
+          # IS THIS JOB STILL TESTING ANYTHING?  If the published package ever
+          # fits this runner -- a release built against 1.9, or ubuntu-latest
+          # moving back -- then the fallback never runs and a green result here
+          # would mean nothing at all.  Say so instead of passing quietly.
+          if ! grep -q "prebuilt libraries need" install.log; then
+            echo "::error::the prebuilt git package loads on this runner, so the"
+            echo "::error::source fallback never ran and this job proved nothing."
+            echo "::error::Point it at a libgit2 the published package was not built"
+            echo "::error::against, or retire it (mvx#370)."
+            exit 1
+          fi
+          grep -q "from source" install.log || {
+            echo "::error::no source build was attempted"; exit 1; }
+
+          # The package is THERE -- the same positive fact build-test asserts.
+          test -e stage/share/mvx/system/CATALOG/GIT || {
+            echo "::error::git was not installed"; exit 1; }
+
+          # AND IT IS THIS HOST'S libgit2 it was built against, which is the
+          # whole point.  A library that merely exists could have been copied
+          # out of the prebuilt tarball.
+          need="$(objdump -p stage/share/mvx/system/LIB/libmvxgit.so \
+                  | sed -n 's/^ *NEEDED *\(libgit2\.so[0-9.]*\).*/\1/p' | sort -u)"
+          have="$(pkg-config --modversion libgit2)"
+          # major.minor, because that is what the soname carries -- and taken
+          # with cut rather than ${have%.*}, which would answer "1" for a
+          # two-component version.
+          hm="$(printf '%s' "$have" | cut -d. -f1,2)"
+          echo "built against $need, runner has libgit2 $have"
+          case "$need" in
+            "libgit2.so.$hm") ;;
+            *) echo "::error::built against $need but this host has libgit2 $have"
                exit 1 ;;
           esac
 
