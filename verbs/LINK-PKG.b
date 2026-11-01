@@ -180,6 +180,17 @@ STOP
       IF RQHAVE < RQWANT THEN REQOK = 0
    CASE RQNAME = "mvx"
       RQHAVE = MVXVERSION()
+      * A REQUIREMENT THAT IS NOT A VERSION IS THE MANIFEST'S PROBLEM, and is
+      * answered before anything about this build, because it is wrong whatever
+      * build reads it.  Order matters: the unknown-version warning below
+      * RETURNS, so asking afterwards would hide a broken manifest on exactly
+      * the untagged and dev builds a packager tests on.
+      GOSUB 9420
+      IF VBAD THEN
+         PRINT "warning: ":CUR:" wants mvx ":RQOP:RQWANT:
+         PRINT ", which is not a version this can compare against"
+         RETURN
+      END
       * AN UNKNOWN VERSION WARNS, IT DOES NOT REFUSE.  A build from an
       * untagged checkout -- every CI run and most developer trees -- reports
       * 0.0.0-dev, and refusing everything then would block all package use on
@@ -193,18 +204,38 @@ STOP
          RETURN
       END
       GOSUB 9400
-      IF VCMP < 0 THEN REQOK = 0
+      BEGIN CASE
+      CASE VUNK                      ;* this build's gap, not the manifest's
+         PRINT "warning: ":CUR:" wants mvx ":RQOP:RQWANT:
+         PRINT ", and this build does not know its own ":VUNAME:" (":RQHAVE:")"
+      CASE VCMP < 0
+         REQOK = 0
+      END CASE
    CASE 1
       RETURN                         ;* a requirement we do not know: ignore
    END CASE
    RETURN
 
-* 9400: compare RQHAVE against RQWANT as dotted numbers -> VCMP (-1/0/1).
+* 9400: compare RQHAVE against RQWANT as dotted numbers -> VCMP (-1/0/1), or
+* VUNK when our own version is the thing that cannot answer.
 * Only the numeric x.y.z prefix is compared: a develop build describes itself
 * as 0.1.4-27-gabc1234, and what that means for a ">=0.1.4" test is that it is
 * newer than 0.1.4, so the suffix is dropped rather than parsed.
+*
+* RQWANT is three dotted numbers by the time we are called -- 9420 settled
+* that -- so the only component that can fail to be one is our own.
+*
+* A COMPONENT THAT IS NOT A NUMBER IS NO LONGER FORCED THROUGH ARITHMETIC
+* (#376).  Since #364 the dev tag names the release line rather than a bare
+* "dev", so this build reports 0.8.x-dev-... and the third component is the
+* letter x.  `x + 0' is fatal, and because the arithmetic only ran once every
+* earlier component had tied, it fired on exactly the requirements that name
+* the line we are on: ">=0.8.0" died, while ">=9.9.9" and ">=0.7.0" were both
+* decided higher up and never reached it.
 9400
    VCMP = 0
+   VUNK = 0
+   VUNAME = "version"
    HV = FIELD(RQHAVE, "-", 1)
    WV = RQWANT
    FOR VI = 1 TO 3
@@ -212,10 +243,48 @@ STOP
       WP = FIELD(WV, ".", VI)
       IF HP = "" THEN HP = 0
       IF WP = "" THEN WP = 0
-      IF VCMP = 0 THEN
-         IF HP + 0 < WP + 0 THEN VCMP = -1
-         IF HP + 0 > WP + 0 THEN VCMP = 1
+      IF VCMP = 0 AND VUNK = 0 THEN
+         BEGIN CASE
+         CASE NUM(HP) = 0
+            GOSUB 9410
+         CASE HP + 0 < WP + 0
+            VCMP = -1
+         CASE HP + 0 > WP + 0
+            VCMP = 1
+         END CASE
       END
+   NEXT VI
+   RETURN
+
+* 9410: our own version stops being a number at component VI -- the x in
+* 0.8.x.  AN UNKNOWN COMPONENT IS NOT THE SAME AS AN UNANSWERABLE QUESTION.
+* The x stands for any patch level on the line, so ">=0.8.0" holds whatever it
+* turns out to be and deserves no warning, while ">=0.8.3" genuinely cannot be
+* answered because 0.8.1 would fail it and 0.8.4 would pass.  What separates
+* the two is whether every component the requirement still has to say is zero.
+* Warning on both would put a warning on the ordinary case -- a package asking
+* for the line it is being installed on -- and a warning that prints every
+* time is one nobody reads.
+9410
+   VUNAME = "patch level"
+   IF VI = 1 THEN VUNAME = "major version"
+   IF VI = 2 THEN VUNAME = "minor version"
+   FOR VJ = VI TO 3
+      WQ = FIELD(WV, ".", VJ)
+      IF WQ = "" THEN WQ = 0
+      IF WQ + 0 # 0 THEN VUNK = 1
+   NEXT VJ
+   RETURN
+
+* 9420: is RQWANT three dotted numbers? -> VBAD.  A missing component is not a
+* malformed one: ">=0.8" is a perfectly good way to ask for the 0.8 line, and
+* reads as 0.8.0.
+9420
+   VBAD = 0
+   FOR VI = 1 TO 3
+      WP = FIELD(RQWANT, ".", VI)
+      IF WP = "" THEN WP = 0
+      IF NUM(WP) = 0 THEN VBAD = 1
    NEXT VI
    RETURN
 

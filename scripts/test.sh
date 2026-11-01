@@ -1702,6 +1702,32 @@ reqtest() { # reqtest <manifest-requirement> -> the LINK-PKG line
   "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1 | tail -1 | normalise \
     | sed -E -e 's/(but this is ).*/\1@RUNTIME@/'
 }
+reqfull() { # reqfull <manifest-requirement> <dir> -> every line, not just the
+  # decision.  reqtest keeps the last line only, which is right for asserting
+  # what was decided; a warning prints BEFORE the decision, so the cases that
+  # assert a build said what it could not work out need both (#376).
+  printf 'reqpkg\n1.0.0\ndesc\nmvx\n%s\n' "$1" > "$RQP/PKG"
+  d="$TESTROOT/rq$2"; mkdir -p "$d"
+  "$ROOT/scripts/mkaccount.sh" "$d" >/dev/null 2>&1
+  "$TCL" -a "$d" -c "LINK-PKG $RQP" 2>&1
+}
+
+verwith() { # verwith <fill> -> this build's dotted version, with any component
+  # that is not a number replaced by <fill>.  Since #364 the dev tag names the
+  # release line, so VERSION SHORT is 0.8.x-dev-... and the patch is the letter
+  # x: `verwith 0' is a version this build certainly has, and the version is
+  # left alone on a build whose components are all numbers.
+  printf '%s' "$VER" | sed -E 's/-.*//' |
+    awk -F. -v fill="$1" '{
+      for (i = 1; i <= 3; i++) {
+        v = (i <= NF ? $i : 0)
+        if (v !~ /^[0-9]+$/) v = fill
+        printf "%s%s", (i > 1 ? "." : ""), v
+      }
+      print ""
+    }'
+}
+
 # The ABI cases are the same everywhere -- it is a compile-time constant -- so
 # they go in a fixture.
 check tcl-requires "$( \
@@ -1719,6 +1745,13 @@ case "$VER" in
   0.0.0*) vknown=0 ;;
   *)      vknown=1 ;;
 esac
+# A THIRD STATE, not a second (#376).  Before #364 a build either knew its
+# version or reported 0.0.0; now a dev build reports the release line with the
+# patch left as `x', which knows more than 0.0.0 and less than a tag.
+case "$(printf '%s' "$VER" | sed -E 's/-.*//')" in
+  *[!0-9.]*) vunk=1 ;;
+  *)         vunk=0 ;;
+esac
 r="$(reqtest '!mvx>=9.9.9' f)"
 if [ "$vknown" = 1 ]; then
   case "$r" in
@@ -1733,11 +1766,68 @@ else
     *) FAIL=$((FAIL+1)); echo "FAIL untagged build should warn, not refuse: $r" ;;
   esac
 fi
-r="$(reqtest "!mvx>=$(printf '%s' "$VER" | sed -E 's/-.*//')" g)"
+# A version this build HAS is accepted, and -- where the build knows what it is
+# -- accepted in silence.  The derivation matters: `sed s/-.*//' alone yields
+# 0.8.x on a dev build, and a requirement of ">=0.8.x" is not a version at all,
+# so it takes the malformed-manifest path and this would pass while comparing
+# nothing (#376).  verwith 0 asks the question that was meant.
+own="$(verwith 0)"
+r="$(reqfull "!mvx>=$own" g)"
 case "$r" in
-  *linked*) PASS=$((PASS+1)); echo "  a version this build does have is accepted" ;;
-  *) FAIL=$((FAIL+1)); echo "FAIL should accept its own version: $r" ;;
+  *linked*)
+    case "$r" in
+      *warning*)
+        if [ "$vknown" = 0 ]; then
+          PASS=$((PASS+1))
+          echo "  an untagged build warns about its own version too, and links"
+        else
+          FAIL=$((FAIL+1)); echo "FAIL warned about a version it has: $r"
+        fi ;;
+      *) PASS=$((PASS+1))
+         echo "  a version this build does have is accepted, and says nothing" ;;
+    esac ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL should accept its own version ($own): $r" ;;
 esac
+
+# A REQUIREMENT THAT IS NOT A VERSION MUST NOT BE FATAL.  This one needs no
+# branch, unlike the cases below, because the answer does not depend on what
+# the build is: a manifest is malformed whoever reads it, and LINK-PKG settles
+# that before it looks at its own version.  Which is load-bearing rather than
+# tidy -- the unknown-version path returns, so asking in the other order would
+# make this assertion pass on a tagged build and fail on every CI run.
+r="$(reqfull '!mvx>=zz' h)"
+case "$r" in
+  *"not a version this can compare against"*) PASS=$((PASS+1))
+    echo "  a requirement that is not a version warns, and does not abort" ;;
+  *) FAIL=$((FAIL+1)); echo "FAIL a non-version requirement should warn: $r" ;;
+esac
+
+# .999 is above any real patch on this line, which splits the three builds
+# apart: one that knows its patch refuses it, one whose patch is the dev tag's
+# placeholder cannot tell, and an untagged one never gets as far as comparing.
+# Keeping those three answers distinct is the whole of #376, so each is asserted
+# rather than tolerated.
+line="$(printf '%s' "$VER" | sed -E 's/-.*//' | awk -F. '{print $1"."$2".999"}')"
+r="$(reqfull "!mvx>=$line" i)"
+if [ "$vknown" = 0 ]; then
+  case "$r" in
+    *"does not know its version"*) PASS=$((PASS+1))
+      echo "  an untagged build does not pretend to a patch level either" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL untagged build should warn on $line: $r" ;;
+  esac
+elif [ "$vunk" = 1 ]; then
+  case "$r" in
+    *"does not know its own patch level"*) PASS=$((PASS+1))
+      echo "  a dev build says it cannot tell, rather than aborting on the x" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL dev build should warn on $line: $r" ;;
+  esac
+else
+  case "$r" in
+    *"needs mvx >=$line"*) PASS=$((PASS+1))
+      echo "  a build that knows its patch level refuses one above it" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL tagged build should refuse $line: $r" ;;
+  esac
+fi
 
 # A package can export a FUNCTION, and a DEFFUN'd caller resolves it across the
 # package boundary (#101).  BUILD-PKG and CATALOG classified only SUBROUTINE as
