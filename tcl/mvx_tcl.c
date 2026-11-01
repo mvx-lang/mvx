@@ -213,7 +213,9 @@ static int voc_lookup(const char *verb, char *path, size_t cap) {
  * Without that, every ABORT and every runtime fault would end the session.
  *
  * A verb with no loadable form -- any account cataloged before mvx#248 --
- * still forks and execs, exactly as before. */
+ * still forks and execs, exactly as before.  That path needs nothing from
+ * mvx#373: the child's process image IS the program, which is what the permit
+ * layer falls back to when no loader has declared one. */
 static int run_verb(const char *path, const char *line) {
 #ifdef __APPLE__
     static const char *libsfx = ".dylib";
@@ -222,12 +224,21 @@ static int run_verb(const char *path, const char *line) {
 #endif
     char lp[4200];
     snprintf(lp, sizeof lp, "%s%s", path, libsfx);
+    const char *loaded = lp;
     void *h = dlopen(lp, RTLD_NOW | RTLD_LOCAL);
-    if (!h) h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { h = dlopen(path, RTLD_NOW | RTLD_LOCAL); loaded = path; }
     mvx_program_fn fn = h ? (mvx_program_fn)dlsym(h, "mvx_main") : NULL;
     if (fn) {
         int aborted = 0;
+        /* WHICH FILE THIS VERB IS, for a prog: permit grant (mvx#373).  The
+           process is `mvx', so without this every verb run here would carry
+           mvx's identity -- and the grant would be either inert or a grant to
+           all of them.  Restored by depth rather than popped: an ABORT in a
+           nested level unwinds past its own leave, and this is where one
+           stops. */
+        int pdepth = mvx_perm_prog_enter(loaded);
         int64_t rc = mvx_level_run_at_prompt(g_ctx, fn, line, &aborted);
+        mvx_perm_prog_leave(pdepth);
         return (int)rc;
     }
 
@@ -1094,6 +1105,23 @@ int main(int argc, char **argv) {
             acct = argv[++i];
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc)
             one_cmd = argv[++i];
+        /* WHAT TO BLESS, computed by the thing that will compare it
+           (mvx#373).  A prog: permit grant is bound to the sha256 of the file
+           a program's code is in, and which file that is differs by platform:
+           CATALOG/<name>.so on Linux, where CATALOG/<name> is a copy of
+           mvx-launch and identical for every program, and CATALOG/<name> on
+           macOS.  A packager that hardcoded either would be silently wrong on
+           the other -- so it asks here instead of knowing. */
+        else if (strcmp(argv[i], "--program-hash") == 0 && i + 1 < argc) {
+            char hex[65];
+            if (!mvx_perm_program_hash(argv[i + 1], hex)) {
+                fprintf(stderr, "mvx: cannot read the program at %s\n",
+                        argv[i + 1]);
+                return 1;
+            }
+            printf("%s\n", hex);
+            return 0;
+        }
         else if (strcmp(argv[i], "--version") == 0) {
             /* The ABI belongs beside the version: it is what decides
                whether a compiled artifact still loads (#117). */
@@ -1101,7 +1129,8 @@ int main(int argc, char **argv) {
             return 0;
         }
         else {
-            fprintf(stderr, "usage: mvx [-a account] [-c command] [--version]\n");
+            fprintf(stderr, "usage: mvx [-a account] [-c command] [--version]"
+                            " [--program-hash <cataloged-program>]\n");
             return 2;
         }
     }
@@ -1135,6 +1164,14 @@ int main(int argc, char **argv) {
        @LEVEL = 1 where UniData and UniVerse both answer 0 -- and every
        `IF @LEVEL THEN' ported from them would fire when it must not. */
     mvx_ctx_set_base_level(g_ctx, -1);
+    /* AND IT IS NOT A PROGRAM FOR A PERMIT GRANT EITHER (mvx#373), which is
+       the same fact with teeth on it.  The permit layer falls back to the
+       process image when no loader has declared a program, and the process
+       image here is `mvx' -- so a `!' typed at the prompt would carry mvx's
+       identity and inherit any prog: grant blessed against it.  Declaring "no
+       program" once, here, is what makes that impossible rather than merely
+       unlikely. */
+    mvx_perm_prog_enter(NULL);
     account_refresh();
 
     /* Register with the session registry, if one is running (mvx#226).  This

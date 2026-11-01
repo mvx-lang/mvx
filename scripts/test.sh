@@ -315,8 +315,12 @@ else
 fi
 
 # program-identity binding (#80, 8.4 constraint 3): a prog:NAME grant applies
-# only when the running binary matches the system-blessed sha256 for NAME — a
+# only when the running program matches the system-blessed sha256 for NAME — a
 # stale hash (re-cataloged / substituted binary) no longer inherits the grant.
+#
+# THIS ONE RUNS THE PROGRAM AS A STANDALONE EXECUTABLE, which is its own
+# process image.  That is the easy half and it is not the half real verbs use;
+# the dispatcher cases are below, and they are what #373 was about.
 PPROG="$TESTROOT/pacct-prog"
 mkdir -p "$PPROG/.mvx-private"
 echo "permit prog:TESTPROG = echo" > "$PPROG/.mvx-private/permissions"
@@ -335,6 +339,81 @@ if "$MVX" "$ROOT/tests/osexec_prog.b" -o "$out" 2>"$TESTROOT/cerr"; then
 else
   check osexec_prog "COMPILE FAILED: $(cat "$TESTROOT/cerr")"
 fi
+
+# --- the same grant, through the DISPATCHER (#373) -------------------------
+# The check above was the only coverage program identity had, and it runs the
+# program as a standalone executable -- where /proc/self/exe IS the program.
+# No cataloged verb has had that shape since #248, which dlopens a verb and
+# runs it at a level in the shell's own process.  So that check went on
+# passing while every prog: grant was inert, and the one blessing that DID
+# bind was mvx's own -- which handed the command to every verb in the account
+# and to `!' typed at the prompt.  Six cases, because the fix has to get the
+# refusals right as well as the grant.
+PVA="$TESTROOT/pacct-verb"
+PVS="$TESTROOT/sysacct-verb"
+"$ROOT/scripts/mkaccount.sh" "$PVA" >/dev/null
+mkdir -p "$PVA/.mvx-private" "$PVA/BP" "$PVS/.mvx-private"
+echo "permit prog:TESTPROG = echo" > "$PVA/.mvx-private/permissions"
+cp "$ROOT/tests/osexec_prog.b" "$PVA/BP/TESTPROG"
+cp "$ROOT/tests/osexec_prog.b" "$PVA/BP/OTHERPROG"
+# OUTER reaches OSEXEC on both sides of an in-process EXECUTE, so one run says
+# whether the inner level inherited the grant AND whether the outer got its
+# own identity back afterwards.
+cat > "$PVA/BP/OUTER" <<'PROGEOF'
+   O = "" ; S1 = OSEXEC("echo":@FM:"x", O)
+   PRINT "outer-before: ":S1
+   EXECUTE "TESTPROG"
+   O = "" ; S2 = OSEXEC("echo":@FM:"x", O)
+   PRINT "outer-after: ":S2
+PROGEOF
+cat > "$PVA/BP/ABORTER" <<'PROGEOF'
+   ABORT
+PROGEOF
+cat > "$PVA/BP/OUTABRT" <<'PROGEOF'
+   EXECUTE "ABORTER"
+PROGEOF
+for v in TESTPROG OTHERPROG OUTER ABORTER OUTABRT; do
+  MVXPRIV=developer "$TCL" -a "$PVA" -c "CATALOG BP $v" >/dev/null 2>&1
+done
+# WHAT TO BLESS: `mvx --program-hash', which is the runtime answering for
+# itself.  The file to bless is CATALOG/<name>.so on Linux -- where
+# CATALOG/<name> is a copy of mvx-launch, identical for every program -- and
+# CATALOG/<name> on macOS, where the executable is dlopen-able and is the whole
+# program.  ASKED RATHER THAN REIMPLEMENTED, because a test carrying its own
+# copy of that rule would keep passing against its own copy after the loader's
+# changed: here a divergence shows up as the first case below going red.
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+        else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+bless_as() { echo "program TESTPROG = $1" > "$PVS/.mvx-private/programs"; }
+pvrun() { MVXSYSTEM="$PVS" "$TCL" -a "$PVA" -c "$1" 2>&1 | grep '^echo:' | head -1; }
+# REPORTED AS WORDS, NOT AS A MATCH COUNT.  A golden file reading `0' says
+# nothing about which way round the test had it, and the two cases it covers
+# are the ones whose right answer is a REFUSAL -- the half that is easy to
+# record backwards and never notice.
+pvmark() { # pvmark MARKER tcl-line...
+  m="$1"; shift
+  if printf '%s\n' "$@" | MVXSYSTEM="$PVS" "$TCL" -a "$PVA" 2>&1 |
+       grep -qE "^$m\$"
+  then printf 'the command RAN'; else printf 'refused'; fi
+}
+
+bless_as "$("$TCL" --program-hash "$PVA/CATALOG/TESTPROG")"
+v1="$(pvrun TESTPROG)"
+v2="$(pvrun OTHERPROG)"
+# nested: OUTER is not blessed, TESTPROG is -- so the inner level must GAIN the
+# grant the outer does not have, and lose it again on the way out.
+v3="$(MVXSYSTEM="$PVS" "$TCL" -a "$PVA" -c OUTER 2>&1 |
+        grep -E '^(outer-|echo:)' | tr '\n' ' ' | sed 's/ *$//')"
+bless_as "$(sha "$TCL")"
+v4="$(pvrun TESTPROG)"
+v5="$(pvmark at-the-prompt '!echo at-the-prompt' OFF)"
+# an ABORT unwinds past the levels in between without their own leave running,
+# so the prompt must still get its identity back -- OUTABRT is blessed here, so
+# a leaked entry would GRANT the prompt rather than merely confuse it.
+bless_as "$("$TCL" --program-hash "$PVA/CATALOG/OUTABRT")"
+v6="$(pvmark after-the-abort OUTABRT '!echo after-the-abort' OFF)"
+check osexec_prog_verb "$(printf 'the blessed verb:     %s\nan unrelated verb:    %s\nacross an EXECUTE:    %s\nmvx blessed, a verb:  %s\nmvx blessed, a bang:  %s\naborted, then a bang: %s' \
+  "$v1" "$v2" "$v3" "$v4" "$v5" "$v6")"
 
 # ---------------------------------------------------------------- phase 2
 echo "== system tests"

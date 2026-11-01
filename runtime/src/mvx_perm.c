@@ -56,9 +56,23 @@
  *
  *     program MVPKG = <sha256-of-approved-binary>
  *
- * The check hashes the running binary (sha256) and compares.  Re-cataloging the
- * program changes the binary, hence its hash — the grant no longer matches until
- * the admin re-blesses the new hash.
+ * The check hashes THE FILE THE PROGRAM'S CODE IS IN (sha256) and compares.
+ * Re-cataloging the program changes that file, hence its hash — the grant no
+ * longer matches until the admin re-blesses the new hash.
+ *
+ * WHICH FILE THAT IS, is the loader's answer and not the process image's
+ * (mvx#373).  Since mvx#248 a cataloged program is dlopen'd and run at a level
+ * inside an existing process, so /proc/self/exe names `mvx' for every verb
+ * typed at the prompt.  On Linux it is worse than useless: `CATALOG/<name>' is
+ * a byte-for-byte copy of mvx-launch, identical for every program on the
+ * machine, and the program itself is `CATALOG/<name>.so'.  So the identity is
+ * the object the loader loaded — `.so' on Linux, the executable on macOS,
+ * which is dlopen-able and is the whole program there — declared through
+ * mvx_perm_prog_enter/leave by run_verb, by EXECUTE and by mvx-launch.
+ *
+ * A BLESSING MUST THEREFORE NAME THAT FILE: `CATALOG/<name>.so' where one
+ * exists, else `CATALOG/<name>' — the loader's own resolution order, which is
+ * what a packager should follow when it computes the hash to bless.
  */
 #include "mvx_runtime.h"
 #include "sha256.h"
@@ -280,23 +294,11 @@ static int in_my_groups(const char *g) {
 
 /* The sha256 (hex) of the running verb's own binary — its identity — cached.
    "" if it cannot be determined (then no prog: grant can match). */
-static const char *self_hash(void) {
-    static char hex[65];
-    static int done = 0;
-    if (done) return hex;
-    done = 1;
-    hex[0] = '\0';
-    char path[4096];
-#ifdef __APPLE__
-    uint32_t sz = sizeof path;
-    if (_NSGetExecutablePath(path, &sz) != 0) return hex;
-#else
-    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
-    if (n <= 0) return hex;
-    path[n] = '\0';
-#endif
+/* The sha256 (hex) of one file, "" if it cannot be read. */
+static void file_hash(const char *path, char out[65]) {
+    out[0] = '\0';
     FILE *fp = fopen(path, "rb");
-    if (!fp) return hex;
+    if (!fp) return;
     sha256_ctx c;
     sha256_init(&c);
     unsigned char buf[65536];
@@ -305,13 +307,139 @@ static const char *self_hash(void) {
     fclose(fp);
     uint8_t dig[32];
     sha256_final(&c, dig);
-    for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", dig[i]);
-    return hex;
+    for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", dig[i]);
 }
 
-/* Does the running binary match the program blessed as `name`? */
+/* The process image's own path — the kernel's answer, not argv[0]. */
+static int self_path(char *out, size_t cap) {
+#ifdef __APPLE__
+    uint32_t sz = (uint32_t)cap;
+    return _NSGetExecutablePath(out, &sz) == 0;
+#else
+    ssize_t n = readlink("/proc/self/exe", out, cap - 1);
+    if (n <= 0) return 0;
+    out[n] = '\0';
+    return 1;
+#endif
+}
+
+/* --- which program is running (mvx#373) --------------------------------
+   A `prog:` grant is bound to a program's identity, and the identity is the
+   file the program's CODE is in.  Until mvx#248 that was the process image:
+   the prompt forked and exec'd a verb, so /proc/self/exe named it.  Since
+   #248 a verb is dlopen'd and run at a level inside an existing process, so
+   the process image answers `mvx' for every verb there is -- making every
+   prog: grant either inert or, if an admin blesses mvx to get one to bind,
+   a grant to EVERY program in the account and to `!' at the prompt.
+
+   So the loader declares what it loaded.  The stack is for nesting: a verb
+   can EXECUTE another verb in-process, and the grant has to follow whichever
+   is RUNNING, not whichever started first.
+
+   LAZILY HASHED.  Almost no program ever reaches OSEXEC, and hashing a
+   library at load time would charge every verb for a check it never makes;
+   the hash is taken when a prog: rule is first consulted, and cached, so a
+   program that calls OSEXEC in a loop hashes once. */
+#define MAX_PROGS 64
+static struct { char path[4096]; int none; } progs[MAX_PROGS];
+static int nprogs = 0;
+
+int mvx_perm_prog_enter(const char *loaded_path) {
+    int depth = nprogs;
+    if (nprogs < MAX_PROGS) {
+        /* NULL = "no program here": what the prompt pushes, so a `!' typed at
+           TCL is not treated as whatever program ran last. */
+        if (loaded_path) {
+            snprintf(progs[nprogs].path, sizeof progs[nprogs].path, "%s",
+                     loaded_path);
+            progs[nprogs].none = 0;
+        } else {
+            progs[nprogs].path[0] = '\0';
+            progs[nprogs].none = 1;
+        }
+        nprogs++;
+    }
+    /* OVERFLOW DENIES.  Past MAX_PROGS the depth still grows, so leave()
+       restores correctly, but nothing is recorded -- and an unrecorded
+       identity must not inherit the identity below it, which is why
+       current_prog() checks the count rather than clamping to the top. */
+    else nprogs++;
+    return depth;
+}
+
+void mvx_perm_prog_leave(int depth) {
+    if (depth >= 0 && depth <= nprogs) nprogs = depth;
+}
+
+/* The entry whose identity applies, or NULL when there is none to apply:
+   nothing has been loaded in this process (an exec'd image -- see
+   current_hash), the prompt pushed "no program", or the stack overflowed. */
+static const char *current_prog(void) {
+    if (nprogs == 0 || nprogs > MAX_PROGS) return NULL;
+    const char *p = progs[nprogs - 1].none ? NULL : progs[nprogs - 1].path;
+    return (p && p[0]) ? p : NULL;
+}
+
+/* The identity to compare a blessing against, cached by path.
+   NOTHING LOADED FALLS BACK TO THE PROCESS IMAGE, and that is not a leftover:
+   a program compiled straight to an executable IS its own image, and so is a
+   verb cataloged before mvx#248, which run_verb still forks and execs.  Both
+   were correct before and stay correct.  Inside mvx the prompt pushes "no
+   program" precisely so this fallback cannot hash `mvx' and resurrect the
+   leak it exists to close. */
+static const char *current_hash(void) {
+    static char cpath[4096];
+    static char chex[65];
+    static int have_self = 0;
+    static char selfhex[65];
+
+    const char *p = current_prog();
+    if (!p) {
+        if (nprogs != 0) return "";          /* "no program", or overflowed */
+        if (!have_self) {
+            have_self = 1;
+            selfhex[0] = '\0';
+            char sp[4096];
+            if (self_path(sp, sizeof sp)) file_hash(sp, selfhex);
+        }
+        return selfhex;
+    }
+    if (strcmp(cpath, p) != 0) {
+        snprintf(cpath, sizeof cpath, "%s", p);
+        file_hash(cpath, chex);
+    }
+    return chex;
+}
+
+/* THE HASH AN ADMIN HAS TO BLESS, so nobody has to know the platform rule.
+   `path' is the cataloged program (CATALOG/<name>); `out' gets the sha256 of
+   the file its code is in -- <path> plus the platform's library suffix if
+   that exists, else <path> itself.  1 on success.
+
+   IT EXISTS SO THE TEST AND THE PACKAGER ASK THE RUNTIME rather than carry a
+   copy of the rule: on Linux the file to bless is CATALOG/<name>.so and on
+   macOS it is CATALOG/<name>, and a packager that hardcoded either would be
+   silently wrong on the other platform -- which is how mv_package came to
+   bless a copy of mvx-launch. */
+int mvx_perm_program_hash(const char *path, char out[65]) {
+#ifdef __APPLE__
+    static const char *sfx = ".dylib";
+#else
+    static const char *sfx = ".so";
+#endif
+    out[0] = '\0';
+    char cand[4200];
+    snprintf(cand, sizeof cand, "%s%s", path, sfx);
+    FILE *fp = fopen(cand, "rb");
+    if (fp) fclose(fp);
+    else snprintf(cand, sizeof cand, "%s", path);
+    file_hash(cand, out);
+    return out[0] != '\0';
+}
+
+/* Does the running program match the one blessed as `name`? */
 static int is_blessed_program(const char *name) {
-    const char *sh = self_hash();
+    const char *sh = current_hash();
     if (!sh[0]) return 0;
     for (int i = 0; i < nblessings; i++)
         if (strcmp(blessings[i].name, name) == 0 && strcmp(blessings[i].hash, sh) == 0)

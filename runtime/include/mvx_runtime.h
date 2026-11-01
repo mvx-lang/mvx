@@ -475,6 +475,26 @@ int64_t mvx_run(mvx_ctx *ctx, const mv_value *argv, mv_value *capture);
    arguments not blocked by a deny rule's switches); see mvx_perm.c. */
 int     mvx_perm_allowed(char *const argv[]);
 
+/* WHICH PROGRAM IS RUNNING, for a `permit prog:NAME' grant (mvx#373).
+   A cataloged program is loaded and run inside an existing process (mvx#248),
+   so the process image no longer names it: every verb at the prompt would be
+   `mvx'.  The loader says what it loaded instead -- the shared object the
+   program's code is actually in -- and that file's sha256 is the identity a
+   blessing is compared against.
+
+   `enter' returns the depth to restore and takes the object's path, or NULL
+   for "no program" (what the prompt itself pushes, so a bare `!' typed there
+   matches no prog: grant).  `leave' TRUNCATES back to a depth rather than
+   popping one, because an ABORT unwinds past the levels in between without
+   their leave ever running.  Nothing in compiled code changes: these are the
+   loader's calls, not the program's. */
+int     mvx_perm_prog_enter(const char *loaded_path);
+void    mvx_perm_prog_leave(int depth);
+/* The sha256 an admin blesses for the cataloged program at `path' — the file
+   its code is in, which differs by platform.  `mvx --program-hash <path>' is
+   this, so a packager never has to know which file that is. */
+int     mvx_perm_program_hash(const char *path, char out[65]);
+
 /* Native filesystem primitives — no shell; below unrestricted each needs a
    permit for its op name (mkdir / rmtree / untar).  See mvx_exec.c. */
 int64_t mvx_mkdir(mvx_ctx *ctx, const mv_value *path);               /* MKDIR */
