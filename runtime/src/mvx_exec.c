@@ -583,12 +583,18 @@ int64_t mvx_compile_opts(mvx_ctx *ctx, const mv_value *mode,
 
 /* The program at `path`, if there is a loadable one.  Resolved the way the
    whole system resolves it: the platform's library suffix first, then the
-   plain path, which on macOS is the executable and is also loadable. */
-static mvx_program_fn exec_load(const char *path) {
+   plain path, which on macOS is the executable and is also loadable.
+   `loaded' is told WHICH of the two it was, because that file is the
+   program's identity for a prog: permit grant (mvx#373). */
+static mvx_program_fn exec_load(const char *path, char *loaded, size_t cap) {
     char p[4200];
     snprintf(p, sizeof p, "%s%s", path, MVX_LIB_SUFFIX);
     void *h = dlopen(p, RTLD_NOW | RTLD_LOCAL);
-    if (!h) h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (h) snprintf(loaded, cap, "%s", p);
+    else {
+        h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (h) snprintf(loaded, cap, "%s", path);
+    }
     if (!h) return NULL;
     return (mvx_program_fn)dlsym(h, "mvx_main");
 }
@@ -700,9 +706,10 @@ static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
     }
 
     char path[2048];
+    char loaded[4200] = "";
     mvx_program_fn fn = NULL;
     if (vi > 0 && mvx_voc_lookup(ctx, verb, path, sizeof path) == 1)
-        fn = exec_load(path);
+        fn = exec_load(path, loaded, sizeof loaded);
 
     /* A PARAGRAPH IS A VERB WITH NO PROGRAM BEHIND IT (mvx#269).  Looked for
        only once the `V' lookup has failed, so a cataloged program still wins
@@ -714,10 +721,17 @@ static int64_t execute_core(mvx_ctx *ctx, const mv_value *sentence,
     }
 
     if (fn) {
+        /* The EXECUTE'd program's own identity for a prog: grant (mvx#373):
+           it is running in this process, so without this it would keep its
+           caller's.  Restored by depth -- an ABORT passes straight through
+           mvx_level_run to the next catcher, so a plain pop would never run
+           and the entry would outlive the program. */
+        int pdepth = mvx_perm_prog_enter(loaded[0] ? loaded : NULL);
         int64_t st = capture ? exec_capture(ctx, fn, sent, capture, aborted)
                              : (aborted ? mvx_level_run_at_prompt(ctx, fn, sent,
                                                                   aborted)
                                         : mvx_level_run(ctx, fn, sent));
+        mvx_perm_prog_leave(pdepth);
         if (rc) mv_set_int(rc, st);
         return st == 0 && !(aborted && *aborted);
     }

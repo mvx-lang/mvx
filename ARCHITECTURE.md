@@ -560,19 +560,38 @@ Grants are unioned from three files, in increasing authority:
 
 **Program-identity binding (constraint 3).** A grant may name a *program*
 instead of a user/group — `permit prog:MVPKG = mkdir tar mkpkg` — which applies
-for any user, but only when the running verb's binary matches the one **blessed**
+for any user, but only when the running program matches the one **blessed**
 under that name. Blessings live only in the system layer, so a user cannot
 self-bless:
 
 ```
 # <system>/.mvx-private/programs
-program MVPKG = <sha256-of-approved-binary>
+program MVPKG = <sha256-of-the-file-the-program's-code-is-in>
 ```
 
-The runtime sha256s the running binary and compares. Re-cataloging the program
-changes its binary and thus its hash, so the grant stops matching until the
-admin re-blesses the new hash — a user who catalogs their own program under the
-name `MVPKG` gets a different hash and inherits nothing.
+The runtime sha256s that file and compares. Re-cataloging the program changes
+it and thus its hash, so the grant stops matching until the admin re-blesses
+the new hash — a user who catalogs their own program under the name `MVPKG`
+gets a different hash and inherits nothing.
+
+**Which file that is, is the loader's answer, not the process image's.** Since
+§3's environment levels, a cataloged program is `dlopen`'d and run inside an
+existing process, so the process image is `mvx` for every verb typed at the
+prompt — and on Linux `CATALOG/<name>` is a copy of `mvx-launch`, byte-for-byte
+identical for every program on the machine, with the program itself in
+`CATALOG/<name>.so`. Hashing the image would therefore bind every grant to
+`mvx` (granting it to *all* verbs and to `!`), or to a launcher shared by all
+of them. So the identity is the object the loader loaded, declared by whoever
+loaded it — the shell's dispatcher, `EXECUTE`, and `mvx-launch` — and a
+blessing names that same file. Rather than knowing which, ask:
+
+```
+$ mvx --program-hash CATALOG/MVPKG
+3f0c…                       # the hash to bless, on either platform
+```
+
+A program compiled straight to an executable is its own image, and is hashed
+as one.
 
 This gives least privilege for OS-touching primitives — a program that only
 needs `mkdir`/`tar` is granted just those, not full `!`/SH.

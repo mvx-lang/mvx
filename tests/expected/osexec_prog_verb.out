@@ -1,0 +1,6 @@
+the blessed verb:     echo: status=0
+an unrelated verb:    echo: status=-1
+across an EXECUTE:    outer-before: -1 echo: status=0 outer-after: -1
+mvx blessed, a verb:  echo: status=-1
+mvx blessed, a bang:  refused
+aborted, then a bang: refused
